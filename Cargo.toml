@@ -1,250 +1,44 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.26"
+version = "0.7.0"
 edition = "2024"
-authors = ["Jeffrey Emanuel"]
-description = "Unified TUI search over local coding agent histories"
+description = "Local search for Claude Code and Codex session histories"
 license-file = "LICENSE"
-resolver = "2"
-repository = "https://github.com/Dicklesworthstone/coding_agent_session_search"
+repository = "https://github.com/jamesqo/coding_agent_session_search"
 default-run = "cass"
-include = [
-    "/Cargo.toml",
-    "/Cargo.lock",
-    "/build.rs",
-    "/LICENSE",
-    "/README.md",
-    "/src/**/*.rs",
-    "/src/pages_assets/**",
-]
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+build = false
+
+[lib]
+path = "app/lib.rs"
+
+[[bin]]
+name = "cass"
+path = "app/main.rs"
+test = false
+
+[[test]]
+name = "cli_contract"
+path = "app/tests/cli_contract.rs"
 
 [dependencies]
-anyhow = "1.0.102"
-thiserror = "2.0.18"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.9", features = ["test-internals", "tls-native-roots"] }
-clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
-clap_complete = "4.6.5"
-clap_mangen = "0.3.0"
-indicatif = "0.18.4"
-console = "0.16.3"
-colored = "3.1.1"
+blake3 = "1.8.5"
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }
+clap = { version = "4.6.1", features = ["derive"] }
+directories = "6.0.0"
+rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
-# reqwest 0.13 ships rustls without a crypto provider under `rustls-no-provider`;
-# cass installs `ring` (see `ensure_rustls_crypto_provider`) instead of letting
-# the default `rustls` feature pull aws-lc-sys and its cmake build into every
-# release target. The platform verifier supplies the trust roots.
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
-toon = { version = "0.2.3", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "d7185c78", package = "tru" }
-tempfile = "3.27.0"
-wait-timeout = "0.2.1"
-rmp-serde = "1.3.1"  # MessagePack for binary metadata serialization (Opt 3.1)
-toml = "1.1.2"
-directories = "6.0.0"
-which = "8.0.2"
-shell-words = "1.1.1"
-dotenvy = "0.15.7"
-notify = "8.2.0"
-# fsqlite 0.3.1 (crates.io): the 0.3.0 asupersync-0.4.3 runtime migration and
-# bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
-# FileIdentity re-derivation after file replacement — the cass#393
-# st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
-# cross-connection visibility) plus the 0.3.1 correctness wave: allocator
-# post-savepoint page-aliasing quarantine, committed-freelist resurrection
-# refusal, shared concurrent-writer EOF high-water, sidecar-less read-only
-# first-contact opens (GH#140), Darwin OFD locking. The engine API is async
-# (!Send futures); CASS's synchronous call shape is preserved by
-# src/franken_sync.rs, which drives every engine future on a private
-# current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.8", package = "fsqlite", features = ["fts5"] }
-# The production storage-integrity probe calls FrankenSQLite's public VFS API
-# directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.8", package = "fsqlite-types" }
-rayon = "1.12.0"
-crossbeam-channel = "0.5.15"
-parking_lot = "0.12.5"
-fs2 = "0.4.3"
-same-file = "1.0.6"
-lru = "0.18"
-rustc-hash = "2.1.2"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }  # Fast content hashing for search-hit dedup (bead sdoxg)
-itoa = "1.0.18"  # Zero-allocation integer-to-string for hot paths (bead w32k6)
-smallvec = "1.15.1"  # Stack-allocated small vectors for hot paths (Opt 4.4)
-regex = "1.12.3"
-portable-pty = "0.9.0"
-# FrankenTUI migration foundation (bead 2noh9.2.1).
-# Strategy: pin a Git revision for reproducible CI builds.
-ftui = { version = "=0.5.0" }
-ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { version = "=0.5.0" }
-ftui-extras = { version = "=0.5.0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
-dirs = "6.0.0"
+thiserror = "2.0.18"
 walkdir = "2.5.0"
-glob = "0.3.3"
-base64 = ">=0.21"
-blake3 = "1.8.5"
-mime_guess = "2.0.5"
-pulldown-cmark = { version = "0.13.3", default-features = false, features = ["html"] }
-chrono = { version = "0.4.44", features = ["serde"] }
-semver = "1.0.28"
-tracing-appender = "0.2.5"
-strsim = "0.11.1"
-once_cell = "1.21.4"
-itertools = "0.15.0"
-crc32fast = "1.5.0"
-unicode-normalization = "0.1.25"
-urlencoding = "2.1.3"
-half = { version = "2.7.1", features = ["bytemuck"] }
-memmap2 = "0.9.10"
-bytemuck = "1.25.0"
-# Semantic embedding + reranking are PURE-RUST via frankensearch's `native`
-# feature: the frankentorch all-MiniLM-L6-v2 sentence embedder (NativeEmbedder)
-# + the ms-marco cross-encoder reranker (NativeReranker). The old
-# `fastembed`/ONNX-Runtime stack was removed (cass #308): ort 2.0.0-rc.12 could
-# not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
-# binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
-# AVX-static-init hazard and no separate `-baseline` artifact is needed.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "22859f74056c31fd3a713bacecd4a1f22f0cf82d", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "0.2.1", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "82424dc8571ef47215cac342696a36faabd07bca", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
-wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
-arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
-bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
-hnsw_rs = "0.3.4"  # Opt 9: Approximate Nearest Neighbor with HNSW
-ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
-
-# Crypto for ChatGPT encrypted conversations and HTML export encryption.
-# The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
-# majors: aes-gcm 0.10 uses digest 0.10, which is what sha2 0.10 / hmac 0.12 /
-# hkdf 0.12 export. Leaving these as wildcards lets cargo upgrade hkdf + hmac
-# to 0.13 (digest 0.11), which fails to satisfy aes-gcm's KeyInit bound and
-# breaks the encryption.rs build with ~29 trait-bound errors.
-aes-gcm = "0.11"
-ring = "0.17.14"
-url = "2.5.8"
-pbkdf2 = "0.13.0"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
-
-# SHA256 hashing for model verification
-sha2 = "0.11"
-hex = "0.4.3"
-
-# Interactive terminal prompts for setup wizard
-dialoguer = "0.12.0"
-
-# SFTP fallback for sync when rsync is unavailable
-ssh2 = "0.9.5"
-argon2 = "0.5.3"
-hkdf = "0.13"  # Must match sha2 0.11 / aes-gcm 0.11 (digest 0.11 family); see comment above.
-zeroize = { version = "1.8.2", features = ["derive"] }
-flate2 = "1.1.9"
-rand = "0.10"
-
-# QR code generation (optional, for recovery secret QR codes)
-qrcode = { version = "0.14.1", optional = true }
-image = { version = "0.25.10", optional = true, default-features = false, features = ["png"] }
-unicode-width = "0.2.2"
-
-# macOS keychain access (optional, for ChatGPT decryption)
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7.0"
-
-# Statically link OpenSSL into Unix release binaries so they do not require a
-# matching system libssl. Windows builds use platform TLS/crypto stacks through
-# transitive dependencies, and forcing vendored OpenSSL breaks MSVC cross-builds.
-[target.'cfg(not(windows))'.dependencies]
-openssl = { version = "0.10.79", features = ["vendored"] }
-
-# Restores the default SIGPIPE disposition at startup (#356): with Rust's
-# ignore-SIGPIPE default plus the release profile's panic=abort, every stdout
-# write to a closed pipe (`cass ... | head`) became a SIGABRT crash report.
-[target.'cfg(unix)'.dependencies]
-sigpipe = "0.1.3"
-
-[features]
-default = ["qr", "encryption"]
-qr = ["dep:qrcode", "dep:image"]
-encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
-backtrace = []
-# NOTE: the former `semantic` feature was retired (bead tg5o9). It had become
-# vacuous after cass#308: the pure-Rust `frankensearch/native` backend
-# (frankentorch tensors, runtime-dispatched SIMD) ships in the always-on
-# frankensearch feature set above, so every binary carries semantic support on
-# any CPU and there is no `-baseline` artifact or AVX2 static-init hazard
-# (cass#256) anymore. `--no-default-features` builds still had the native
-# stack compiled in while the stale `cfg(not(feature = "semantic"))` arm
-# refused `--mode semantic` with an ONNX-era error — an internally
-# contradictory binary. Semantic availability is now a runtime question
-# (model installed or hash fallback), never a compile-time one.
-# Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
-# validate the optional /data/projects path checkouts before enabling local overrides.
-strict-path-dep-validation = []
-# Internal, in-memory seam for feeding engine-ranked message identities through
-# the production CASS SQLite message projector and result reducer. This does not
-# enable artifact persistence or make a conformance/admission claim by itself.
-cass-layer-b-conformance = []
-
-[build-dependencies]
-vergen = { version = "10.0.0", default-features = false, features = ["build", "cargo"] }
-toml = "1.1.2"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
-insta = { version = "1.47.2", features = ["yaml", "json"] }
-criterion = "0.8.2"
-once_cell = "1.21.4"
-serial_test = "4.0.1"
-proptest = "1.11.0"
-arbitrary = { version = "1", features = ["derive"] }
-serde_yaml = "0.9.34"
-rand = "0.10"
-rand_chacha = "0.10"
-# rusqlite is retained only for C-SQLite interop fixtures in tests; production
-# storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
-# The manifest-policy build gate requires this explicit dev entry for compat
-# fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.8", package = "fsqlite-types" }
-
-# The fsqlite family now resolves from crates.io (0.3.1) for every direct and
-# transitive consumer, so the former [patch.crates-io] git override is gone.
-# build.rs enforces the registry identity (single 0.3.1 fsqlite family in the
-# lockfile, no patch reintroduction) as the dependency source contract.
-
-[[bin]]
-name = "cass"
-path = "src/main.rs"
-test = false
-
-[[bin]]
-name = "cass-pages-perf-bundle"
-path = "src/bin/cass-pages-perf-bundle.rs"
-test = false
-
-[[bin]]
-name = "e2e-run-bundle"
-path = "src/bin/e2e-run-bundle.rs"
-test = false
-
-# fsqlite 0.3.x's async engine builds enormous debug-mode futures; at
-# opt-level 0 a single statement poll can overflow even a 16 MiB test-thread
-# stack (analytics::query storage tests SIGABRT'd during the 0.3.1 gate).
-# Upstream frankensqlite develops at `[profile.dev] opt-level = 1` and
-# franken_agent_detection uses this exact dependencies-only form for the same
-# reason. Applies to dependencies only, never this crate's own code/tests.
-#
-# The fsqlite 0.3.4 uptake pushed these futures past what opt-level 1 covers:
-# `cli_read_db_tests::state_meta_json_reports_active_data_dir_lock_without_db_path_metadata`
-# SIGABRT'd on a stack overflow. Verified as a size problem, not a logic
-# regression — the same test passes unchanged under a larger thread stack — so
-# the fix is `RUST_MIN_STACK` in `.cargo/config.toml` rather than opt-level 2
-# here. opt-level 2 also works but forces a full rebuild of every dependency
-# at roughly double the artifact size, which is not worth it for a test-thread
-# stack bound.
-[profile.dev.package."*"]
-opt-level = 1
+tempfile = "3.27.0"
 
 [profile.release]
 lto = true
@@ -253,123 +47,9 @@ strip = true
 panic = "abort"
 opt-level = 3
 
-# Optimized build with symbols for profiling (perf/flamegraphs).
-# Usage: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
-[profile.profiling]
-inherits = "release"
-debug = true
-strip = false
+[lints.rust]
+unsafe_code = "forbid"
 
-# Dedicated profile for benchmark runs that need to land in .bench-history/
-# pass-over-pass ratchets per the gauntlet keep-gate rules. Inherits release
-# (opt-level=3, lto, panic=abort) and adds line-tables + frame pointers so
-# samply/flamegraph attribution works without rebuilding.
-# Usage: RUSTFLAGS="-C force-frame-pointers=yes" cargo bench --profile release-perf
-[profile.release-perf]
-inherits = "release"
-debug = "line-tables-only"
-strip = false
-
-# The dependency graph is pinned to the asupersync 0.4.x line (0.4.9). Keep
-# frankensqlite plus frankensearch and franken-agent-detection revs aligned so
-# Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
-#
-# If you need to build against a local checkout of asupersync (sibling
-# at ../asupersync) during runtime-level hacking, add the following
-# [patch.crates-io] block LOCALLY and DO NOT COMMIT IT — the
-# fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
-# fail if any [patch] block pointing at sibling paths is committed:
-#
-# [patch.crates-io]
-# asupersync = { path = "../asupersync" }
-# franken-decision = { path = "../asupersync/franken_decision" }
-# franken-evidence = { path = "../asupersync/franken_evidence" }
-# franken-kernel = { path = "../asupersync/franken_kernel" }
-#
-# build.rs validates the committed dependency source contracts and can validate
-# sibling repos below when `strict-path-dep-validation` is enabled.
-#
-# LOCAL DEVELOPMENT: Uncomment the [patch] sections below to build against
-# local sibling repo checkouts instead of committed registry/git pins. These
-# are commented out by default so that a clean clone builds without requiring
-# specific directory layout. See build.rs for validation details.
-#
-# A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
-# — if you re-enable any of these [patch] blocks, that workflow will fail.
-#
-# [patch."https://github.com/Dicklesworthstone/frankensqlite"]
-# fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-# fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-# [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
-# franken-agent-detection = { path = "../franken_agent_detection" }
-#
-# Enable strict validation before uncommenting any additional sibling path overrides:
-# cargo check --features strict-path-dep-validation
-# LOCAL DEV ONLY (CASS->Quill flip). Must be re-commented before commit: a path
-# patch on a shared branch breaks every other checkout.
-# [patch."https://github.com/Dicklesworthstone/frankensearch"]
-# frankensearch = { path = "../frankensearch/frankensearch" }
-# frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
-# frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
-# frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
-# frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
-# frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
-# frankensearch-quill = { path = "../frankensearch/crates/frankensearch-quill" }
-# frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
-
-[workspace.metadata.dist]
-targets = ["x86_64-unknown-linux-gnu"]
-installers = ["shell", "powershell"]
-ci = ["github"]
-
-[[bench]]
-name = "index_perf"
-harness = false
-
-[[bench]]
-name = "runtime_perf"
-harness = false
-
-[[bench]]
-name = "search_perf"
-harness = false
-
-[[bench]]
-name = "search_latency_e2e"
-harness = false
-
-[[bench]]
-name = "crypto_perf"
-harness = false
-
-[[bench]]
-name = "db_perf"
-harness = false
-
-[[bench]]
-name = "export_perf"
-harness = false
-
-[[bench]]
-name = "cache_micro"
-harness = false
-
-[[bench]]
-name = "integration_regression"
-harness = false
-
-[[bench]]
-name = "redaction_perf"
-harness = false
-
-[[test]]
-name = "docs"
-path = "tests/docs/mod.rs"
-
-[[test]]
-name = "upgrade"
-path = "tests/upgrade/mod.rs"
-
-[[test]]
-name = "recovery"
-path = "tests/recovery/mod.rs"
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

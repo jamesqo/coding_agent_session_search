@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "change_id": "cass-independent-core",
+  "mode": "direct",
+  "run_id": "direct-sha256:7b337",
+  "contract_hash": "sha256:7b337874cb544dd1fe84fa4699da8154f57db3e92dea8c87b8fbde100b21dc3b",
+  "state": "running",
+  "started_at": "2026-08-24T23:25:38Z",
+  "brief_path": ".vspec/changes/cass-independent-core/contract.md"
+}

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "config": {
+    "annotate-with-claims": {
+      "claimStage": "lock",
+      "approvalMode": "prompt"
+    },
+    "define-behavioral-tests": {
+      "approvalMode": "delegated",
+      "coverageLevel": "auto",
+      "exclusionMode": "auto",
+      "finalApproval": "auto",
+      "handoffContinuation": "auto",
+      "priorityMode": "auto",
+      "profileMode": "auto"
+    },
+    "generate-acceptance-tests": {
+      "declarationApproval": "auto",
+      "defaultScope": "comprehensive",
+      "gherkinDocumentation": "omit",
+      "handoffContinuation": "auto"
+    }
+  },
+  "skills": [
+    "rust-coding-conventions"
+  ]
+}

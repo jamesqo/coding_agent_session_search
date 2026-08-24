@@ -1,0 +1,147 @@
+name: vspec
+version: 1
+description: OpenSpec change governance with Veritas claims, planning, and evidence gates
+
+artifacts:
+  - id: proposal
+    generates: proposal.md
+    description: Change motivation, scope, capabilities, and success boundary
+    template: proposal.md
+    instruction: |
+      Require completed VSpec project bootstrap. The OpenSpec project context
+      must record user-confirmed implementation language, native test
+      framework, compatible Veritas evidence producer, and the workflow skill
+      catalog root or roots. If any choice is absent or unsupported, stop and
+      invoke `vspec-init`; do not write proposal.md.
+
+      Later artifacts name workflow skills without addresses. Resolve each one
+      under a recorded catalog root. When a name resolves elsewhere, record
+      that root in project context so the next consumer does not repeat the
+      search.
+
+      Before writing proposal.md, require project-bound Veritas access. Prefer
+      active MCP. When MCP is unavailable, permit `vtas` CLI fallback only
+      after `vtas --project <absolute-project-root> status --json` succeeds.
+      Record access mode in project context. Stop only when neither path works.
+
+      Create a concise proposal explaining WHY this change exists.
+
+      Name every new or modified OpenSpec capability. Keep implementation
+      choices out of this artifact. Record observable success and explicit
+      non-goals so later artifacts cannot grow scope silently.
+    requires: []
+
+  - id: specs
+    generates: "specs/**/*.md"
+    description: Behavioral delta specifications for affected capabilities
+    template: spec.md
+    instruction: |
+      Invoke `write-spec` with `postWordingReview: none` to create or
+      revise one behavioral delta spec per capability named by proposal.md.
+      Treat this change's spec path and the OpenSpec delta structure below as
+      the output contract for that workflow; do not write a second
+      project-level specification. That workflow must invoke
+      `annotate-with-claims` with `claimStage: provisional` before first
+      presentation and after each revision. Do not lock claims in this stage.
+
+      Use OpenSpec ADDED, MODIFIED, REMOVED, and RENAMED sections. Every
+      requirement uses `### Requirement:` and has at least one testable
+      `#### Scenario:` using WHEN and THEN. MODIFIED requirements contain the
+      complete replacement block. Specs own observable behavior, not internal
+      design or execution steps.
+    requires:
+      - proposal
+
+  - id: design
+    generates: design.md
+    description: Technical decisions, ownership boundaries, risks, and migration approach
+    template: design.md
+    instruction: |
+      Explain HOW the proposed behavior will be implemented.
+
+      Confirm every bootstrapped implementation language and intended native
+      test framework, then verify Veritas has a compatible runnable evidence
+      producer. If native evidence support is missing, stop and report the
+      unsupported stack plus explicit choices: approve a
+      cross-language bridge, add a native producer, change stacks, or defer
+      evidence while leaving the workflow blocked. Never select or configure a
+      fallback test framework without explicit user approval.
+
+      Record only material architecture decisions, alternatives, ownership
+      boundaries, dependency direction, risks, migration, and rollback. Do not
+      restate requirements. Any new observable guarantee belongs back in specs.
+      Record the approved language, test framework, evidence producer, and any
+      bridge in Tooling Compatibility. Resolve questions that would change
+      behavior, architecture, delivery decomposition, or evidence support
+      before continuing.
+    requires:
+      - specs
+
+  - id: plan
+    generates: plan.md
+    description: Veritas delivery plan with components, phases, dependency order, and proof gates
+    template: plan.md
+    instruction: |
+      Use Veritas itself as the planning-readiness gate. Do not create or
+      maintain a separate evidence-readiness artifact.
+
+      Recheck project-bound Veritas access. Prefer active MCP. When unavailable
+      or bound elsewhere, permit CLI fallback only after
+      `vtas --project <absolute-project-root> status --json` succeeds. Stop only
+      when neither path works.
+
+      Require resolved Tooling Compatibility from design.md and a configured
+      runnable evidence producer compatible with that decision. Never select a
+      substitute framework here.
+
+      Specification authoring owns provisional marker reconciliation. Use
+      `annotate-with-claims`, `define-behavioral-tests`, and
+      `generate-acceptance-tests` only when the selected proof policy or
+      material behavior change needs them. Claim locking, coverage modeling,
+      acceptance-test generation, evidence-link review, and evidence approval
+      are not universal pre-execution stages.
+
+      Treat Veritas output as authoritative; never transcribe hashes, links,
+      approvals, or findings into a second maintained readiness record.
+      Optional generated reports are audit output only. A consumer-relevant
+      claim that no supported boundary can falsify may remain in the spec with
+      a `[[coverage.exclude]]` entry carrying the claim and required `reason`;
+      exclusions grant no coverage, proof, or approval.
+
+      Invoke `create-implementation-plan` only for delivery that needs a
+      durable phase plan. Direct or validation-only work may proceed from the
+      reviewed contract and record proof at completion. Any resulting plan must
+      preserve Veritas as the completion gate and must not schedule work that
+      pretends an excluded non-falsifiable claim has runnable proof.
+
+      Redirect its approved output into this change's plan.md. Do not write a
+      second project-level plan. The plan must consume proposal, specs, design,
+      current code seams, and fresh Veritas state. It owns component
+      responsibility, preservation, phase dependencies, parallel groups, risks,
+      evidence transitions, and execution progress. Include one OpenSpec-trackable
+      checkbox per bounded phase, integration gate, and final consolidation
+      unit. It must not invent behavior or architecture decisions missing from
+      specs or design.
+    requires:
+      - specs
+      - design
+
+apply:
+  requires: [plan]
+  tracks: plan.md
+  instruction: |
+    Read plan.md, then invoke `autonomous-software-development` for
+    implementation.
+
+    Execute one dependency-ready phase at a time. Before each bounded phase,
+    use `plan-implementation-phase` for a just-in-time execution brief;
+    implement through `implement-plan-phase`. Follow configured
+    isolation, review, verification, and checkpoint policies. Mark a plan.md
+    checkbox complete only after its phase exit and selected proof gates pass.
+    Completion requires current Veritas evidence for the chosen proof policy;
+    implementation progress itself does not require a separate coverage model
+    or acceptance-test-authoring ceremony.
+
+    OpenSpec tracks progress. Veritas phase state and evidence determine
+    completion. Missing Veritas capabilities or stale plan inputs stop apply;
+    never degrade silently to generic checkbox execution.

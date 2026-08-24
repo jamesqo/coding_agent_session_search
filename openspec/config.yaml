@@ -1,0 +1,46 @@
+schema: vspec
+
+context: |
+  Implementation language: Rust.
+  Native test framework and runner: cargo nextest 0.9.143.
+  Veritas evidence producer: rust-test (discovery); nextest executes tests.
+  Configured agent hosts: Codex and Claude Code.
+  Veritas access mode: project-bound CLI fallback via vtas until host reload
+  exposes the project-scoped MCP server.
+  Workflow skill catalog root: /home/james/.local/share/skill-issue/skills.
+  Resolve named VSpec workflow skills under that root first. If a skill name
+  resolves elsewhere, record its concrete catalog root here before use.
+  Product scope: independent CASS supporting only Claude Code and Codex.
+  Test execution uses cargo nextest run for parallelism; cargo test remains
+  only for doctests or cases nextest cannot execute.
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

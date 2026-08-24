@@ -1,0 +1,3 @@
+schema: vspec
+created: 2026-08-24
+goal: Replace CASS in place with a completely independent Claude Code and Codex search CLI using rusqlite, SQLite FTS5, semantic retrieval, fusion, and reranking.
