@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fastembed::{
     EmbeddingModel, InitOptionsUserDefined, RerankInitOptions, RerankInitOptionsUserDefined,
@@ -27,6 +27,7 @@ const EMBEDDING_WORKERS: usize = 8;
 const EMBEDDING_THREADS_PER_WORKER: usize = 2;
 const EMBEDDING_WAVE_SIZE: usize = EMBEDDING_BATCH_SIZE * EMBEDDING_WORKERS;
 const EMBEDDING_CHECKPOINT_ROWS: u64 = 4_096;
+const EMBEDDING_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const RRF_K: f32 = 60.0;
 static EMBEDDING_GENERATION: OnceLock<String> = OnceLock::new();
 
@@ -370,6 +371,7 @@ pub(crate) fn rebuild_embeddings(
             .ok_or_else(|| AppError::internal("too many embeddings"))
     })?;
     let started = Instant::now();
+    let mut last_progress = started;
     let mut summary = EmbeddingSummary::default();
     let mut rows_since_checkpoint = 0_u64;
     for wave in groups.chunks(EMBEDDING_WAVE_SIZE) {
@@ -414,7 +416,13 @@ pub(crate) fn rebuild_embeddings(
                 storage.checkpoint_writer()?;
                 rows_since_checkpoint = 0;
             }
-            on_progress(embedding_progress(&summary, total_vectors, started));
+            let now = Instant::now();
+            if now.duration_since(last_progress) >= EMBEDDING_PROGRESS_INTERVAL
+                || summary.stored_vectors == total_vectors
+            {
+                on_progress(embedding_progress(&summary, total_vectors, started));
+                last_progress = now;
+            }
         }
     }
     summary.reused_vectors = summary

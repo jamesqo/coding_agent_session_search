@@ -118,25 +118,25 @@ The checkpoint row target is a private constant chosen large enough to avoid
 per-transaction overhead and small enough to bound lost inference. Checkpoints
 never divide an exact-text group, even if one group exceeds the target.
 
-### Emit progress from completed inference batches
+### Rate-limit progress from completed inference batches
 
 Semantic indexing returns an `EmbeddingSummary` containing stored vectors,
-actual model inferences, and duplicate reuses. After each inference batch, a
-progress callback emits one newline-delimited JSON object to standard error with
-the specified cumulative counters, elapsed time, and stored-vector rate. The
-normal final `IndexResponse` remains the only standard-output object. Progress
-write failures remain non-fatal, matching existing ingestion progress behavior.
+actual model inferences, and duplicate reuses. After completed inference
+batches, a progress callback emits at most one newline-delimited JSON object per
+second, plus the final event, with the specified cumulative counters, elapsed
+time, and stored-vector rate. The normal final `IndexResponse` remains the only
+standard-output object. Progress write failures remain non-fatal, matching
+existing ingestion progress behavior.
 
 ### Benchmark outside ordinary gates
 
-An ignored real-model benchmark test uses `CASS_TEST_MODELS_DIR` and a checked,
-deterministic manifest that reproduces the measured Xenia length buckets and
-duplicate multiplicities without committing private session text. It compares
-the reference identifier-order path to candidate length-aware batching, records
-stored and inferred throughput, checks the 0.98 cosine floor and canonical
-determinism, and verifies retrieval-fixture relevance. The repository records
-the command, machine, corpus-shape manifest, batch size, and result in the change
-plan when the implementation is accepted.
+An ignored real-model benchmark test uses `CASS_TEST_MODELS_DIR` and a disposable
+copy of an explicitly selected real database. It records stored and inferred
+throughput. Separate ignored tests compare singleton reference inference to the
+canonical pooled path, check the 0.98 cosine floor and canonical determinism,
+and verify retrieval-fixture relevance. The repository records the command,
+machine, corpus size, selected constants, and result in the change plan when the
+implementation is accepted.
 
 ## Tooling Compatibility
 

@@ -107,7 +107,7 @@ real-model tests own inference equivalence and performance evidence.
 - Non-goals: terminal UI, colors, progress bars, or configurable cadence.
 - Claim: `semantic-indexing/progress-is-monotonic`.
 - Dependencies: C1 counters; compatible with C2 checkpoints.
-- Risk: excessive output; emit once per completed model batch.
+- Risk: excessive output; emit at most once per second plus the final event.
 
 ### C4: Reproducible performance acceptance
 
@@ -148,8 +148,9 @@ defines readiness.
   CLI interruption tests demonstrate durable partial coverage, not-ready search,
   and missing-only retry. Dependencies: PH-1. Parallel group: B.
 
-- [x] **PH-3 — Progress contract (C3):** expose embedding counters and emit one
-  monotonic stderr JSON event per inference batch without changing final stdout.
+- [x] **PH-3 — Progress contract (C3):** expose embedding counters and emit a
+  monotonic stderr JSON event at most once per second plus the final event,
+  without changing final stdout.
   Exit: CLI contract tests parse the event stream and final response and link the
   progress claim. Dependencies: PH-1; may proceed in parallel with PH-2 after
   the summary interface lands. Parallel group: B.
