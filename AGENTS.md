@@ -53,6 +53,4 @@ The real-model integration test is ignored by default and requires an explicit
 
 ## Git
 
-Work on `main`. After pushing `main`, keep the legacy branch mirror synchronized
-with `git push origin main:master` until that remote compatibility branch is
-removed.
+Work on and push `main`; it is the repository's sole development branch.
