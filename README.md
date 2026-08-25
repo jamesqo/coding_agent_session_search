@@ -47,16 +47,14 @@ provider registry, compatibility layer, or alternate output encoding.
 
 ```bash
 cargo fmt --check
-env TMPDIR=/home/james/scratch/cass-tmp \
-  CARGO_TARGET_DIR=/home/james/scratch/cass-targets/integrated \
-  CARGO_INCREMENTAL=0 cargo nextest run
-env TMPDIR=/home/james/scratch/cass-tmp \
-  CARGO_TARGET_DIR=/home/james/scratch/cass-targets/integrated \
-  CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings
-env TMPDIR=/home/james/scratch/cass-tmp \
-  CARGO_TARGET_DIR=/home/james/scratch/cass-targets/integrated \
-  CARGO_INCREMENTAL=0 cargo test --doc
+cargo nextest run
+cargo clippy --all-targets -- -D warnings
+cargo test --doc
 ```
 
 The real-model integration test is ignored by default and requires
 `CASS_TEST_MODELS_DIR` pointing at assets created by `cass models install`.
+
+## License
+
+See [LICENSE](LICENSE).

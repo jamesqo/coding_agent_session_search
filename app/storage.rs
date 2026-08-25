@@ -98,6 +98,7 @@ impl Storage {
         connection
             .execute_batch(SCHEMA)
             .map_err(AppError::database)?;
+        purge_unsupported_providers(&connection)?;
         Ok(Self { connection })
     }
 
@@ -403,6 +404,32 @@ impl Storage {
         transaction.commit().map_err(AppError::database)?;
         Ok(removed > 0)
     }
+}
+
+fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> {
+    connection
+        .execute_batch(
+            "DELETE FROM message_fts
+              WHERE conversation_id IN (
+                    SELECT id FROM conversations
+                     WHERE provider NOT IN ('claude-code', 'codex')
+              );
+             DELETE FROM message_embeddings
+              WHERE message_id IN (
+                    SELECT messages.id
+                      FROM messages
+                      JOIN conversations ON conversations.id = messages.conversation_id
+                     WHERE conversations.provider NOT IN ('claude-code', 'codex')
+              );
+             DELETE FROM messages
+              WHERE conversation_id IN (
+                    SELECT id FROM conversations
+                     WHERE provider NOT IN ('claude-code', 'codex')
+              );
+             DELETE FROM conversations
+              WHERE provider NOT IN ('claude-code', 'codex');",
+        )
+        .map_err(AppError::database)
 }
 
 fn encode_vector(vector: &[f32]) -> Vec<u8> {

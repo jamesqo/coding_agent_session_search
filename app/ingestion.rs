@@ -163,10 +163,10 @@ fn parse_claude(path: &Path) -> Result<ParsedFile, AppError> {
 fn parse_codex(path: &Path) -> Result<ParsedFile, AppError> {
     parse_jsonl(path, "codex", |raw| {
         let entry_type = raw.get("type").and_then(Value::as_str)?;
-        match entry_type {
-            "response_item" => extract_codex_response_item(raw),
-            "event_msg" => extract_codex_event(raw),
-            _ => None,
+        if entry_type == "response_item" {
+            extract_codex_response_item(raw)
+        } else {
+            None
         }
     })
 }
@@ -211,28 +211,6 @@ fn extract_codex_response_item(raw: &Value) -> Option<ExtractedMessage> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         role,
-        content,
-        parse_timestamp(raw.get("timestamp")),
-        None,
-    ))
-}
-
-fn extract_codex_event(raw: &Value) -> Option<ExtractedMessage> {
-    let payload = raw.get("payload")?;
-    let payload_type = payload.get("type").and_then(Value::as_str)?;
-    let role = match payload_type {
-        "user_message" => "user",
-        "agent_message" | "assistant_message" => "assistant",
-        _ => return None,
-    };
-    let content = payload
-        .get("message")
-        .or_else(|| payload.get("content"))
-        .or_else(|| payload.get("text"))
-        .and_then(flatten_content)?;
-    Some((
-        payload.get("id").and_then(Value::as_str).map(str::to_owned),
-        role.to_owned(),
         content,
         parse_timestamp(raw.get("timestamp")),
         None,
@@ -440,6 +418,26 @@ mod tests {
         assert_eq!(conversation.id, "c1");
         assert_eq!(conversation.messages.len(), 2);
         assert!(conversation.messages[1].content.contains("Tool search"));
+    }
+
+    #[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]
+    #[test]
+    fn codex_parser_ignores_mirrored_event_messages() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"c-mirror"}}}}"#
+        )
+        .expect("meta line");
+        writeln!(file, r#"{{"type":"response_item","payload":{{"type":"message","id":"m1","role":"user","content":[{{"type":"input_text","text":"mirrored turn"}}]}}}}"#)
+            .expect("response item");
+        writeln!(file, r#"{{"type":"event_msg","payload":{{"type":"user_message","message":"mirrored turn"}}}}"#)
+            .expect("mirrored event");
+
+        let parsed = parse_codex(file.path()).expect("parse Codex history");
+        let conversation = parsed.conversation.expect("conversation");
+        assert_eq!(conversation.messages.len(), 1);
+        assert_eq!(conversation.messages[0].content, "mirrored turn");
     }
 
     #[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use veritas_test_macros as veritas;
 
@@ -135,6 +136,7 @@ fn index_search_view_and_forget_supported_histories() {
         concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-1\"}}\n",
             "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"m1\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"check the database\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"database checked\"}]}}\n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"database checked\"}}\n",
         ),
     )
@@ -200,6 +202,68 @@ fn unsupported_records_are_ignored() {
     assert_eq!(indexed["scanned_files"], 1);
     assert_eq!(indexed["indexed_conversations"], 0);
     assert_eq!(indexed["indexed_messages"], 0);
+}
+
+#[veritas::claims("ingestion/unsupported-providers-ignored")]
+#[test]
+fn removed_provider_rows_are_purged_from_existing_databases() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("cass.sqlite3");
+    let removed_provider = ["her", "mes"].concat();
+    seed_database_with_removed_provider_rows(&database, &removed_provider);
+
+    let status = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "status",
+    ]);
+    assert_eq!(status["conversations"], 1);
+    assert_eq!(status["messages"], 1);
+
+    let removed = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "search",
+        "legacyneedle",
+    ]);
+    assert_eq!(removed["results"].as_array().map(Vec::len), Some(0));
+
+    let supported = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "search",
+        "supportedneedle",
+    ]);
+    assert_eq!(supported["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(supported["results"][0]["provider"], "codex");
+
+    let claude_root = directory.path().join("claude");
+    let codex_root = directory.path().join("codex");
+    std::fs::create_dir_all(&claude_root).expect("Claude root");
+    std::fs::create_dir_all(&codex_root).expect("Codex root");
+    let indexed = run_json_with_roots(
+        &[
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "index",
+            "--full",
+        ],
+        &claude_root,
+        &codex_root,
+    );
+    assert_eq!(indexed["indexed_conversations"], 1);
+    assert_eq!(indexed["indexed_messages"], 1);
+
+    let removed_after_rebuild = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "search",
+        "legacyneedle",
+    ]);
+    assert_eq!(
+        removed_after_rebuild["results"].as_array().map(Vec::len),
+        Some(0)
+    );
 }
 
 #[veritas::claims(
@@ -452,5 +516,81 @@ fn maintained_repository_is_independent_and_minimal() {
             !maintained.contains(&name.to_ascii_lowercase()),
             "prohibited dependency surface remains: {name}"
         );
+    }
+}
+
+fn seed_database_with_removed_provider_rows(path: &Path, removed_provider: &str) {
+    let connection = Connection::open(path).expect("open seed database");
+    let schema = format!(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE conversations (
+             id TEXT PRIMARY KEY,
+             provider TEXT NOT NULL CHECK (
+                 provider IN ('claude-code', 'codex', '{removed_provider}')
+             ),
+             source_path TEXT NOT NULL UNIQUE,
+             title TEXT,
+             created_at INTEGER,
+             updated_at INTEGER
+         );
+         CREATE TABLE messages (
+             id TEXT PRIMARY KEY,
+             conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+             ordinal INTEGER NOT NULL,
+             role TEXT NOT NULL,
+             content TEXT NOT NULL,
+             created_at INTEGER,
+             UNIQUE (conversation_id, ordinal)
+         );
+         CREATE TABLE message_embeddings (
+             message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+             dimensions INTEGER NOT NULL,
+             vector BLOB NOT NULL
+         );
+         CREATE VIRTUAL TABLE message_fts USING fts5(
+             content,
+             message_id UNINDEXED,
+             conversation_id UNINDEXED,
+             tokenize = 'unicode61'
+         );"
+    );
+    connection.execute_batch(&schema).expect("seed schema");
+    for (conversation_id, provider, source_path, message_id, content) in [
+        (
+            "legacy-conversation",
+            removed_provider,
+            "/tmp/legacy.jsonl",
+            "legacy-message",
+            "legacyneedle",
+        ),
+        (
+            "codex-conversation",
+            "codex",
+            "/tmp/codex.jsonl",
+            "codex-message",
+            "supportedneedle",
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO conversations(id, provider, source_path)
+                 VALUES (?1, ?2, ?3)",
+                params![conversation_id, provider, source_path],
+            )
+            .expect("seed conversation");
+        connection
+            .execute(
+                "INSERT INTO messages(id, conversation_id, ordinal, role, content)
+                 VALUES (?1, ?2, 0, 'user', ?3)",
+                params![message_id, conversation_id, content],
+            )
+            .expect("seed message");
+        connection
+            .execute(
+                "INSERT INTO message_fts(content, message_id, conversation_id)
+                 VALUES (?1, ?2, ?3)",
+                params![content, message_id, conversation_id],
+            )
+            .expect("seed FTS");
     }
 }
