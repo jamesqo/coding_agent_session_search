@@ -117,6 +117,8 @@ pub(super) struct StatusResponse {
     database_path: PathBuf,
     conversations: u64,
     messages: u64,
+    embeddings: u64,
+    stored_embeddings: u64,
     models_installed: bool,
     semantic_support: bool,
     realized_mode: &'static str,
@@ -185,6 +187,8 @@ fn index(
     if full {
         storage.rebuild_derived_search_state()?;
     }
+    #[cfg(feature = "semantic")]
+    storage.invalidate_embedding_generation(semantic::embedding_generation())?;
     let models = Models::new(models_dir.to_path_buf());
     let (embeddings, fallback_reason) = match models.load() {
         Ok(Some(mut backend)) => match semantic::rebuild_embeddings(&mut storage, &mut backend) {
@@ -195,8 +199,12 @@ fn index(
         Err(error) => (0, Some(error.message().to_owned())),
     };
     let counts = storage.counts()?;
+    #[cfg(feature = "semantic")]
+    let current_embeddings = storage.embedding_count(semantic::embedding_generation())?;
+    #[cfg(not(feature = "semantic"))]
+    let current_embeddings = 0;
     storage.commit_writer()?;
-    let hybrid_ready = counts.messages > 0 && counts.embeddings == counts.messages;
+    let hybrid_ready = counts.messages > 0 && current_embeddings == counts.messages;
     Ok(Response::Index(IndexResponse {
         indexed_conversations: counts.conversations,
         indexed_messages: counts.messages,
@@ -224,9 +232,12 @@ fn search(
 ) -> Result<Response, AppError> {
     let provider = normalize_provider_filter(provider)?;
     let storage = Storage::open_existing(database_path)?;
-    let counts = storage.counts()?;
+    #[cfg(feature = "semantic")]
+    let current_embeddings = storage.embedding_count(semantic::embedding_generation())?;
+    #[cfg(not(feature = "semantic"))]
+    let current_embeddings = 0;
     let models = Models::new(models_dir.to_path_buf());
-    let backend = if counts.embeddings > 0 {
+    let backend = if current_embeddings > 0 {
         models.load()
     } else {
         Ok(None)
@@ -294,6 +305,8 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
             database_path: database_path.to_path_buf(),
             conversations: 0,
             messages: 0,
+            embeddings: 0,
+            stored_embeddings: 0,
             models_installed,
             semantic_support: cfg!(feature = "semantic"),
             realized_mode: "unavailable",
@@ -303,17 +316,23 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
 
     let storage = Storage::open_existing(database_path)?;
     let counts = storage.counts()?;
+    #[cfg(feature = "semantic")]
+    let current_embeddings = storage.embedding_count(semantic::embedding_generation())?;
+    #[cfg(not(feature = "semantic"))]
+    let current_embeddings = 0;
     let hybrid_ready =
-        models_installed && counts.messages > 0 && counts.embeddings == counts.messages;
+        models_installed && counts.messages > 0 && current_embeddings == counts.messages;
     Ok(Response::Status(StatusResponse {
         ready: true,
         database_path: database_path.to_path_buf(),
         conversations: counts.conversations,
         messages: counts.messages,
+        embeddings: current_embeddings,
+        stored_embeddings: counts.embeddings,
         models_installed,
         semantic_support: cfg!(feature = "semantic"),
         realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
-        recommended_action: (models_installed && counts.embeddings != counts.messages)
+        recommended_action: (models_installed && current_embeddings != counts.messages)
             .then_some("index"),
     }))
 }

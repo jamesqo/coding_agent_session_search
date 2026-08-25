@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE TABLE IF NOT EXISTS message_embeddings (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    generation TEXT NOT NULL DEFAULT '',
     dimensions INTEGER NOT NULL,
     vector BLOB NOT NULL
 );
@@ -176,6 +177,19 @@ impl Storage {
             embeddings: u64::try_from(embeddings)
                 .map_err(|_| AppError::internal("negative embedding count"))?,
         })
+    }
+
+    #[cfg(feature = "semantic")]
+    pub(crate) fn embedding_count(&self, generation: &str) -> Result<u64, AppError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM message_embeddings WHERE generation = ?1",
+                [generation],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)?;
+        u64::try_from(count).map_err(|_| AppError::internal("negative embedding count"))
     }
 
     pub(crate) fn replace_conversation(
@@ -447,7 +461,10 @@ impl Storage {
     }
 
     #[cfg(feature = "semantic")]
-    pub(crate) fn messages_needing_embeddings(&self) -> Result<Vec<SearchableMessage>, AppError> {
+    pub(crate) fn messages_needing_embeddings(
+        &self,
+        generation: &str,
+    ) -> Result<Vec<SearchableMessage>, AppError> {
         let mut statement = self
             .connection
             .prepare(
@@ -455,12 +472,13 @@ impl Storage {
                    FROM messages
                    LEFT JOIN message_embeddings
                      ON message_embeddings.message_id = messages.id
+                    AND message_embeddings.generation = ?1
                   WHERE message_embeddings.message_id IS NULL
                   ORDER BY messages.id",
             )
             .map_err(AppError::database)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([generation], |row| {
                 Ok(SearchableMessage {
                     id: row.get(0)?,
                     content: row.get(1)?,
@@ -474,6 +492,7 @@ impl Storage {
     #[cfg(feature = "semantic")]
     pub(crate) fn replace_embeddings(
         &mut self,
+        generation: &str,
         embeddings: &[(&str, &[f32])],
     ) -> Result<(), AppError> {
         for (message_id, vector) in embeddings {
@@ -481,12 +500,13 @@ impl Storage {
                 .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
             self.connection
                 .execute(
-                    "INSERT INTO message_embeddings(message_id, dimensions, vector)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO message_embeddings(message_id, generation, dimensions, vector)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(message_id) DO UPDATE SET
+                        generation = excluded.generation,
                         dimensions = excluded.dimensions,
                         vector = excluded.vector",
-                    params![message_id, dimensions, encode_vector(vector)],
+                    params![message_id, generation, dimensions, encode_vector(vector)],
                 )
                 .map_err(AppError::database)?;
         }
@@ -496,6 +516,7 @@ impl Storage {
     #[cfg(feature = "semantic")]
     pub(crate) fn semantic_documents(
         &self,
+        generation: &str,
         provider: Option<&str>,
         days: Option<u32>,
     ) -> Result<Vec<SemanticDocument>, AppError> {
@@ -508,13 +529,14 @@ impl Storage {
                    FROM message_embeddings e
                    JOIN messages m ON m.id = e.message_id
                    JOIN conversations c ON c.id = m.conversation_id
-                  WHERE (?1 IS NULL OR c.provider = ?1)
-                    AND (?2 IS NULL OR m.created_at >= ?2)
+                  WHERE e.generation = ?1
+                    AND (?2 IS NULL OR c.provider = ?2)
+                    AND (?3 IS NULL OR m.created_at >= ?3)
                   ORDER BY m.id",
             )
             .map_err(AppError::database)?;
         let rows = statement
-            .query_map(params![provider, cutoff], |row| {
+            .query_map(params![generation, provider, cutoff], |row| {
                 let dimensions: i64 = row.get(5)?;
                 let bytes: Vec<u8> = row.get(6)?;
                 let vector = decode_vector(dimensions, &bytes).map_err(|message| {
@@ -545,6 +567,22 @@ impl Storage {
             .map_err(AppError::database)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(AppError::database)
+    }
+
+    #[cfg(feature = "semantic")]
+    pub(crate) fn invalidate_embedding_generation(
+        &mut self,
+        generation: &str,
+    ) -> Result<u64, AppError> {
+        self.require_writer()?;
+        let removed = self
+            .connection
+            .execute(
+                "DELETE FROM message_embeddings WHERE generation <> ?1",
+                [generation],
+            )
+            .map_err(AppError::database)?;
+        u64::try_from(removed).map_err(|_| AppError::internal("too many stale embeddings"))
     }
 
     pub(crate) fn view(&self, id: &str, context: u32) -> Result<Vec<Message>, AppError> {
@@ -697,6 +735,12 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
         "fingerprint",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(
+        &transaction,
+        "message_embeddings",
+        "generation",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     purge_unsupported_providers(&transaction)?;
     if !provider_schema_is_current(&transaction)? {
         rebuild_provider_schema(&transaction)?;
@@ -742,6 +786,7 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
              );
              CREATE TABLE message_embeddings_next (
                 message_id TEXT PRIMARY KEY REFERENCES messages_next(id) ON DELETE CASCADE,
+                generation TEXT NOT NULL DEFAULT '',
                 dimensions INTEGER NOT NULL, vector BLOB NOT NULL
              );
              INSERT INTO conversations_next
@@ -750,7 +795,8 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
              INSERT INTO messages_next
                 SELECT id, conversation_id, ordinal, role, content, created_at, fingerprint
                 FROM messages;
-             INSERT INTO message_embeddings_next SELECT * FROM message_embeddings;
+             INSERT INTO message_embeddings_next(message_id, generation, dimensions, vector)
+                SELECT message_id, generation, dimensions, vector FROM message_embeddings;
              DROP TABLE message_fts;
              DROP TABLE message_embeddings;
              DROP TABLE messages;
@@ -987,13 +1033,17 @@ mod tests {
                     VALUES ('message-1', 'session-1', 0, 'user', 'preserved');
                  INSERT INTO message_fts(content, message_id, conversation_id)
                     VALUES ('preserved', 'message-1', 'session-1');
+                 INSERT INTO message_embeddings(message_id, dimensions, vector)
+                    VALUES ('message-1', 1, X'0000803F');
                  PRAGMA user_version = 1;",
             )
             .expect("seed older schema");
         drop(connection);
 
         let storage = Storage::open(&path).expect("migrate database");
-        assert_eq!(storage.counts().expect("counts").messages, 1);
+        let counts = storage.counts().expect("counts");
+        assert_eq!(counts.messages, 1);
+        assert_eq!(counts.embeddings, 1);
         assert_eq!(
             storage
                 .connection
@@ -1056,7 +1106,7 @@ mod tests {
         assert_eq!(first.changed_message_ids, ["message-1"]);
         #[cfg(feature = "semantic")]
         storage
-            .replace_embeddings(&[("message-1", &[1.0, 0.0])])
+            .replace_embeddings("generation-a", &[("message-1", &[1.0, 0.0])])
             .expect("seed embedding");
         let unchanged = storage
             .replace_conversation(&conversation("first"))
@@ -1066,7 +1116,7 @@ mod tests {
         #[cfg(feature = "semantic")]
         assert!(
             storage
-                .messages_needing_embeddings()
+                .messages_needing_embeddings("generation-a")
                 .expect("embedding selection")
                 .is_empty()
         );
@@ -1077,13 +1127,63 @@ mod tests {
         #[cfg(feature = "semantic")]
         assert_eq!(
             storage
-                .messages_needing_embeddings()
+                .messages_needing_embeddings("generation-a")
                 .expect("embedding selection")
                 .iter()
                 .map(|message| message.id.as_str())
                 .collect::<Vec<_>>(),
             ["message-1"]
         );
+    }
+
+    #[cfg(feature = "semantic")]
+    #[veritas::claims("semantic/stale-embedding-generation-invalidated")]
+    #[test]
+    fn stale_embedding_generation_is_excluded_and_replaced() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("generation proof"))
+            .expect("insert conversation");
+        writer
+            .replace_embeddings("old-generation", &[("message-1", &[1.0, 0.0])])
+            .expect("old embedding");
+        writer.commit_writer().expect("commit old generation");
+        drop(writer);
+
+        let storage = Storage::open(&path).expect("reader");
+        assert_eq!(storage.embedding_count("new-generation").expect("count"), 0);
+        assert_eq!(
+            storage
+                .semantic_documents("new-generation", None, None)
+                .expect("semantic documents")
+                .len(),
+            0
+        );
+        drop(storage);
+
+        let mut writer = Storage::open_writer(&path).expect("replacement writer");
+        assert_eq!(
+            writer
+                .invalidate_embedding_generation("new-generation")
+                .expect("invalidate"),
+            1
+        );
+        assert_eq!(
+            writer
+                .messages_needing_embeddings("new-generation")
+                .expect("re-embedding selection")
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-1"]
+        );
+        writer
+            .replace_embeddings("new-generation", &[("message-1", &[0.0, 1.0])])
+            .expect("new embedding");
+        writer.commit_writer().expect("commit new generation");
+        assert_eq!(writer.embedding_count("new-generation").expect("count"), 1);
     }
 
     #[veritas::claims("storage/forget-persists-through-indexing")]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use fastembed::{
     EmbeddingModel, RerankInitOptions, RerankerModel, TextEmbedding, TextInitOptions, TextRerank,
@@ -18,6 +19,7 @@ const CANDIDATE_LIMIT: usize = 50;
 const RERANK_LIMIT: usize = 20;
 const EMBEDDING_BATCH_SIZE: usize = 32;
 const RRF_K: f32 = 60.0;
+static EMBEDDING_GENERATION: OnceLock<String> = OnceLock::new();
 
 pub(crate) struct Models {
     root: PathBuf,
@@ -170,11 +172,22 @@ impl Backend {
     }
 }
 
+pub(crate) fn embedding_generation() -> &'static str {
+    EMBEDDING_GENERATION.get_or_init(|| {
+        let specification = format!(
+            "fastembed=6.0.1;model={EMBEDDING_MODEL};\
+             vector=f32-little-endian;cosine=exact;schema=1"
+        );
+        blake3::hash(specification.as_bytes()).to_hex().to_string()
+    })
+}
+
 pub(crate) fn rebuild_embeddings(
     storage: &mut Storage,
     backend: &mut Backend,
 ) -> Result<u64, AppError> {
-    let messages = storage.messages_needing_embeddings()?;
+    let generation = embedding_generation();
+    let messages = storage.messages_needing_embeddings(generation)?;
     if messages.is_empty() {
         return Ok(0);
     }
@@ -197,7 +210,7 @@ pub(crate) fn rebuild_embeddings(
         .zip(vectors.iter())
         .map(|(message, vector)| (message.id.as_str(), vector.as_slice()))
         .collect();
-    storage.replace_embeddings(&rows)?;
+    storage.replace_embeddings(generation, &rows)?;
     u64::try_from(rows.len()).map_err(|_| AppError::internal("too many embeddings"))
 }
 
@@ -214,7 +227,7 @@ pub(crate) fn hybrid_search(
         .embed(&[query])?
         .pop()
         .ok_or_else(|| AppError::model("embedding model returned no query vector"))?;
-    let mut semantic = storage.semantic_documents(provider, days)?;
+    let mut semantic = storage.semantic_documents(embedding_generation(), provider, days)?;
     for document in &mut semantic {
         document.hit.semantic_score = Some(cosine_similarity(&query_vector, &document.vector));
     }

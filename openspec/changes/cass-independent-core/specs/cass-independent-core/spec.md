@@ -142,7 +142,10 @@ supported provider and recency filters.
 ### Requirement: Semantic retrieval and reranking
 
 The system SHALL support semantic candidates, RRF fusion, and cross-encoder
-reranking using a mainstream maintained model backend.
+reranking using a mainstream maintained model backend. Each stored vector SHALL
+carry a deterministic identity for its embedding model and vector schema;
+vectors with a different identity SHALL never participate in semantic search
+and SHALL be invalidated during indexing.
 
 #### Scenario: Models installed
 
@@ -161,6 +164,12 @@ reranking using a mainstream maintained model backend.
 <!-- claim: semantic/inference-failure-falls-back -->
 - **WHEN** installed semantic assets cannot load or inference fails
 - **THEN** search still succeeds through FTS5 and reports the semantic failure and lexical realization
+
+#### Scenario: Embedding generation changes
+
+<!-- claim: semantic/stale-embedding-generation-invalidated -->
+- **WHEN** the configured embedding model or stored-vector schema identity changes
+- **THEN** old vectors are excluded immediately and the next index replaces them with current-generation vectors
 
 #### Scenario: Explicit installation
 

@@ -105,9 +105,10 @@ Veritas evidence refresh.
   message cleanup, and complete-scan-only source purging with provider fixtures.
   Depends on PH-2.
 - [x] **PH-4 — Implement incremental semantic enrichment and fallback.** Embed
-  only added/changed messages in bounded batches, replace stale vectors, and
-  preserve truthful lexical results across disabled, missing, load-failed, and
-  inference-failed semantic states. Depends on PH-2 and PH-3.
+  only added/changed messages in bounded batches, version vectors by model and
+  schema generation, replace stale vectors, and preserve truthful lexical
+  results across disabled, missing, load-failed, and inference-failed semantic
+  states. Depends on PH-2 and PH-3.
 - [x] **PH-5 — Integrate distribution and behavioral proof.** Publish full
   semantic release binaries in CI; run default and no-default feature suites,
   migration/concurrency/tombstone/purge scenarios, and real-model coverage when
@@ -155,4 +156,7 @@ gates may execute concurrently once PH-4 completes.
   purging, bounded embeddings, and lexical fallback with failure diagnostics.
 - Verified 30 default-feature tests, 26 lexical-only tests, strict Clippy in
   both realizations, formatting, doctests, a locked release build, strict
-  OpenSpec validation, and a zero-finding Veritas report covering 27 claims.
+  OpenSpec validation, and a zero-finding Veritas report covering 28 claims.
+- Follow-up: advanced the schema to version 4 and keyed every vector by a
+  deterministic FastEmbed model/vector-schema generation hash. Search excludes
+  mismatches immediately; indexing invalidates and re-embeds them.

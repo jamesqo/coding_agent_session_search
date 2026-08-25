@@ -63,6 +63,10 @@ canonical; FTS rows and embeddings are derived.
 - Use SQLite FTS5 BM25 for lexical retrieval.
 - Store one embedding per searchable message and use exact cosine search before
   any benchmark-driven ANN discussion.
+- Store a deterministic generation hash with every embedding. The hash covers
+  the FastEmbed model identity and vector serialization schema; search filters
+  to the current hash and indexing deletes mismatches before selecting messages
+  for bounded re-embedding.
 - Fuse lexical and semantic ranks with a small RRF implementation and rerank a
   bounded candidate set with one mainstream maintained model backend.
 - Keep the model backend concrete: FastEmbed MiniLM-class embeddings and a

@@ -536,9 +536,21 @@ fn invalid_installed_assets_fall_back_to_lexical_search() {
         .expect("message ID");
     connection
         .execute(
-            "INSERT INTO message_embeddings(message_id, dimensions, vector)
-             VALUES (?1, 1, ?2)",
-            params![message_id, 1.0_f32.to_le_bytes().to_vec()],
+            "INSERT INTO message_embeddings(message_id, generation, dimensions, vector)
+             VALUES (?1, ?2, 1, ?3)",
+            params![
+                message_id,
+                blake3::hash(
+                    concat!(
+                        "fastembed=6.0.1;model=AllMiniLML6V2Q;",
+                        "vector=f32-little-endian;cosine=exact;schema=1"
+                    )
+                    .as_bytes()
+                )
+                .to_hex()
+                .to_string(),
+                1.0_f32.to_le_bytes().to_vec()
+            ],
         )
         .expect("seed derived vector");
     drop(connection);

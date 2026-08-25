@@ -41,6 +41,8 @@ not scanned.
 - Search reports `realized_mode` and `fallback_mode` truthfully in JSON.
 - Ordinary refreshes fingerprint sources and messages, skip unchanged input,
   and embed only added or changed messages in bounded batches.
+- Embeddings carry a model/vector-schema generation hash. Search excludes stale
+  generations immediately and the next index re-embeds them.
 - `forget` writes a durable tombstone. Complete scans purge disappeared
   sources; incomplete scans preserve committed state.
 
