@@ -362,8 +362,13 @@ fn index(
     let search_refresh_milliseconds = elapsed_milliseconds(search_started);
     emit_index_phase("semantic-embeddings", &summary);
     let embedding_started = Instant::now();
-    storage.invalidate_embedding_generation(semantic::embedding_generation())?;
-    let embeddings = if storage.has_pending_embeddings()? {
+    let generation = semantic::embedding_generation();
+    let already_published = storage.semantic_generation_is_published(generation)?
+        && !storage.has_pending_embeddings()?;
+    if !already_published {
+        storage.invalidate_embedding_generation(generation)?;
+    }
+    let embeddings = if !already_published && storage.has_pending_embeddings()? {
         storage.commit_and_continue_writer()?;
         let model_started = Instant::now();
         let mut embedding_pool = models.load_indexer()?.ok_or_else(|| {
@@ -376,7 +381,9 @@ fn index(
     };
     let embedding_milliseconds = elapsed_milliseconds(embedding_started);
     let counts = storage.counts()?;
-    storage.mark_semantic_index_ready(semantic::embedding_generation())?;
+    if !already_published {
+        storage.mark_semantic_index_ready(generation)?;
+    }
     storage.commit_writer()?;
     if full {
         storage.truncate_wal()?;

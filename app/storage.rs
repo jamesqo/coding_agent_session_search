@@ -527,6 +527,21 @@ impl Storage {
             .map_err(AppError::database)
     }
 
+    pub(crate) fn semantic_generation_is_published(
+        &self,
+        generation: &str,
+    ) -> Result<bool, AppError> {
+        self.connection
+            .query_row(
+                "SELECT semantic_ready_generation IS ?1
+                   FROM derived_state
+                  WHERE singleton = 1",
+                [generation],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)
+    }
+
     pub(crate) fn mark_semantic_index_ready(&mut self, generation: &str) -> Result<(), AppError> {
         self.require_writer()?;
         if !self.semantic_coverage_is_complete(generation)? {
