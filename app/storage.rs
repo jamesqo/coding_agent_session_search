@@ -1318,12 +1318,6 @@ impl Storage {
     ) -> Result<u64, AppError> {
         self.require_writer()?;
         self.mark_semantic_index_incomplete()?;
-        self.connection
-            .execute_batch(
-                "DELETE FROM semantic_chunks;
-                 DELETE FROM dirty_semantic_chunks;",
-            )
-            .map_err(AppError::database)?;
         let removed = self
             .connection
             .execute(
@@ -1336,6 +1330,24 @@ impl Storage {
                 [generation],
             )
             .map_err(AppError::database)?;
+        if removed != 0 {
+            self.connection
+                .execute("DELETE FROM semantic_chunks", [])
+                .map_err(AppError::database)?;
+            self.connection
+                .execute(
+                    "INSERT INTO dirty_semantic_chunks(chunk_id, generation)
+                     SELECT (m.rowid - 1) / ?2, min(e.generation)
+                       FROM message_embeddings e
+                       JOIN messages m ON m.id = e.message_id
+                      WHERE e.generation = ?1
+                      GROUP BY (m.rowid - 1) / ?2
+                     ON CONFLICT(chunk_id) DO UPDATE SET
+                        generation = excluded.generation",
+                    params![generation, SEMANTIC_CHUNK_ROWS],
+                )
+                .map_err(AppError::database)?;
+        }
         u64::try_from(removed).map_err(|_| AppError::internal("too many stale embeddings"))
     }
 
@@ -3023,6 +3035,43 @@ mod tests {
             )
             .expect("updated first chunk");
         assert_eq!(updated, [0, 126]);
+    }
+
+    #[test]
+    fn current_embedding_generation_cleanup_preserves_packed_chunks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("current generation"))
+            .expect("seed message");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127, 0],
+                    norm: 127.0,
+                }],
+            )
+            .expect("seed embedding");
+        writer.commit_writer().expect("commit semantic chunk");
+
+        let mut writer = Storage::open_writer(&path).expect("no-op generation writer");
+        assert_eq!(
+            writer
+                .invalidate_embedding_generation("generation")
+                .expect("retain current generation"),
+            0
+        );
+        writer
+            .commit_writer()
+            .expect("commit no-op generation check");
+        let preserved_chunks: i64 = writer
+            .connection
+            .query_row("SELECT count(*) FROM semantic_chunks", [], |row| row.get(0))
+            .expect("count preserved chunks");
+        assert_eq!(preserved_chunks, 1);
     }
 
     #[test]
