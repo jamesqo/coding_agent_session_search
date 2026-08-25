@@ -1,4 +1,0 @@
-wrap:
-  Default: no forced wrap (wide output).
-  --wrap <n>: wrap informational text to n columns.
-  --nowrap: force no wrapping even if wrap set elsewhere.

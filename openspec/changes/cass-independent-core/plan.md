@@ -123,7 +123,7 @@ CLI contract, and shared schema are common ownership seams.
   model assets metadata, and semantic tests. Exit: lexical fallback tests pass;
   both target architectures load and infer with the selected backend; hybrid
   integration tests report and exercise fusion plus reranking.
-- [ ] **PH-4 — Delete the legacy product and dependency surface.** Depends on
+- [x] **PH-4 — Delete the legacy product and dependency surface.** Depends on
   PH-3. Consumes the behavior-complete replacement. Produces a consolidated
   manifest and repository containing no legacy application, removed provider,
   Dickles/Franken dependency, TUI, export, analytics, sync, daemon, benchmark,
@@ -303,6 +303,93 @@ all-target Clippy, formatting, and doctests passed. Veritas discovery now sees
 18 evidence declarations with no artifact drift. The 16 uncovered-claim
 findings remain assigned to PH-5 link review and approval. No exclusion was
 introduced. PH-4 is now ready.
+
+### PH-4 Execution Contract: Delete the Legacy Product
+
+Status: implemented
+Depends on: PH-3 (implemented)
+Consumes: behavior-complete independent crate and current OpenSpec/Veritas proof
+Produces: a small maintained repository with no legacy product or prohibited stack
+Owns: every tracked path outside the retained set below
+Concurrent siblings: none
+Verification cadence: plan-final
+Verification role: intermediate
+
+#### Contract
+
+- **Outcome:** the maintained repository consists of the independent `app/`
+  crate, focused tests, minimal operator/developer documentation, minimal CI,
+  license/toolchain configuration, and the active OpenSpec/Veritas contract.
+- **Existing foundation:** `Cargo.toml`, `Cargo.lock`, `app/`, `LICENSE`,
+  `rust-toolchain.toml`, `.cargo/config.toml`, the active
+  `openspec/changes/cass-independent-core` artifacts, `veritas.toml`, and
+  `.veritas` locks remain.
+- **Net-new work:** rewrite `README.md`, `AGENTS.md`, `.gitignore`, Nextest
+  configuration, and `.github/workflows/ci.yml` to describe and test only the
+  replacement.
+- **Removed:** legacy `src/`, `tests/`, `benches/`, `fuzz/`, `scripts/`, docs,
+  web/assets, packaging/install/release machinery, build script, RCH, UBS,
+  ACFS, Beads/Gas City state, stale workflows, old skills/configuration, and
+  every removed-provider or product-surface artifact.
+- **Not included:** semantic behavior changes, release publishing, migration or
+  compatibility work, evidence-link approval, or OpenSpec archival.
+- **Claims and findings:** `independence/no-dickles-franken-surface` and final
+  size accounting; its current uncovered finding remains assigned to PH-5.
+- **Constraints:** PC-1 and PC-5; deletions are authorized, explicit path lists
+  are reviewed before execution, and git history is the recovery mechanism.
+
+#### Execution
+
+1. Rewrite retained README/developer/CI/ignore/Nextest surfaces so no stale
+   command, dependency, provider, or workflow remains.
+2. Review tracked path groups, then delete the legacy product, tests, docs,
+   assets, packaging, scripts, workflows, and Beads/Dickles development
+   machinery in explicit top-level groups. Preserve unrelated untracked
+   machine-managed agent skill directories.
+3. Scan manifests, lockfile, source, tests, workflows, docs, and build surfaces
+   for prohibited Dickles/Franken names and removed provider/product terms.
+   Count production/test Rust and tracked files.
+4. Run model-free Nextest, the explicitly enabled installed-model test,
+   formatting, strict Clippy, doctests, and minimal CI syntax inspection.
+   Refresh Veritas discovery/status/report; PH-5 retains link review and final
+   accumulated proof.
+
+#### Proof
+
+- Targeted: prohibited-name/provider scans and tracked-file/LOC accounting.
+- Native: full current Nextest plus the explicit installed-model test, strict
+  Clippy, formatting, and doctests.
+- Evidence: independence scan declaration added if Veritas supports it;
+  otherwise the runnable repository test owns the claim.
+- Coverage exclusions: none.
+- Veritas: refresh discovery/status/report; do not approve links in this phase.
+
+#### Exit
+
+- [x] Outcome demonstrated and assigned checks pass for cadence.
+- [x] Runnable evidence freshly discovered; required links remain explicitly
+  assigned to PH-5 review/approval.
+- [x] No phase-owned coverage exclusion exists.
+- [x] PH-4 outputs are available to PH-5 and remaining work retains an owner.
+
+#### Completion record
+
+Implemented outcome: 3,685 tracked legacy files were removed from the product
+and development surfaces. Locally modified `.beads` state was removed from the
+Git index but preserved on Xenia and ignored, preventing data loss while future
+clones remain Beads-free. The repository now tracks 35 files and contains 2,043
+Rust lines under `app/`, including focused tests. README, AGENTS, Nextest, ignore
+rules, and CI now describe only the replacement.
+
+The maintained manifest, lockfile, source, tests, workflow, documentation, and
+Cargo/Nextest/toolchain configuration are clean for the prohibited
+Dickles/Franken, RCH, UBS, and ACFS surfaces. A runnable repository regression
+protects this boundary. On Xenia, 18 model-free Nextest tests and the separately
+enabled real-model test passed; strict all-target Clippy, formatting, doctests,
+diff hygiene, file accounting, LOC accounting, and scans passed. Veritas now
+discovers 19 focused evidence declarations with no artifact drift. The 16
+uncovered claims remain assigned to PH-5 link review and approval. No exclusion
+was introduced. PH-5 is now ready.
 
 ## Traceability and Evidence Assignment
 

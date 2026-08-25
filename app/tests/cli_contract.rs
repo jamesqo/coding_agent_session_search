@@ -134,7 +134,7 @@ fn unsupported_provider_records_are_ignored() {
     std::fs::create_dir_all(&claude_root).expect("Claude root");
     std::fs::create_dir_all(&codex_root).expect("Codex root");
     std::fs::write(
-        claude_root.join("opencode.jsonl"),
+        claude_root.join("unsupported.jsonl"),
         "{\"type\":\"message\",\"role\":\"user\",\"content\":\"not supported\"}\n",
     )
     .expect("unsupported fixture");
@@ -345,4 +345,66 @@ fn lexical_search_applies_recency_filter() {
     let recent = run_json(&["--db", database, "search", "temporal", "--days", "30"]);
     assert_eq!(recent["results"].as_array().map(Vec::len), Some(1));
     assert_eq!(recent["results"][0]["content"], "temporal new");
+}
+
+// Veritas claim: independence/no-dickles-franken-surface
+#[test]
+fn maintained_repository_is_independent_and_minimal() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for removed in [
+        "src",
+        "tests",
+        "benches",
+        "fuzz",
+        "scripts",
+        "docs",
+        "packaging",
+        "build.rs",
+    ] {
+        let path = root.join(removed);
+        let absent = if path.is_dir() {
+            std::fs::read_dir(&path)
+                .expect("read removed directory")
+                .next()
+                .is_none()
+        } else {
+            !path.exists()
+        };
+        assert!(absent, "removed legacy path still has files: {removed}");
+    }
+
+    let forbidden = [
+        concat!("franken", "sqlite"),
+        concat!("franken", "search"),
+        concat!("franken", "torch"),
+        concat!("franken", "tui"),
+        concat!("franken_", "agent_detection"),
+        concat!("asu", "persync"),
+        concat!("Dickles", "worthstone"),
+    ];
+    let mut maintained = String::new();
+    for file in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "AGENTS.md",
+        ".github/workflows/ci.yml",
+    ] {
+        maintained.push_str(&std::fs::read_to_string(root.join(file)).expect("maintained file"));
+    }
+    for entry in walkdir::WalkDir::new(root.join("app")) {
+        let entry = entry.expect("walk app source");
+        if entry.file_type().is_file() {
+            maintained.push_str(
+                &std::fs::read_to_string(entry.path()).expect("UTF-8 maintained Rust source"),
+            );
+        }
+    }
+    let maintained = maintained.to_ascii_lowercase();
+    for name in forbidden {
+        assert!(
+            !maintained.contains(&name.to_ascii_lowercase()),
+            "prohibited dependency surface remains: {name}"
+        );
+    }
 }
