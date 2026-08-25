@@ -85,9 +85,15 @@ pub(super) struct IndexResponse {
     indexed_messages: u64,
     scanned_files: u64,
     malformed_records: u64,
+    changed_messages: u64,
+    removed_messages: u64,
+    unchanged_sources: u64,
+    tombstoned_sources: u64,
+    purged_conversations: u64,
     full: bool,
     embeddings: u64,
     realized_mode: &'static str,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +101,7 @@ pub(super) struct SearchResponse {
     query: String,
     realized_mode: &'static str,
     fallback_mode: Option<&'static str>,
+    fallback_reason: Option<String>,
     results: Vec<crate::storage::SearchHit>,
 }
 
@@ -111,6 +118,7 @@ pub(super) struct StatusResponse {
     conversations: u64,
     messages: u64,
     models_installed: bool,
+    semantic_support: bool,
     realized_mode: &'static str,
     recommended_action: Option<&'static str>,
 }
@@ -172,26 +180,37 @@ fn index(
     full: bool,
     roots: &ProviderRoots,
 ) -> Result<Response, AppError> {
-    let mut storage = Storage::open(database_path)?;
+    let mut storage = Storage::open_writer(database_path)?;
     let summary = ingestion::index(&mut storage, roots)?;
     if full {
         storage.rebuild_derived_search_state()?;
     }
     let models = Models::new(models_dir.to_path_buf());
-    let embeddings = if let Some(mut backend) = models.load()? {
-        semantic::rebuild_embeddings(&mut storage, &mut backend)?
-    } else {
-        0
+    let (embeddings, fallback_reason) = match models.load() {
+        Ok(Some(mut backend)) => match semantic::rebuild_embeddings(&mut storage, &mut backend) {
+            Ok(count) => (count, None),
+            Err(error) => (0, Some(error.message().to_owned())),
+        },
+        Ok(None) => (0, semantic_unavailable_reason()),
+        Err(error) => (0, Some(error.message().to_owned())),
     };
     let counts = storage.counts()?;
+    storage.commit_writer()?;
+    let hybrid_ready = counts.messages > 0 && counts.embeddings == counts.messages;
     Ok(Response::Index(IndexResponse {
         indexed_conversations: counts.conversations,
         indexed_messages: counts.messages,
         scanned_files: summary.scanned_files,
         malformed_records: summary.malformed_records,
+        changed_messages: summary.changed_messages,
+        removed_messages: summary.removed_messages,
+        unchanged_sources: summary.unchanged_sources,
+        tombstoned_sources: summary.tombstoned_sources,
+        purged_conversations: summary.purged_conversations,
         full,
         embeddings,
-        realized_mode: if embeddings > 0 { "hybrid" } else { "lexical" },
+        realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
+        fallback_reason,
     }))
 }
 
@@ -208,27 +227,40 @@ fn search(
     let counts = storage.counts()?;
     let models = Models::new(models_dir.to_path_buf());
     let backend = if counts.embeddings > 0 {
-        models.load().ok().flatten()
+        models.load()
     } else {
-        None
+        Ok(None)
     };
-    let (results, realized_mode, fallback_mode) = if let Some(mut backend) = backend {
-        (
-            semantic::hybrid_search(&storage, &mut backend, &query, limit, provider, days)?,
-            "hybrid",
-            None,
-        )
-    } else {
-        (
+    let (results, realized_mode, fallback_mode, fallback_reason) = match backend {
+        Ok(Some(mut backend)) => {
+            match semantic::hybrid_search(&storage, &mut backend, &query, limit, provider, days) {
+                Ok(results) => (results, "hybrid", None, None),
+                Err(error) => (
+                    storage.search(&query, limit, provider, days)?,
+                    "lexical",
+                    Some("lexical"),
+                    Some(error.message().to_owned()),
+                ),
+            }
+        }
+        Ok(None) => (
             storage.search(&query, limit, provider, days)?,
             "lexical",
             Some("lexical"),
-        )
+            semantic_unavailable_reason(),
+        ),
+        Err(error) => (
+            storage.search(&query, limit, provider, days)?,
+            "lexical",
+            Some("lexical"),
+            Some(error.message().to_owned()),
+        ),
     };
     Ok(Response::Search(SearchResponse {
         query,
         realized_mode,
         fallback_mode,
+        fallback_reason,
         results,
     }))
 }
@@ -238,6 +270,10 @@ fn normalize_provider_filter(provider: Option<&str>) -> Result<Option<&'static s
         None => Ok(None),
         Some("claude" | "claude-code" | "claude_code") => Ok(Some("claude-code")),
         Some("codex") => Ok(Some("codex")),
+        Some("opencode" | "open-code" | "open_code") => Ok(Some("opencode")),
+        Some("github-copilot" | "copilot" | "github_copilot") => Ok(Some("github-copilot")),
+        Some("hermes" | "hermes-agent" | "hermes_agent") => Ok(Some("hermes")),
+        Some("pi" | "pi-agent" | "pi_agent") => Ok(Some("pi")),
         Some(provider) => Err(AppError::usage(format!(
             "unsupported provider filter: {provider}"
         ))),
@@ -259,6 +295,7 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
             conversations: 0,
             messages: 0,
             models_installed,
+            semantic_support: cfg!(feature = "semantic"),
             realized_mode: "unavailable",
             recommended_action: Some("index"),
         }));
@@ -274,10 +311,19 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
         conversations: counts.conversations,
         messages: counts.messages,
         models_installed,
+        semantic_support: cfg!(feature = "semantic"),
         realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
         recommended_action: (models_installed && counts.embeddings != counts.messages)
             .then_some("index"),
     }))
+}
+
+fn semantic_unavailable_reason() -> Option<String> {
+    if cfg!(feature = "semantic") {
+        None
+    } else {
+        Some("semantic support is unavailable in this lexical-only build".to_owned())
+    }
 }
 
 fn install_models(models_dir: &Path) -> Result<Response, AppError> {

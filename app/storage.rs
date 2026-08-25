@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -7,20 +9,20 @@ use serde::Serialize;
 use crate::AppError;
 use crate::ingestion::Conversation;
 
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = r"
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL CHECK (
         provider IN (
-            'claude-code', 'codex'
+            'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
         )
     ),
     source_path TEXT NOT NULL UNIQUE,
     title TEXT,
     created_at INTEGER,
-    updated_at INTEGER
+    updated_at INTEGER,
+    source_fingerprint TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at INTEGER,
+    fingerprint TEXT NOT NULL DEFAULT '',
     UNIQUE (conversation_id, ordinal)
 );
 CREATE TABLE IF NOT EXISTS message_embeddings (
@@ -42,10 +45,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
     conversation_id UNINDEXED,
     tokenize = 'unicode61'
 );
+CREATE TABLE IF NOT EXISTS tombstones (
+    provider TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    forgotten_at INTEGER NOT NULL,
+    PRIMARY KEY (provider, conversation_id)
+);
 ";
 
 pub(crate) struct Storage {
     connection: Connection,
+    writer_active: bool,
 }
 
 pub(crate) struct Counts {
@@ -79,14 +89,24 @@ pub(crate) struct Message {
     created_at: Option<i64>,
 }
 
+#[cfg(feature = "semantic")]
 pub(crate) struct SearchableMessage {
     pub(crate) id: String,
     pub(crate) content: String,
 }
 
+#[cfg(feature = "semantic")]
 pub(crate) struct SemanticDocument {
     pub(crate) hit: SearchHit,
     pub(crate) vector: Vec<f32>,
+}
+
+#[derive(Default)]
+pub(crate) struct ConversationChange {
+    pub(crate) unchanged: bool,
+    pub(crate) tombstoned: bool,
+    pub(crate) changed_message_ids: Vec<String>,
+    pub(crate) removed_messages: u64,
 }
 
 impl Storage {
@@ -95,11 +115,35 @@ impl Storage {
             fs::create_dir_all(parent).map_err(AppError::io)?;
         }
         let connection = Connection::open(path).map_err(AppError::database)?;
-        connection
-            .execute_batch(SCHEMA)
+        initialize(&connection)?;
+        Ok(Self {
+            connection,
+            writer_active: false,
+        })
+    }
+
+    pub(crate) fn open_writer(path: &Path) -> Result<Self, AppError> {
+        let mut storage = Self::open(path)?;
+        storage
+            .connection
+            .busy_timeout(Duration::ZERO)
             .map_err(AppError::database)?;
-        purge_unsupported_providers(&connection)?;
-        Ok(Self { connection })
+        storage
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(AppError::database)?;
+        storage.writer_active = true;
+        Ok(storage)
+    }
+
+    pub(crate) fn commit_writer(&mut self) -> Result<(), AppError> {
+        if self.writer_active {
+            self.connection
+                .execute_batch("COMMIT")
+                .map_err(AppError::database)?;
+            self.writer_active = false;
+        }
+        Ok(())
     }
 
     pub(crate) fn open_existing(path: &Path) -> Result<Self, AppError> {
@@ -137,18 +181,55 @@ impl Storage {
     pub(crate) fn replace_conversation(
         &mut self,
         conversation: &Conversation,
-    ) -> Result<(), AppError> {
-        let transaction = self.connection.transaction().map_err(AppError::database)?;
-        transaction
+    ) -> Result<ConversationChange, AppError> {
+        self.require_writer()?;
+        let tombstoned = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE provider = ?1 AND conversation_id = ?2",
+                params![conversation.provider, conversation.id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(AppError::database)?
+            .is_some();
+        if tombstoned {
+            return Ok(ConversationChange {
+                tombstoned: true,
+                ..ConversationChange::default()
+            });
+        }
+
+        let source_fingerprint = conversation_fingerprint(conversation);
+        let existing_source_fingerprint: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT source_fingerprint FROM conversations WHERE id = ?1",
+                [&conversation.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AppError::database)?;
+        if existing_source_fingerprint.as_deref() == Some(source_fingerprint.as_str()) {
+            return Ok(ConversationChange {
+                unchanged: true,
+                ..ConversationChange::default()
+            });
+        }
+
+        let existing_messages = self.message_fingerprints(&conversation.id)?;
+        self.connection
             .execute(
-                "INSERT INTO conversations(id, provider, source_path, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO conversations(
+                    id, provider, source_path, title, created_at, updated_at, source_fingerprint
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                     provider = excluded.provider,
                     source_path = excluded.source_path,
                     title = excluded.title,
                     created_at = excluded.created_at,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at,
+                    source_fingerprint = excluded.source_fingerprint",
                 params![
                     conversation.id,
                     conversation.provider,
@@ -156,27 +237,45 @@ impl Storage {
                     conversation.title,
                     conversation.created_at,
                     conversation.updated_at,
+                    source_fingerprint,
                 ],
             )
             .map_err(AppError::database)?;
-        transaction
-            .execute(
-                "DELETE FROM message_fts WHERE conversation_id = ?1",
-                [&conversation.id],
-            )
-            .map_err(AppError::database)?;
-        transaction
-            .execute(
-                "DELETE FROM messages WHERE conversation_id = ?1",
-                [&conversation.id],
-            )
-            .map_err(AppError::database)?;
 
+        let (changed_message_ids, removed_messages) =
+            self.reconcile_messages(conversation, &existing_messages)?;
+        Ok(ConversationChange {
+            changed_message_ids,
+            removed_messages,
+            ..ConversationChange::default()
+        })
+    }
+
+    fn reconcile_messages(
+        &mut self,
+        conversation: &Conversation,
+        existing_messages: &BTreeMap<String, String>,
+    ) -> Result<(Vec<String>, u64), AppError> {
+        let mut seen = BTreeSet::new();
+        let mut changed = Vec::new();
         for message in &conversation.messages {
-            transaction
+            seen.insert(message.id.clone());
+            let fingerprint = message_fingerprint(message);
+            if existing_messages.get(&message.id) == Some(&fingerprint) {
+                continue;
+            }
+            self.connection
                 .execute(
-                    "INSERT INTO messages(id, conversation_id, ordinal, role, content, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO messages(
+                        id, conversation_id, ordinal, role, content, created_at, fingerprint
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET
+                        conversation_id = excluded.conversation_id,
+                        ordinal = excluded.ordinal,
+                        role = excluded.role,
+                        content = excluded.content,
+                        created_at = excluded.created_at,
+                        fingerprint = excluded.fingerprint",
                     params![
                         message.id,
                         conversation.id,
@@ -184,18 +283,48 @@ impl Storage {
                         message.role,
                         message.content,
                         message.created_at,
+                        fingerprint,
                     ],
                 )
                 .map_err(AppError::database)?;
-            transaction
+            self.connection
+                .execute(
+                    "DELETE FROM message_fts WHERE message_id = ?1",
+                    [&message.id],
+                )
+                .map_err(AppError::database)?;
+            self.connection
                 .execute(
                     "INSERT INTO message_fts(content, message_id, conversation_id)
                      VALUES (?1, ?2, ?3)",
                     params![message.content, message.id, conversation.id],
                 )
                 .map_err(AppError::database)?;
+            self.connection
+                .execute(
+                    "DELETE FROM message_embeddings WHERE message_id = ?1",
+                    [&message.id],
+                )
+                .map_err(AppError::database)?;
+            changed.push(message.id.clone());
         }
-        transaction.commit().map_err(AppError::database)
+
+        let removed: Vec<String> = existing_messages
+            .keys()
+            .filter(|id| !seen.contains(*id))
+            .cloned()
+            .collect();
+        for id in &removed {
+            self.connection
+                .execute("DELETE FROM message_fts WHERE message_id = ?1", [id])
+                .map_err(AppError::database)?;
+            self.connection
+                .execute("DELETE FROM messages WHERE id = ?1", [id])
+                .map_err(AppError::database)?;
+        }
+        let removed = u64::try_from(removed.len())
+            .map_err(|_| AppError::internal("too many removed messages"))?;
+        Ok((changed, removed))
     }
 
     pub(crate) fn rebuild_derived_search_state(&self) -> Result<(), AppError> {
@@ -207,6 +336,68 @@ impl Storage {
                  SELECT content, id, conversation_id FROM messages;",
             )
             .map_err(AppError::database)
+    }
+
+    pub(crate) fn purge_missing_sources(
+        &mut self,
+        provider: &str,
+        observed_paths: &BTreeSet<String>,
+    ) -> Result<u64, AppError> {
+        self.require_writer()?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, source_path FROM conversations WHERE provider = ?1")
+            .map_err(AppError::database)?;
+        let rows = statement
+            .query_map([provider], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(AppError::database)?;
+        let existing = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(statement);
+        let mut removed = 0_u64;
+        for (id, source_path) in existing {
+            if observed_paths.contains(&source_path) {
+                continue;
+            }
+            self.connection
+                .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
+                .map_err(AppError::database)?;
+            self.connection
+                .execute("DELETE FROM conversations WHERE id = ?1", [&id])
+                .map_err(AppError::database)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn remove_source(
+        &mut self,
+        provider: &str,
+        source_path: &str,
+    ) -> Result<bool, AppError> {
+        self.require_writer()?;
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM conversations WHERE provider = ?1 AND source_path = ?2",
+                params![provider, source_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AppError::database)?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        self.connection
+            .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
+            .map_err(AppError::database)?;
+        self.connection
+            .execute("DELETE FROM conversations WHERE id = ?1", [&id])
+            .map_err(AppError::database)?;
+        Ok(true)
     }
 
     pub(crate) fn search(
@@ -255,10 +446,18 @@ impl Storage {
             .map_err(AppError::database)
     }
 
-    pub(crate) fn searchable_messages(&self) -> Result<Vec<SearchableMessage>, AppError> {
+    #[cfg(feature = "semantic")]
+    pub(crate) fn messages_needing_embeddings(&self) -> Result<Vec<SearchableMessage>, AppError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, content FROM messages ORDER BY id")
+            .prepare(
+                "SELECT messages.id, messages.content
+                   FROM messages
+                   LEFT JOIN message_embeddings
+                     ON message_embeddings.message_id = messages.id
+                  WHERE message_embeddings.message_id IS NULL
+                  ORDER BY messages.id",
+            )
             .map_err(AppError::database)?;
         let rows = statement
             .query_map([], |row| {
@@ -272,28 +471,29 @@ impl Storage {
             .map_err(AppError::database)
     }
 
+    #[cfg(feature = "semantic")]
     pub(crate) fn replace_embeddings(
         &mut self,
         embeddings: &[(&str, &[f32])],
     ) -> Result<(), AppError> {
-        let transaction = self.connection.transaction().map_err(AppError::database)?;
-        transaction
-            .execute("DELETE FROM message_embeddings", [])
-            .map_err(AppError::database)?;
         for (message_id, vector) in embeddings {
             let dimensions = i64::try_from(vector.len())
                 .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
-            transaction
+            self.connection
                 .execute(
                     "INSERT INTO message_embeddings(message_id, dimensions, vector)
-                     VALUES (?1, ?2, ?3)",
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(message_id) DO UPDATE SET
+                        dimensions = excluded.dimensions,
+                        vector = excluded.vector",
                     params![message_id, dimensions, encode_vector(vector)],
                 )
                 .map_err(AppError::database)?;
         }
-        transaction.commit().map_err(AppError::database)
+        Ok(())
     }
 
+    #[cfg(feature = "semantic")]
     pub(crate) fn semantic_documents(
         &self,
         provider: Option<&str>,
@@ -395,6 +595,26 @@ impl Storage {
 
     pub(crate) fn forget(&mut self, id: &str) -> Result<bool, AppError> {
         let transaction = self.connection.transaction().map_err(AppError::database)?;
+        let provider: Option<String> = transaction
+            .query_row(
+                "SELECT provider FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AppError::database)?;
+        let Some(provider) = provider else {
+            transaction.commit().map_err(AppError::database)?;
+            return Ok(false);
+        };
+        transaction
+            .execute(
+                "INSERT INTO tombstones(provider, conversation_id, forgotten_at)
+                 VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(provider, conversation_id) DO NOTHING",
+                params![provider, id],
+            )
+            .map_err(AppError::database)?;
         transaction
             .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [id])
             .map_err(AppError::database)?;
@@ -404,6 +624,212 @@ impl Storage {
         transaction.commit().map_err(AppError::database)?;
         Ok(removed > 0)
     }
+
+    fn message_fingerprints(
+        &self,
+        conversation_id: &str,
+    ) -> Result<BTreeMap<String, String>, AppError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, fingerprint FROM messages WHERE conversation_id = ?1")
+            .map_err(AppError::database)?;
+        let rows = statement
+            .query_map([conversation_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(AppError::database)?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(AppError::database)
+    }
+
+    fn require_writer(&self) -> Result<(), AppError> {
+        if self.writer_active {
+            Ok(())
+        } else {
+            Err(AppError::internal(
+                "index mutation requires an active writer",
+            ))
+        }
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if self.writer_active {
+            let _ = self.connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+fn initialize(connection: &Connection) -> Result<(), AppError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(AppError::database)?;
+    if version > SCHEMA_VERSION {
+        return Err(AppError::schema(format!(
+            "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+        )));
+    }
+
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+        .map_err(AppError::database)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(AppError::database)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(AppError::database)?;
+    transaction
+        .execute_batch(SCHEMA)
+        .map_err(AppError::database)?;
+    add_column_if_missing(
+        &transaction,
+        "conversations",
+        "source_fingerprint",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        &transaction,
+        "messages",
+        "fingerprint",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    purge_unsupported_providers(&transaction)?;
+    if !provider_schema_is_current(&transaction)? {
+        rebuild_provider_schema(&transaction)?;
+    }
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(AppError::database)?;
+    transaction.commit().map_err(AppError::database)?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(AppError::database)
+}
+
+fn provider_schema_is_current(connection: &Connection) -> Result<bool, AppError> {
+    let sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'conversations'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(AppError::database)?;
+    Ok(sql.contains("'opencode'") && sql.contains("'github-copilot'") && sql.contains("'pi'"))
+}
+
+fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE conversations_next (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL CHECK (provider IN (
+                    'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+                )),
+                source_path TEXT NOT NULL UNIQUE,
+                title TEXT, created_at INTEGER, updated_at INTEGER,
+                source_fingerprint TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE messages_next (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations_next(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+                created_at INTEGER, fingerprint TEXT NOT NULL DEFAULT '',
+                UNIQUE(conversation_id, ordinal)
+             );
+             CREATE TABLE message_embeddings_next (
+                message_id TEXT PRIMARY KEY REFERENCES messages_next(id) ON DELETE CASCADE,
+                dimensions INTEGER NOT NULL, vector BLOB NOT NULL
+             );
+             INSERT INTO conversations_next
+                SELECT id, provider, source_path, title, created_at, updated_at, source_fingerprint
+                FROM conversations;
+             INSERT INTO messages_next
+                SELECT id, conversation_id, ordinal, role, content, created_at, fingerprint
+                FROM messages;
+             INSERT INTO message_embeddings_next SELECT * FROM message_embeddings;
+             DROP TABLE message_fts;
+             DROP TABLE message_embeddings;
+             DROP TABLE messages;
+             DROP TABLE conversations;
+             ALTER TABLE conversations_next RENAME TO conversations;
+             ALTER TABLE messages_next RENAME TO messages;
+             ALTER TABLE message_embeddings_next RENAME TO message_embeddings;
+             CREATE VIRTUAL TABLE message_fts USING fts5(
+                content, message_id UNINDEXED, conversation_id UNINDEXED,
+                tokenize = 'unicode61'
+             );
+             INSERT INTO message_fts(content, message_id, conversation_id)
+                SELECT content, id, conversation_id FROM messages;",
+        )
+        .map_err(AppError::database)
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<(), AppError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(AppError::database)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)?;
+    if !names.iter().any(|name| name == column) {
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            ))
+            .map_err(AppError::database)?;
+    }
+    Ok(())
+}
+
+fn conversation_fingerprint(conversation: &Conversation) -> String {
+    let mut hasher = blake3::Hasher::new();
+    update_hash(&mut hasher, conversation.provider);
+    update_hash(&mut hasher, &conversation.id);
+    update_hash(
+        &mut hasher,
+        conversation.title.as_deref().unwrap_or_default(),
+    );
+    update_hash(
+        &mut hasher,
+        &conversation.created_at.unwrap_or_default().to_string(),
+    );
+    update_hash(
+        &mut hasher,
+        &conversation.updated_at.unwrap_or_default().to_string(),
+    );
+    for message in &conversation.messages {
+        update_hash(&mut hasher, &message_fingerprint(message));
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn message_fingerprint(message: &crate::ingestion::NormalizedMessage) -> String {
+    let mut hasher = blake3::Hasher::new();
+    update_hash(&mut hasher, &message.id);
+    update_hash(&mut hasher, &message.ordinal.to_string());
+    update_hash(&mut hasher, &message.role);
+    update_hash(&mut hasher, &message.content);
+    update_hash(
+        &mut hasher,
+        &message.created_at.unwrap_or_default().to_string(),
+    );
+    hasher.finalize().to_hex().to_string()
+}
+
+fn update_hash(hasher: &mut blake3::Hasher, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> {
@@ -412,26 +838,35 @@ fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> 
             "DELETE FROM message_fts
               WHERE conversation_id IN (
                     SELECT id FROM conversations
-                     WHERE provider NOT IN ('claude-code', 'codex')
+                     WHERE provider NOT IN (
+                        'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+                     )
               );
              DELETE FROM message_embeddings
               WHERE message_id IN (
                     SELECT messages.id
                       FROM messages
                       JOIN conversations ON conversations.id = messages.conversation_id
-                     WHERE conversations.provider NOT IN ('claude-code', 'codex')
+                     WHERE conversations.provider NOT IN (
+                        'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+                     )
               );
              DELETE FROM messages
               WHERE conversation_id IN (
                     SELECT id FROM conversations
-                     WHERE provider NOT IN ('claude-code', 'codex')
+                     WHERE provider NOT IN (
+                        'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+                     )
               );
              DELETE FROM conversations
-              WHERE provider NOT IN ('claude-code', 'codex');",
+              WHERE provider NOT IN (
+                'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+              );",
         )
         .map_err(AppError::database)
 }
 
+#[cfg(any(feature = "semantic", test))]
 fn encode_vector(vector: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
@@ -440,6 +875,7 @@ fn encode_vector(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+#[cfg(any(feature = "semantic", test))]
 fn decode_vector(dimensions: i64, bytes: &[u8]) -> Result<Vec<f32>, &'static str> {
     let dimensions = usize::try_from(dimensions).map_err(|_| "negative embedding dimensions")?;
     if bytes.len() != dimensions.saturating_mul(size_of::<f32>()) {
@@ -474,7 +910,26 @@ fn cutoff_timestamp(days: Option<u32>) -> Result<Option<i64>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use veritas_test_macros as veritas;
+
+    fn conversation(content: &str) -> Conversation {
+        Conversation {
+            id: "session-1".to_owned(),
+            provider: "codex",
+            source_path: PathBuf::from("/tmp/session-1.jsonl"),
+            title: Some("session".to_owned()),
+            created_at: Some(1),
+            updated_at: Some(2),
+            messages: vec![crate::ingestion::NormalizedMessage {
+                id: "message-1".to_owned(),
+                ordinal: 0,
+                role: "user".to_owned(),
+                content: content.to_owned(),
+                created_at: Some(1),
+            }],
+        }
+    }
 
     #[veritas::claims("storage/full-rebuild-is-idempotent")]
     #[test]
@@ -499,5 +954,160 @@ mod tests {
         let bytes = encode_vector(&vector);
         assert_eq!(decode_vector(3, &bytes), Ok(vector.to_vec()));
         assert!(decode_vector(2, &bytes).is_err());
+    }
+
+    #[veritas::claims("storage/supported-schema-migrates")]
+    #[test]
+    fn supported_schema_migrates_once_and_preserves_rows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let connection = Connection::open(&path).expect("seed database");
+        connection
+            .execute_batch(
+                "CREATE TABLE conversations (
+                    id TEXT PRIMARY KEY, provider TEXT NOT NULL, source_path TEXT NOT NULL UNIQUE,
+                    title TEXT, created_at INTEGER, updated_at INTEGER
+                 );
+                 CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+                    created_at INTEGER, UNIQUE(conversation_id, ordinal)
+                 );
+                 CREATE TABLE message_embeddings (
+                    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    dimensions INTEGER NOT NULL, vector BLOB NOT NULL
+                 );
+                 CREATE VIRTUAL TABLE message_fts USING fts5(
+                    content, message_id UNINDEXED, conversation_id UNINDEXED
+                 );
+                 INSERT INTO conversations(id, provider, source_path)
+                    VALUES ('session-1', 'codex', '/tmp/session-1.jsonl');
+                 INSERT INTO messages(id, conversation_id, ordinal, role, content)
+                    VALUES ('message-1', 'session-1', 0, 'user', 'preserved');
+                 INSERT INTO message_fts(content, message_id, conversation_id)
+                    VALUES ('preserved', 'message-1', 'session-1');
+                 PRAGMA user_version = 1;",
+            )
+            .expect("seed older schema");
+        drop(connection);
+
+        let storage = Storage::open(&path).expect("migrate database");
+        assert_eq!(storage.counts().expect("counts").messages, 1);
+        assert_eq!(
+            storage
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            SCHEMA_VERSION
+        );
+        drop(storage);
+        Storage::open(&path).expect("idempotent second open");
+    }
+
+    #[veritas::claims("storage/newer-schema-is-rejected")]
+    #[test]
+    fn newer_schema_is_rejected_without_rewriting_version() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let connection = Connection::open(&path).expect("seed database");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("newer version");
+        drop(connection);
+
+        let error = Storage::open(&path).err().expect("newer schema rejected");
+        assert_eq!(error.error.kind, "schema-incompatible");
+        let connection = Connection::open(&path).expect("reopen seed");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            SCHEMA_VERSION + 1
+        );
+    }
+
+    #[veritas::claims("indexing/concurrent-writer-is-rejected")]
+    #[test]
+    fn concurrent_writer_is_rejected_and_first_writer_can_commit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut first = Storage::open_writer(&path).expect("first writer");
+        let error = Storage::open_writer(&path)
+            .err()
+            .expect("second writer rejected");
+        assert_eq!(error.error.kind, "index-busy");
+        first.commit_writer().expect("first writer commits");
+        Storage::open_writer(&path).expect("writer available after commit");
+    }
+
+    #[veritas::claims(
+        "indexing/unchanged-source-is-skipped",
+        "indexing/only-changed-messages-refresh"
+    )]
+    #[test]
+    fn conversation_reconciliation_writes_only_changed_messages() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut storage = Storage::open_writer(&path).expect("writer");
+        let first = storage
+            .replace_conversation(&conversation("first"))
+            .expect("initial insert");
+        assert_eq!(first.changed_message_ids, ["message-1"]);
+        #[cfg(feature = "semantic")]
+        storage
+            .replace_embeddings(&[("message-1", &[1.0, 0.0])])
+            .expect("seed embedding");
+        let unchanged = storage
+            .replace_conversation(&conversation("first"))
+            .expect("unchanged refresh");
+        assert!(unchanged.unchanged);
+        assert_eq!(unchanged.changed_message_ids, Vec::<String>::new());
+        #[cfg(feature = "semantic")]
+        assert!(
+            storage
+                .messages_needing_embeddings()
+                .expect("embedding selection")
+                .is_empty()
+        );
+        let changed = storage
+            .replace_conversation(&conversation("second"))
+            .expect("changed refresh");
+        assert_eq!(changed.changed_message_ids, ["message-1"]);
+        #[cfg(feature = "semantic")]
+        assert_eq!(
+            storage
+                .messages_needing_embeddings()
+                .expect("embedding selection")
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-1"]
+        );
+    }
+
+    #[veritas::claims("storage/forget-persists-through-indexing")]
+    #[test]
+    fn tombstone_prevents_reinsertion() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("remember me"))
+            .expect("insert");
+        writer.commit_writer().expect("commit");
+        drop(writer);
+
+        let mut storage = Storage::open(&path).expect("open database");
+        assert!(storage.forget("session-1").expect("forget"));
+        drop(storage);
+
+        let mut writer = Storage::open_writer(&path).expect("second writer");
+        let change = writer
+            .replace_conversation(&conversation("remember me"))
+            .expect("tombstone check");
+        assert!(change.tombstoned);
+        writer.commit_writer().expect("commit");
+        assert_eq!(writer.counts().expect("counts").conversations, 0);
     }
 }

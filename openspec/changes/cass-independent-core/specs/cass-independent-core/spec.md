@@ -1,7 +1,8 @@
 ## Purpose
 
 Provide a small, independent JSON CLI that indexes and searches local Claude
-Code and Codex conversations with lexical and semantic retrieval.
+Code, Codex, current OpenCode, GitHub Copilot CLI, Hermes Agent, and Pi
+conversations with lexical and semantic retrieval.
 
 ## ADDED Requirements
 
@@ -26,13 +27,14 @@ The system SHALL expose only `index`, `search`, `view`, `status`, `forget`, and
 ### Requirement: Provider boundary
 
 <!-- claim: ingestion/provider-boundary -->
-The system SHALL discover and normalize Claude Code and Codex JSONL histories
-into CASS-owned canonical conversation and message records.
+The system SHALL discover and normalize Claude Code, Codex, current OpenCode,
+GitHub Copilot CLI, Hermes Agent, and Pi histories into CASS-owned canonical
+conversation and message records.
 
 #### Scenario: Supported histories
 
 <!-- claim: ingestion/supported-jsonl-indexes -->
-- **WHEN** configured roots contain representative Claude Code and Codex JSONL histories
+- **WHEN** configured roots contain representative histories from each of the six supported providers
 - **THEN** `cass index` persists their conversations and messages with stable IDs
 
 #### Scenario: Unsupported provider
@@ -50,7 +52,9 @@ into CASS-owned canonical conversation and message records.
 ### Requirement: Canonical storage
 
 The system SHALL use one Rusqlite database and one current schema as canonical
-state. Search indexes and embeddings SHALL be rebuildable derived state.
+state. It SHALL migrate supported older schema versions forward and reject a
+newer unknown schema with a typed JSON error. Search indexes and embeddings
+SHALL be rebuildable derived state.
 
 #### Scenario: Full rebuild
 
@@ -62,7 +66,67 @@ state. Search indexes and embeddings SHALL be rebuildable derived state.
 
 <!-- claim: storage/forget-removes-conversation -->
 - **WHEN** `cass forget <id>` succeeds
-- **THEN** the conversation, its messages, and derived search rows are no longer retrievable
+- **THEN** the conversation, its messages, and derived search rows are no longer retrievable and later indexing does not restore it
+
+#### Scenario: Supported schema migration
+
+<!-- claim: storage/supported-schema-migrates -->
+- **WHEN** CASS opens a database at a supported older schema version
+- **THEN** it applies the required forward migrations once and preserves canonical records
+
+#### Scenario: Unknown newer schema
+
+<!-- claim: storage/newer-schema-is-rejected -->
+- **WHEN** CASS opens a database whose schema version is newer than the binary supports
+- **THEN** it returns a typed JSON incompatibility error without modifying the database
+
+### Requirement: Incremental indexing lifecycle
+
+The system SHALL fingerprint sources and normalized messages so an ordinary
+index refresh skips unchanged sources, updates only added or changed messages,
+and removes canonical histories absent from a complete successful provider
+scan. A failed or incomplete scan SHALL preserve previously indexed histories.
+
+#### Scenario: Unchanged source
+
+<!-- claim: indexing/unchanged-source-is-skipped -->
+- **WHEN** `cass index` sees a source whose fingerprint is unchanged
+- **THEN** it reports the source unchanged without rewriting its messages or embeddings
+
+#### Scenario: Changed messages
+
+<!-- claim: indexing/only-changed-messages-refresh -->
+- **WHEN** a previously indexed source contains added or changed messages
+- **THEN** only those messages require new canonical writes and semantic embeddings
+
+#### Scenario: Source disappeared after complete scan
+
+<!-- claim: indexing/complete-scan-purges-missing-source -->
+- **WHEN** a complete successful provider scan no longer discovers a previously indexed source
+- **THEN** its conversation, messages, FTS rows, and embeddings are removed
+
+#### Scenario: Incomplete scan
+
+<!-- claim: indexing/incomplete-scan-preserves-state -->
+- **WHEN** provider discovery or parsing fails before a complete scan is established
+- **THEN** previously indexed conversations are not purged as missing
+
+#### Scenario: Forgotten source remains forgotten
+
+<!-- claim: storage/forget-persists-through-indexing -->
+- **WHEN** a forgotten source remains present during later indexing
+- **THEN** its durable tombstone prevents the conversation from being reinserted
+
+### Requirement: Single index writer
+
+The system SHALL permit only one active index writer for a canonical database
+while allowing searches to continue against committed state.
+
+#### Scenario: Concurrent index attempt
+
+<!-- claim: indexing/concurrent-writer-is-rejected -->
+- **WHEN** a second `cass index` targets a database with an active index writer
+- **THEN** it returns a typed JSON busy error without starting a competing refresh
 
 ### Requirement: Lexical retrieval
 
@@ -92,11 +156,35 @@ reranking using a mainstream maintained model backend.
 - **WHEN** semantic models are not installed
 - **THEN** search succeeds lexically and truthfully reports lexical fallback
 
+#### Scenario: Inference failure
+
+<!-- claim: semantic/inference-failure-falls-back -->
+- **WHEN** installed semantic assets cannot load or inference fails
+- **THEN** search still succeeds through FTS5 and reports the semantic failure and lexical realization
+
 #### Scenario: Explicit installation
 
 <!-- claim: models/download-is-explicit -->
 - **WHEN** models are absent and no `models install` command is run
 - **THEN** CASS does not download models implicitly
+
+### Requirement: Semantic release and lexical development builds
+
+Official release binaries SHALL include semantic retrieval. The supported
+no-default-features development build SHALL compile and run the retained
+commands lexically without linking the semantic model backend.
+
+#### Scenario: Official release
+
+<!-- claim: distribution/release-includes-semantic -->
+- **WHEN** CI publishes an official CASS binary
+- **THEN** the binary includes the concrete FastEmbed semantic backend
+
+#### Scenario: Lexical-only build
+
+<!-- claim: distribution/lexical-only-build-works -->
+- **WHEN** CASS is built with `--no-default-features`
+- **THEN** indexing and search work through FTS5 and truthfully report semantic support as unavailable
 
 ### Requirement: Context view
 

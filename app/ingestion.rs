@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
+use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -15,11 +16,20 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
 pub(crate) struct ProviderRoots {
     claude: Vec<PathBuf>,
     codex: Vec<PathBuf>,
+    opencode: Vec<PathBuf>,
+    copilot: Vec<PathBuf>,
+    hermes: Vec<PathBuf>,
+    pi: Vec<PathBuf>,
 }
 
 pub(crate) struct IndexSummary {
     pub(crate) scanned_files: u64,
     pub(crate) malformed_records: u64,
+    pub(crate) changed_messages: u64,
+    pub(crate) removed_messages: u64,
+    pub(crate) unchanged_sources: u64,
+    pub(crate) tombstoned_sources: u64,
+    pub(crate) purged_conversations: u64,
 }
 
 pub(crate) struct Conversation {
@@ -45,6 +55,11 @@ struct ParsedFile {
     malformed_records: u64,
 }
 
+struct Discovery {
+    files: Vec<PathBuf>,
+    complete: bool,
+}
+
 type ExtractedMessage = (Option<String>, String, String, Option<i64>, Option<String>);
 
 impl ProviderRoots {
@@ -65,6 +80,13 @@ impl ProviderRoots {
                     home.join(".local/share/codex/sessions"),
                 ],
             ),
+            opencode: configured_roots(
+                "CASS_OPENCODE_ROOTS",
+                [home.join(".local/share/opencode/opencode.db")],
+            ),
+            copilot: configured_roots("CASS_COPILOT_ROOTS", [home.join(".copilot/session-state")]),
+            hermes: configured_roots("CASS_HERMES_ROOTS", [home.join(".hermes/state.db")]),
+            pi: configured_roots("CASS_PI_ROOTS", [home.join(".pi/agent/sessions")]),
         }
     }
 }
@@ -76,26 +98,120 @@ pub(crate) fn index(
     let mut summary = IndexSummary {
         scanned_files: 0,
         malformed_records: 0,
+        changed_messages: 0,
+        removed_messages: 0,
+        unchanged_sources: 0,
+        tombstoned_sources: 0,
+        purged_conversations: 0,
     };
 
-    for path in discover_jsonl_files(&roots.claude) {
-        summary.scanned_files += 1;
-        let parsed = parse_claude(&path)?;
-        summary.malformed_records += parsed.malformed_records;
-        if let Some(conversation) = parsed.conversation {
-            storage.replace_conversation(&conversation)?;
-        }
-    }
-    for path in discover_jsonl_files(&roots.codex) {
-        summary.scanned_files += 1;
-        let parsed = parse_codex(&path)?;
-        summary.malformed_records += parsed.malformed_records;
-        if let Some(conversation) = parsed.conversation {
-            storage.replace_conversation(&conversation)?;
-        }
-    }
+    index_provider(
+        storage,
+        "claude-code",
+        discover_jsonl_files(&roots.claude),
+        parse_claude,
+        &mut summary,
+    )?;
+    index_database_provider(
+        storage,
+        "opencode",
+        &roots.opencode,
+        parse_opencode,
+        &mut summary,
+    )?;
+    index_provider(
+        storage,
+        "github-copilot",
+        discover_files(&roots.copilot, |path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("events.jsonl")
+        }),
+        parse_copilot,
+        &mut summary,
+    )?;
+    index_database_provider(storage, "hermes", &roots.hermes, parse_hermes, &mut summary)?;
+    index_provider(
+        storage,
+        "pi",
+        discover_jsonl_files(&roots.pi),
+        parse_pi,
+        &mut summary,
+    )?;
+    index_provider(
+        storage,
+        "codex",
+        discover_jsonl_files(&roots.codex),
+        parse_codex,
+        &mut summary,
+    )?;
 
     Ok(summary)
+}
+
+fn index_provider(
+    storage: &mut Storage,
+    provider: &'static str,
+    discovery: Discovery,
+    parse: fn(&Path) -> Result<ParsedFile, AppError>,
+    summary: &mut IndexSummary,
+) -> Result<(), AppError> {
+    let mut complete = discovery.complete;
+    let mut observed_paths = BTreeSet::new();
+    for path in discovery.files {
+        summary.scanned_files += 1;
+        let source_path = path.to_string_lossy().into_owned();
+        observed_paths.insert(source_path.clone());
+        let parsed = parse(&path)?;
+        summary.malformed_records += parsed.malformed_records;
+        complete &= parsed.malformed_records == 0;
+        if let Some(conversation) = parsed.conversation {
+            apply_conversation(storage, &conversation, summary)?;
+        } else if parsed.malformed_records == 0 && storage.remove_source(provider, &source_path)? {
+            summary.purged_conversations += 1;
+        }
+    }
+    if complete {
+        summary.purged_conversations += storage.purge_missing_sources(provider, &observed_paths)?;
+    }
+    Ok(())
+}
+
+fn index_database_provider(
+    storage: &mut Storage,
+    provider: &'static str,
+    roots: &[PathBuf],
+    parse: fn(&Path) -> Result<ParsedDatabase, AppError>,
+    summary: &mut IndexSummary,
+) -> Result<(), AppError> {
+    let mut complete = true;
+    let mut observed_paths = BTreeSet::new();
+    for path in roots.iter().filter(|path| path.is_file()) {
+        summary.scanned_files += 1;
+        let parsed = parse(path)?;
+        summary.malformed_records += parsed.malformed_records;
+        complete &= parsed.malformed_records == 0;
+        for conversation in parsed.conversations {
+            observed_paths.insert(conversation.source_path.to_string_lossy().into_owned());
+            apply_conversation(storage, &conversation, summary)?;
+        }
+    }
+    if complete {
+        summary.purged_conversations += storage.purge_missing_sources(provider, &observed_paths)?;
+    }
+    Ok(())
+}
+
+fn apply_conversation(
+    storage: &mut Storage,
+    conversation: &Conversation,
+    summary: &mut IndexSummary,
+) -> Result<(), AppError> {
+    let change = storage.replace_conversation(conversation)?;
+    summary.changed_messages += u64::try_from(change.changed_message_ids.len())
+        .map_err(|_| AppError::internal("too many changed messages"))?;
+    summary.removed_messages += change.removed_messages;
+    summary.unchanged_sources += u64::from(change.unchanged);
+    summary.tombstoned_sources += u64::from(change.tombstoned);
+    Ok(())
 }
 
 fn configured_roots<const N: usize>(env_name: &str, defaults: [PathBuf; N]) -> Vec<PathBuf> {
@@ -105,11 +221,16 @@ fn configured_roots<const N: usize>(env_name: &str, defaults: [PathBuf; N]) -> V
     )
 }
 
-fn discover_jsonl_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+fn discover_jsonl_files(roots: &[PathBuf]) -> Discovery {
+    discover_files(roots, is_jsonl)
+}
+
+fn discover_files(roots: &[PathBuf], accept: fn(&Path) -> bool) -> Discovery {
     let mut files = BTreeSet::new();
+    let mut complete = true;
     for root in roots {
         if root.is_file() {
-            if is_jsonl(root) {
+            if accept(root) {
                 files.insert(root.clone());
             }
             continue;
@@ -119,21 +240,276 @@ fn discover_jsonl_files(roots: &[PathBuf]) -> Vec<PathBuf> {
         }
         for entry in WalkDir::new(root).follow_links(false) {
             let Ok(entry) = entry else {
+                complete = false;
                 continue;
             };
             let path = entry.path();
-            if entry.file_type().is_file() && is_jsonl(path) {
+            if entry.file_type().is_file() && accept(path) {
                 files.insert(path.to_path_buf());
             }
         }
     }
-    files.into_iter().collect()
+    Discovery {
+        files: files.into_iter().collect(),
+        complete,
+    }
 }
 
 fn is_jsonl(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+}
+
+struct ParsedDatabase {
+    conversations: Vec<Conversation>,
+    malformed_records: u64,
+}
+
+fn parse_opencode(path: &Path) -> Result<ParsedDatabase, AppError> {
+    let connection = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(AppError::database)?;
+    let mut conversations = Vec::new();
+    let mut malformed_records = 0;
+    for (session_id, title, created_at, updated_at) in opencode_sessions(&connection)? {
+        let mut query = connection
+            .prepare(
+                "SELECT id, data, time_created FROM message
+                 WHERE session_id = ?1 ORDER BY time_created, id",
+            )
+            .map_err(AppError::database)?;
+        let rows = query
+            .query_map([&session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(query);
+        let mut messages = Vec::new();
+        for (source_id, data, message_created_at) in rows {
+            let role = if let Ok(data) = serde_json::from_str::<Value>(&data) {
+                data.get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                    .to_owned()
+            } else {
+                malformed_records += 1;
+                continue;
+            };
+            let Some(content) =
+                opencode_message_content(&connection, &source_id, &mut malformed_records)?
+            else {
+                continue;
+            };
+            let ordinal = i64::try_from(messages.len())
+                .map_err(|_| AppError::internal("conversation contains too many messages"))?;
+            messages.push(NormalizedMessage {
+                id: stable_id(
+                    "message",
+                    &["opencode", &path.to_string_lossy(), &source_id],
+                ),
+                ordinal,
+                role,
+                content,
+                created_at: message_created_at,
+            });
+        }
+        if !messages.is_empty() {
+            conversations.push(Conversation {
+                id: session_id.clone(),
+                provider: "opencode",
+                source_path: PathBuf::from(format!("{}#{session_id}", path.display())),
+                title,
+                created_at,
+                updated_at,
+                messages,
+            });
+        }
+    }
+    Ok(ParsedDatabase {
+        conversations,
+        malformed_records,
+    })
+}
+
+type OpenCodeSession = (String, Option<String>, Option<i64>, Option<i64>);
+
+fn opencode_sessions(connection: &SqliteConnection) -> Result<Vec<OpenCodeSession>, AppError> {
+    let mut query = connection
+        .prepare(
+            "SELECT id, title, time_created, time_updated
+             FROM session ORDER BY time_created, id",
+        )
+        .map_err(AppError::database)?;
+    query
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)
+}
+
+fn opencode_message_content(
+    connection: &SqliteConnection,
+    message_id: &str,
+    malformed_records: &mut u64,
+) -> Result<Option<String>, AppError> {
+    let mut query = connection
+        .prepare(
+            "SELECT data FROM part WHERE message_id = ?1
+             ORDER BY time_created, id",
+        )
+        .map_err(AppError::database)?;
+    let parts = query
+        .query_map([message_id], |row| row.get::<_, String>(0))
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)?;
+    let mut content = Vec::new();
+    for part in parts {
+        if let Ok(data) = serde_json::from_str::<Value>(&part) {
+            if matches!(
+                data.get("type").and_then(Value::as_str),
+                Some("text" | "reasoning")
+            ) && let Some(text) = data.get("text").and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                content.push(text.to_owned());
+            }
+        } else {
+            *malformed_records += 1;
+        }
+    }
+    Ok((!content.is_empty()).then(|| content.join("\n")))
+}
+
+fn parse_copilot(path: &Path) -> Result<ParsedFile, AppError> {
+    let mut parsed = parse_jsonl(path, "github-copilot", |raw| {
+        let role = match raw.get("type").and_then(Value::as_str)? {
+            "user.message" => "user",
+            "assistant.message" => "assistant",
+            _ => return None,
+        };
+        let payload = raw.get("data").unwrap_or(raw);
+        let content = payload
+            .get("content")
+            .or_else(|| payload.get("message"))
+            .or_else(|| payload.get("text"))
+            .and_then(flatten_content)?;
+        Some((
+            raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            role.to_owned(),
+            content,
+            parse_timestamp(raw.get("timestamp")),
+            None,
+        ))
+    })?;
+    if let Some(conversation) = &mut parsed.conversation
+        && let Some(session_id) = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+    {
+        session_id.clone_into(&mut conversation.id);
+    }
+    Ok(parsed)
+}
+
+fn parse_hermes(path: &Path) -> Result<ParsedDatabase, AppError> {
+    let connection = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(AppError::database)?;
+    let mut query = connection
+        .prepare(
+            "SELECT id, title, CAST(started_at * 1000 AS INTEGER),
+                    CAST(ended_at * 1000 AS INTEGER)
+             FROM sessions ORDER BY started_at, id",
+        )
+        .map_err(AppError::database)?;
+    let sessions = query
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)?;
+    drop(query);
+    let mut conversations = Vec::new();
+    for (session_id, title, created_at, updated_at) in sessions {
+        let mut query = connection
+            .prepare(
+                "SELECT id, role, content, reasoning,
+                        CAST(timestamp * 1000 AS INTEGER)
+                 FROM messages WHERE session_id = ?1 ORDER BY timestamp, id",
+            )
+            .map_err(AppError::database)?;
+        let rows = query
+            .query_map([&session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(query);
+        let mut messages = Vec::new();
+        for (source_id, role, content, reasoning, message_created_at) in rows {
+            if role == "session_meta" {
+                continue;
+            }
+            let content = [content, reasoning]
+                .into_iter()
+                .flatten()
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n[reasoning]\n");
+            if content.is_empty() {
+                continue;
+            }
+            let ordinal = i64::try_from(messages.len())
+                .map_err(|_| AppError::internal("conversation contains too many messages"))?;
+            messages.push(NormalizedMessage {
+                id: stable_id(
+                    "message",
+                    &["hermes", &path.to_string_lossy(), &source_id.to_string()],
+                ),
+                ordinal,
+                role,
+                content,
+                created_at: message_created_at,
+            });
+        }
+        if !messages.is_empty() {
+            conversations.push(Conversation {
+                id: session_id.clone(),
+                provider: "hermes",
+                source_path: PathBuf::from(format!("{}#{session_id}", path.display())),
+                title,
+                created_at,
+                updated_at,
+                messages,
+            });
+        }
+    }
+    Ok(ParsedDatabase {
+        conversations,
+        malformed_records: 0,
+    })
 }
 
 fn parse_claude(path: &Path) -> Result<ParsedFile, AppError> {
@@ -168,6 +544,30 @@ fn parse_codex(path: &Path) -> Result<ParsedFile, AppError> {
         } else {
             None
         }
+    })
+}
+
+fn parse_pi(path: &Path) -> Result<ParsedFile, AppError> {
+    parse_jsonl(path, "pi", |raw| {
+        if raw.get("type").and_then(Value::as_str) != Some("message") {
+            return None;
+        }
+        let message = raw.get("message")?;
+        let role = match message.get("role").and_then(Value::as_str)? {
+            "toolResult" => "tool",
+            role => role,
+        };
+        let mut content = flatten_content(message.get("content")?)?;
+        if role == "tool" {
+            content = truncate_chars(&content, MAX_TOOL_OUTPUT_CHARS);
+        }
+        Some((
+            raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            role.to_owned(),
+            content,
+            parse_timestamp(raw.get("timestamp")),
+            None,
+        ))
     })
 }
 
@@ -243,6 +643,8 @@ fn parse_jsonl(
                 .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+        } else if provider == "pi" && raw.get("type").and_then(Value::as_str) == Some("session") {
+            session_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
         }
         let Some((source_id, role, content, created_at, message_session_id)) = extract(&raw) else {
             continue;
@@ -381,6 +783,7 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write;
 
     use super::*;
@@ -466,5 +869,62 @@ mod tests {
         );
         assert_eq!(conversation.messages[1].role, "tool");
         assert_eq!(conversation.messages[1].content, "created diagram.png");
+    }
+
+    #[veritas::claims(
+        "indexing/incomplete-scan-preserves-state",
+        "indexing/complete-scan-purges-missing-source"
+    )]
+    #[test]
+    fn purge_requires_a_complete_provider_scan() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("cass.sqlite3");
+        let claude_root = directory.path().join("claude");
+        fs::create_dir_all(&claude_root).expect("Claude root");
+        let missing_source = claude_root.join("missing.jsonl");
+
+        let mut writer = Storage::open_writer(&database).expect("writer");
+        writer
+            .replace_conversation(&Conversation {
+                id: "old-session".to_owned(),
+                provider: "claude-code",
+                source_path: missing_source,
+                title: None,
+                created_at: None,
+                updated_at: None,
+                messages: vec![NormalizedMessage {
+                    id: "old-message".to_owned(),
+                    ordinal: 0,
+                    role: "user".to_owned(),
+                    content: "preserve until complete".to_owned(),
+                    created_at: None,
+                }],
+            })
+            .expect("seed source");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+
+        fs::write(claude_root.join("malformed.jsonl"), "not-json\n").expect("malformed source");
+        let roots = ProviderRoots {
+            claude: vec![claude_root.clone()],
+            codex: Vec::new(),
+            opencode: Vec::new(),
+            copilot: Vec::new(),
+            hermes: Vec::new(),
+            pi: Vec::new(),
+        };
+        let mut writer = Storage::open_writer(&database).expect("incomplete writer");
+        let incomplete = index(&mut writer, &roots).expect("bounded malformed scan");
+        assert_eq!(incomplete.malformed_records, 1);
+        writer.commit_writer().expect("commit incomplete scan");
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+        drop(writer);
+
+        fs::remove_file(claude_root.join("malformed.jsonl")).expect("remove malformed source");
+        let mut writer = Storage::open_writer(&database).expect("complete writer");
+        let complete = index(&mut writer, &roots).expect("complete scan");
+        assert_eq!(complete.purged_conversations, 1);
+        writer.commit_writer().expect("commit complete scan");
+        assert_eq!(writer.counts().expect("counts").conversations, 0);
     }
 }

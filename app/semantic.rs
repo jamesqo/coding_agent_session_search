@@ -16,6 +16,7 @@ const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
 const MARKER_NAME: &str = "installed.json";
 const CANDIDATE_LIMIT: usize = 50;
 const RERANK_LIMIT: usize = 20;
+const EMBEDDING_BATCH_SIZE: usize = 32;
 const RRF_K: f32 = 60.0;
 
 pub(crate) struct Models {
@@ -98,9 +99,10 @@ impl Models {
     }
 
     pub(crate) fn load(&self) -> Result<Option<Backend>, AppError> {
-        if self.read_valid_marker().is_err() {
+        if !self.root.join(MARKER_NAME).is_file() {
             return Ok(None);
         }
+        self.read_valid_marker()?;
         Backend::load(&self.root).map(Some)
     }
 
@@ -172,20 +174,23 @@ pub(crate) fn rebuild_embeddings(
     storage: &mut Storage,
     backend: &mut Backend,
 ) -> Result<u64, AppError> {
-    let messages = storage.searchable_messages()?;
+    let messages = storage.messages_needing_embeddings()?;
     if messages.is_empty() {
-        storage.replace_embeddings(&[])?;
         return Ok(0);
     }
-    let texts: Vec<&str> = messages
-        .iter()
-        .map(|message| message.content.as_str())
-        .collect();
-    let vectors = backend.embed(&texts)?;
-    if messages.len() != vectors.len() {
-        return Err(AppError::model(
-            "embedding model returned an unexpected result count",
-        ));
+    let mut vectors = Vec::with_capacity(messages.len());
+    for batch in messages.chunks(EMBEDDING_BATCH_SIZE) {
+        let texts: Vec<&str> = batch
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        let batch_vectors = backend.embed(&texts)?;
+        if batch.len() != batch_vectors.len() {
+            return Err(AppError::model(
+                "embedding model returned an unexpected result count",
+            ));
+        }
+        vectors.extend(batch_vectors);
     }
     let rows: Vec<_> = messages
         .iter()

@@ -1,6 +1,11 @@
 mod cli;
 mod ingestion;
+#[cfg(feature = "semantic")]
 mod semantic;
+#[cfg(not(feature = "semantic"))]
+mod semantic_disabled;
+#[cfg(not(feature = "semantic"))]
+use semantic_disabled as semantic;
 mod storage;
 
 use std::ffi::OsString;
@@ -63,6 +68,10 @@ struct ErrorBody {
 }
 
 impl AppError {
+    fn message(&self) -> &str {
+        &self.error.message
+    }
+
     fn usage(message: impl Into<String>) -> Self {
         Self::new(2, "usage", message, false)
     }
@@ -77,6 +86,16 @@ impl AppError {
     }
 
     fn database(error: rusqlite::Error) -> Self {
+        if matches!(
+            &error,
+            rusqlite::Error::SqliteFailure(details, _)
+                if matches!(
+                    details.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        ) {
+            return Self::new(6, "index-busy", "another index writer is active", true);
+        }
         let message = error.to_string();
         drop(error);
         Self::new(5, "database", message, true)
@@ -94,6 +113,10 @@ impl AppError {
 
     fn model(message: impl Into<String>) -> Self {
         Self::new(4, "model", message, true)
+    }
+
+    fn schema(message: impl Into<String>) -> Self {
+        Self::new(7, "schema-incompatible", message, false)
     }
 
     fn new(code: i32, kind: &'static str, message: impl Into<String>, retryable: bool) -> Self {

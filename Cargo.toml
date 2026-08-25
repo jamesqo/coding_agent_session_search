@@ -29,12 +29,16 @@ blake3 = "1.8.5"
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
-fastembed = { version = "6.0.1", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "6.0.1", optional = true, default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
 walkdir = "2.5.0"
+
+[features]
+default = ["semantic"]
+semantic = ["dep:fastembed"]
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
@@ -43,8 +47,8 @@ tempfile = "3.27.0"
 veritas-test-macros = { path = "vendor/veritas-test-macros" }
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = true
 panic = "abort"
 opt-level = 3
