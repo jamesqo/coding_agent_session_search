@@ -49,6 +49,9 @@ enum Command {
         /// Current Hermes Agent SQLite database.
         #[arg(long, value_name = "PATH")]
         hermes_db: Option<PathBuf>,
+        /// Pi coding-agent sessions directory.
+        #[arg(long, value_name = "PATH")]
+        pi_root: Option<PathBuf>,
     },
     /// Search indexed messages.
     Search {
@@ -165,6 +168,7 @@ where
             opencode_db,
             copilot_root,
             hermes_db,
+            pi_root,
         } => index(
             &database_path,
             &models_dir,
@@ -175,6 +179,7 @@ where
                 opencode_db,
                 copilot_root,
                 hermes_db,
+                pi_root,
             ),
         ),
         Command::Search {
@@ -334,8 +339,9 @@ fn default_models_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use veritas_test_macros as veritas;
 
-    // Veritas claim: cli/operational-command-surface
+    #[veritas::claims("cli/operational-command-surface")]
     #[test]
     fn command_surface_contains_only_the_contract_commands() {
         let command = Cli::command();

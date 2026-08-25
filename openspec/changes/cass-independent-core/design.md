@@ -4,14 +4,15 @@ CASS has accumulated roughly half a million lines of production Rust around a
 small core need: searching local coding-agent histories. There are no external
 users or backward-compatibility requirements. The replacement stays in this
 repository, retains Claude Code, Codex, current OpenCode, GitHub Copilot CLI,
-and Hermes Agent histories, and must be independent of the Dickles/Franken
+Hermes Agent, and Pi histories, and must be independent of the Dickles/Franken
 ecosystem. SQLite is canonical; search artifacts are derived.
 
 ## Decisions
 
-- Use five concrete ingestion paths returning CASS-owned `Conversation` and
+- Use six concrete ingestion paths returning CASS-owned `Conversation` and
   `Message` values: Claude Code JSONL, Codex JSONL, current OpenCode SQLite,
-  GitHub Copilot CLI JSONL events, and current Hermes SQLite. Reject connector
+  GitHub Copilot CLI JSONL events, current Hermes SQLite, and current Pi JSONL.
+  Reject connector
   traits, registries, copied FAD code, legacy file stores, and VS Code Copilot
   Chat storage.
 - Use Rusqlite as the sole database library and one current schema. Reject
@@ -46,10 +47,10 @@ ecosystem. SQLite is canonical; search artifacts are derived.
 - Current database rows may not map cleanly to the selected schema. Test opening
   a representative current database before cutover and report unsupported data
   explicitly rather than silently discarding it.
-- Provider formats evolve. Keep representative fixtures for all five retained
+- Provider formats evolve. Keep representative fixtures for all six retained
   providers and fail malformed records without panicking. Current OpenCode and
-  Hermes schemas plus Copilot CLI event-log assumptions are bounded explicitly
-  rather than expanded into legacy compatibility machinery.
+  Hermes schemas plus Copilot CLI and Pi JSONL assumptions are bounded
+  explicitly rather than expanded into legacy compatibility machinery.
 - Exact vector search may become slow. Benchmark a representative corpus before
   adding any ANN dependency.
 - A mainstream model backend may fail on a deployment target. The portability

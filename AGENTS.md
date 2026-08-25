@@ -3,7 +3,7 @@
 ## Product boundary
 
 CASS is a small JSON-only Rust CLI for Claude Code, Codex, current OpenCode,
-GitHub Copilot CLI, and Hermes Agent histories. Keep the command surface
+GitHub Copilot CLI, Hermes Agent, and Pi histories. Keep the command surface
 limited to `index`, `search`, `view`, `status`, `forget`, and `models install`.
 
 - Use Rusqlite as the sole SQLite library.
@@ -12,9 +12,9 @@ limited to `index`, `search`, `view`, `status`, `forget`, and `models install`.
   and bounded reranking.
 - Do not add provider traits, registries, daemons, ANN indexes, compatibility
   shims, alternate output modes, a TUI, export, analytics, sync, or watch mode.
-- Keep OpenCode and Hermes support on their current SQLite schemas and GitHub
-  Copilot support on Copilot CLI `events.jsonl`; do not grow legacy/IDE/cloud
-  compatibility.
+- Keep OpenCode and Hermes support on their current SQLite schemas, GitHub
+  Copilot support on Copilot CLI `events.jsonl`, and Pi support on its current
+  JSONL session store; do not grow legacy/IDE/cloud/Oh My Pi compatibility.
 - Never download models outside the explicit `models install` command.
 - Unsafe Rust is forbidden.
 

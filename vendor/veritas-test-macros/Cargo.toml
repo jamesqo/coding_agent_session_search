@@ -1,0 +1,31 @@
+[package]
+name = "veritas-test-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Compile-time checked native evidence metadata for Veritas Rust tests"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jamesqo/veritas"
+publish = false
+
+[package.metadata.veritas]
+native-protocol = 1
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.106"
+quote = "1.0.42"
+syn = { version = "2.0.119", features = ["full", "parsing"] }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+float_cmp = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"

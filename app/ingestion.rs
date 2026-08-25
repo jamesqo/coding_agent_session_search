@@ -18,6 +18,7 @@ pub(crate) struct ProviderRoots {
     opencode: PathBuf,
     copilot: PathBuf,
     hermes: PathBuf,
+    pi: PathBuf,
 }
 
 pub(crate) struct IndexSummary {
@@ -57,6 +58,7 @@ impl ProviderRoots {
         opencode: Option<PathBuf>,
         copilot: Option<PathBuf>,
         hermes: Option<PathBuf>,
+        pi: Option<PathBuf>,
     ) -> Self {
         let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
         Self {
@@ -65,6 +67,7 @@ impl ProviderRoots {
             opencode: opencode.unwrap_or_else(|| home.join(".local/share/opencode/opencode.db")),
             copilot: copilot.unwrap_or_else(|| home.join(".copilot/session-state")),
             hermes: hermes.unwrap_or_else(|| home.join(".hermes/state.db")),
+            pi: pi.unwrap_or_else(|| home.join(".pi/agent/sessions")),
         }
     }
 }
@@ -133,6 +136,26 @@ pub(crate) fn index(
         summary.scanned_files += 1;
         for conversation in parse_hermes(&roots.hermes)? {
             storage.replace_conversation(&conversation)?;
+        }
+    }
+    if roots.pi.is_dir() {
+        for entry in WalkDir::new(&roots.pi).follow_links(false) {
+            let entry = entry.map_err(|error| AppError::internal(error.to_string()))?;
+            let path = entry.path();
+            if !entry.file_type().is_file()
+                || path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("jsonl"))
+            {
+                continue;
+            }
+            summary.scanned_files += 1;
+            let parsed = parse_pi(path)?;
+            summary.malformed_records += parsed.malformed_records;
+            if let Some(conversation) = parsed.conversation {
+                storage.replace_conversation(&conversation)?;
+            }
         }
     }
     Ok(summary)
@@ -468,6 +491,30 @@ fn parse_codex(path: &Path) -> Result<ParsedFile, AppError> {
     })
 }
 
+fn parse_pi(path: &Path) -> Result<ParsedFile, AppError> {
+    parse_jsonl(path, "pi", |raw| {
+        if raw.get("type").and_then(Value::as_str) != Some("message") {
+            return None;
+        }
+        let message = raw.get("message")?;
+        let role = match message.get("role").and_then(Value::as_str)? {
+            "toolResult" => "tool",
+            role => role,
+        };
+        let mut content = flatten_content(message.get("content")?)?;
+        if role == "tool" {
+            content = truncate_chars(&content, MAX_TOOL_OUTPUT_CHARS);
+        }
+        Some((
+            raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            role.to_owned(),
+            content,
+            parse_timestamp(raw.get("timestamp")),
+            None,
+        ))
+    })
+}
+
 fn parse_jsonl(
     path: &Path,
     provider: &'static str,
@@ -494,6 +541,8 @@ fn parse_jsonl(
                 .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+        } else if provider == "pi" && raw.get("type").and_then(Value::as_str) == Some("session") {
+            session_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
         }
         let Some((source_id, role, content, created_at, message_session_id)) = extract(&raw) else {
             continue;
@@ -573,6 +622,21 @@ fn flatten_block(block: &Value) -> Option<String> {
         return Some(text.to_owned());
     }
     match block.get("type").and_then(Value::as_str) {
+        Some("thinking") => block
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(|thinking| format!("[Thinking] {thinking}")),
+        Some("toolCall") => {
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let arguments = block
+                .get("arguments")
+                .map(stringify_value)
+                .unwrap_or_default();
+            Some(format!("Tool {name}: {arguments}"))
+        }
         Some("tool_use") => {
             let name = block
                 .get("name")
@@ -620,9 +684,12 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use veritas_test_macros as veritas;
 
-    // Veritas claims: ingestion/provider-boundary,
-    // ingestion/malformed-records-do-not-panic
+    #[veritas::claims(
+        "ingestion/provider-boundary",
+        "ingestion/malformed-records-do-not-panic"
+    )]
     #[test]
     fn claude_parser_skips_malformed_lines_and_keeps_messages() {
         let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
@@ -638,7 +705,7 @@ mod tests {
         assert_eq!(conversation.messages[1].content, "world");
     }
 
-    // Veritas claim: ingestion/provider-boundary
+    #[veritas::claims("ingestion/provider-boundary")]
     #[test]
     fn codex_parser_keeps_messages_and_tool_calls() {
         let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
@@ -653,8 +720,7 @@ mod tests {
         assert!(conversation.messages[1].content.contains("Tool search"));
     }
 
-    // Veritas claims: ingestion/provider-boundary,
-    // ingestion/supported-jsonl-indexes
+    #[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]
     #[test]
     fn codex_parser_keeps_custom_tool_calls() {
         let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
@@ -680,5 +746,22 @@ mod tests {
         );
         assert_eq!(conversation.messages[1].role, "tool");
         assert_eq!(conversation.messages[1].content, "created fox.png");
+    }
+
+    #[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]
+    #[test]
+    fn pi_parser_keeps_current_messages_and_tool_results() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
+        writeln!(file, r#"{{"type":"session","version":3,"id":"pi-1","timestamp":"2026-08-25T01:00:00Z","cwd":"/work/pi"}}"#).expect("session header");
+        writeln!(file, r#"{{"type":"message","id":"u1","timestamp":"2026-08-25T01:00:01Z","message":{{"role":"user","content":"hello"}}}}"#).expect("user message");
+        writeln!(file, r#"{{"type":"message","id":"a1","timestamp":"2026-08-25T01:00:02Z","message":{{"role":"assistant","content":[{{"type":"text","text":"world"}},{{"type":"toolCall","name":"read","arguments":{{"path":"app/lib.rs"}}}}]}}}}"#).expect("assistant message");
+        writeln!(file, r#"{{"type":"message","id":"t1","timestamp":"2026-08-25T01:00:03Z","message":{{"role":"toolResult","content":[{{"type":"text","text":"contents"}}]}}}}"#).expect("tool result");
+
+        let parsed = parse_pi(file.path()).expect("parse Pi history");
+        let conversation = parsed.conversation.expect("conversation");
+        assert_eq!(conversation.id, "pi-1");
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(conversation.messages[1].content.contains("Tool read"));
+        assert_eq!(conversation.messages[2].role, "tool");
     }
 }

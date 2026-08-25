@@ -1,15 +1,15 @@
 ## Why
 
 Replace CASS in place with a completely independent Claude Code, Codex,
-OpenCode, GitHub Copilot CLI, and Hermes Agent search application using
+OpenCode, GitHub Copilot CLI, Hermes Agent, and Pi search application using
 Rusqlite, SQLite FTS5, semantic retrieval, fusion, and reranking.
 
 ## What Changes
 
 - Replace the existing application with six JSON-first commands: `index`,
   `search`, `view`, `status`, `forget`, and `models install`.
-- Ingest current Claude Code and Codex JSONL histories, OpenCode and Hermes
-  SQLite histories, and GitHub Copilot CLI JSONL event logs.
+- Ingest current Claude Code, Codex, and Pi JSONL histories, OpenCode and
+  Hermes SQLite histories, and GitHub Copilot CLI JSONL event logs.
 - Store canonical conversations and messages in one current Rusqlite schema.
 - Combine SQLite FTS5 lexical retrieval with independent semantic retrieval,
   reciprocal-rank fusion, and cross-encoder reranking.
@@ -21,7 +21,7 @@ Rusqlite, SQLite FTS5, semantic retrieval, fusion, and reranking.
 ### New Capabilities
 
 - `cass-independent-core`: Index and retrieve Claude Code, Codex, OpenCode,
-  GitHub Copilot CLI, and Hermes Agent histories through a small, independent,
+  GitHub Copilot CLI, Hermes Agent, and Pi histories through a small, independent,
   machine-readable command-line application.
 
 ### Modified Capabilities
@@ -38,8 +38,9 @@ most 30,000 lines.
 
 ## Non-Goals
 
-- Providers other than Claude Code, Codex, OpenCode, GitHub Copilot CLI, and
-  Hermes Agent; legacy OpenCode/Hermes file storage and VS Code Copilot Chat
+- Providers other than Claude Code, Codex, OpenCode, GitHub Copilot CLI,
+  Hermes Agent, and Pi; legacy OpenCode/Hermes file storage, non-JSONL Pi
+  stores, Oh My Pi, and VS Code Copilot Chat
   storage are not part of this change.
 - TUI, HTML or transcript export, analytics, remote sync, watch mode, daemons,
   self-update, shell completion, human-oriented rendering, or alternate output

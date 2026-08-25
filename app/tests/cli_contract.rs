@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
+use veritas_test_macros as veritas;
 
 fn run_json(arguments: &[&str]) -> Value {
     let output = Command::cargo_bin("cass")
@@ -100,7 +101,24 @@ fn create_hermes_fixture(path: &std::path::Path) {
         .expect("Hermes fixture schema");
 }
 
-// Veritas claim: cli/bare-invocation-prints-help
+fn create_pi_fixture(root: &std::path::Path) {
+    let project = root.join("--work-pi-project--");
+    std::fs::create_dir_all(&project).expect("Pi project session root");
+    std::fs::write(
+        project.join("2026-08-25T01-00-00_pi-session.jsonl"),
+        concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"pi-session\",\"timestamp\":\"2026-08-25T01:00:00Z\",\"cwd\":\"/work/pi-project\"}\n",
+            "{not-json}\n",
+            "{\"type\":\"model_change\",\"id\":\"model-1\",\"parentId\":null,\"provider\":\"anthropic\",\"modelId\":\"claude-opus-4-1\"}\n",
+            "{\"type\":\"message\",\"id\":\"pi-user\",\"parentId\":\"model-1\",\"timestamp\":\"2026-08-25T01:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"locate the chartreuse-chinchilla\",\"timestamp\":1787619601000}}\n",
+            "{\"type\":\"message\",\"id\":\"pi-assistant\",\"parentId\":\"pi-user\",\"timestamp\":\"2026-08-25T01:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"inspect the current tree\"},{\"type\":\"text\",\"text\":\"the chinchilla is in Pi\"},{\"type\":\"toolCall\",\"id\":\"call-1\",\"name\":\"read\",\"arguments\":{\"path\":\"app/ingestion.rs\"}}],\"timestamp\":1787619602000}}\n",
+            "{\"type\":\"message\",\"id\":\"pi-tool\",\"parentId\":\"pi-assistant\",\"timestamp\":\"2026-08-25T01:00:03Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"call-1\",\"toolName\":\"read\",\"content\":[{\"type\":\"text\",\"text\":\"reader output\"}],\"isError\":false,\"timestamp\":1787619603000}}\n",
+        ),
+    )
+    .expect("Pi fixture");
+}
+
+#[veritas::claims("cli/bare-invocation-prints-help")]
 #[test]
 fn bare_invocation_prints_help_without_starting_an_interface() {
     Command::cargo_bin("cass")
@@ -110,7 +128,7 @@ fn bare_invocation_prints_help_without_starting_an_interface() {
         .stderr(predicate::str::contains("Usage:"));
 }
 
-// Veritas claim: cli/removed-commands-are-rejected
+#[veritas::claims("cli/removed-commands-are-rejected")]
 #[test]
 fn removed_commands_are_rejected() {
     for command in ["export", "doctor", "list", "sources"] {
@@ -123,7 +141,7 @@ fn removed_commands_are_rejected() {
     }
 }
 
-// Veritas claim: status/missing-database-recommends-index
+#[veritas::claims("status/missing-database-recommends-index")]
 #[test]
 fn status_without_a_database_recommends_index() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -143,9 +161,13 @@ fn status_without_a_database_recommends_index() {
     assert_eq!(body["recommended_action"], "index");
 }
 
-// Veritas claims: ingestion/supported-jsonl-indexes,
-// search/lexical-returns-distinctive-match, view/context-clamps-to-conversation,
-// storage/forget-removes-conversation
+#[veritas::claims(
+    "cli/operational-command-surface",
+    "ingestion/supported-jsonl-indexes",
+    "search/lexical-returns-distinctive-match",
+    "view/context-clamps-to-conversation",
+    "storage/forget-removes-conversation"
+)]
 #[test]
 fn index_search_view_and_forget_supported_histories() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -189,6 +211,8 @@ fn index_search_view_and_forget_supported_histories() {
         codex_root,
         "--hermes-db",
         codex_root,
+        "--pi-root",
+        codex_root,
     ]);
     assert_eq!(indexed["indexed_conversations"], 2);
     assert_eq!(indexed["indexed_messages"], 3);
@@ -215,8 +239,11 @@ fn index_search_view_and_forget_supported_histories() {
     assert_eq!(absent["results"].as_array().map(Vec::len), Some(0));
 }
 
-// Veritas claims: ingestion/provider-boundary,
-// ingestion/supported-jsonl-indexes, ingestion/malformed-records-do-not-panic
+#[veritas::claims(
+    "ingestion/provider-boundary",
+    "ingestion/supported-jsonl-indexes",
+    "ingestion/malformed-records-do-not-panic"
+)]
 #[test]
 fn opencode_and_copilot_cli_histories_are_searchable() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -246,6 +273,8 @@ fn opencode_and_copilot_cli_histories_are_searchable() {
         "--copilot-root",
         copilot_root.to_str().expect("UTF-8 Copilot path"),
         "--hermes-db",
+        claude_root.to_str().expect("UTF-8 Claude path"),
+        "--pi-root",
         claude_root.to_str().expect("UTF-8 Claude path"),
     ]);
     assert_eq!(indexed["indexed_conversations"], 2);
@@ -280,13 +309,14 @@ fn opencode_and_copilot_cli_histories_are_searchable() {
         copilot_root.to_str().expect("UTF-8 Copilot path"),
         "--hermes-db",
         claude_root.to_str().expect("UTF-8 Claude path"),
+        "--pi-root",
+        claude_root.to_str().expect("UTF-8 Claude path"),
     ]);
     assert_eq!(reindexed["indexed_conversations"], 2);
     assert_eq!(reindexed["indexed_messages"], 4);
 }
 
-// Veritas claims: ingestion/provider-boundary,
-// ingestion/supported-jsonl-indexes
+#[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]
 #[test]
 fn hermes_histories_are_searchable() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -313,6 +343,8 @@ fn hermes_histories_are_searchable() {
         empty_root,
         "--hermes-db",
         hermes_db,
+        "--pi-root",
+        empty_root,
     ];
     let indexed = run_json(&arguments);
     assert_eq!(indexed["indexed_conversations"], 1);
@@ -338,7 +370,60 @@ fn hermes_histories_are_searchable() {
     assert_eq!(reindexed["indexed_messages"], 2);
 }
 
-// Veritas claim: ingestion/unsupported-providers-ignored
+#[veritas::claims(
+    "ingestion/provider-boundary",
+    "ingestion/supported-jsonl-indexes",
+    "ingestion/malformed-records-do-not-panic",
+    "storage/full-rebuild-is-idempotent"
+)]
+#[test]
+fn pi_histories_are_searchable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let empty_root = directory.path().join("empty");
+    let pi_root = directory.path().join("pi-sessions");
+    std::fs::create_dir_all(&empty_root).expect("empty provider root");
+    create_pi_fixture(&pi_root);
+    let database = directory.path().join("cass.sqlite3");
+    let database = database.to_str().expect("UTF-8 database path");
+    let empty_root = empty_root.to_str().expect("UTF-8 empty path");
+    let pi_root = pi_root.to_str().expect("UTF-8 Pi path");
+    let arguments = [
+        "--db",
+        database,
+        "index",
+        "--full",
+        "--claude-root",
+        empty_root,
+        "--codex-root",
+        empty_root,
+        "--opencode-db",
+        empty_root,
+        "--copilot-root",
+        empty_root,
+        "--hermes-db",
+        empty_root,
+        "--pi-root",
+        pi_root,
+    ];
+    let indexed = run_json(&arguments);
+    assert_eq!(indexed["indexed_conversations"], 1);
+    assert_eq!(indexed["indexed_messages"], 3);
+    assert_eq!(indexed["scanned_files"], 1);
+    assert_eq!(indexed["malformed_records"], 1);
+
+    let found = run_json(&["--db", database, "search", "chartreuse", "--provider", "pi"]);
+    assert_eq!(found["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(found["results"][0]["conversation_id"], "pi-session");
+    let message_id = found["results"][0]["id"].as_str().expect("message ID");
+    let viewed = run_json(&["--db", database, "view", message_id, "--context", "10"]);
+    assert_eq!(viewed["messages"].as_array().map(Vec::len), Some(3));
+
+    let reindexed = run_json(&arguments);
+    assert_eq!(reindexed["indexed_conversations"], 1);
+    assert_eq!(reindexed["indexed_messages"], 3);
+}
+
+#[veritas::claims("ingestion/unsupported-providers-ignored")]
 #[test]
 fn unsupported_provider_records_are_ignored() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -367,6 +452,8 @@ fn unsupported_provider_records_are_ignored() {
         codex_root.to_str().expect("UTF-8 Codex path"),
         "--hermes-db",
         codex_root.to_str().expect("UTF-8 Codex path"),
+        "--pi-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
     ]);
 
     assert_eq!(indexed["scanned_files"], 1);
@@ -374,8 +461,11 @@ fn unsupported_provider_records_are_ignored() {
     assert_eq!(indexed["indexed_messages"], 0);
 }
 
-// Veritas claims: ingestion/malformed-records-do-not-panic,
-// ingestion/supported-jsonl-indexes, storage/full-rebuild-is-idempotent
+#[veritas::claims(
+    "ingestion/malformed-records-do-not-panic",
+    "ingestion/supported-jsonl-indexes",
+    "storage/full-rebuild-is-idempotent"
+)]
 #[test]
 fn malformed_records_are_bounded_and_reindexing_is_idempotent() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -408,6 +498,8 @@ fn malformed_records_are_bounded_and_reindexing_is_idempotent() {
         codex_root.to_str().expect("UTF-8 Codex path"),
         "--hermes-db",
         codex_root.to_str().expect("UTF-8 Codex path"),
+        "--pi-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
     ];
     let first = run_json(&arguments);
     let second = run_json(&arguments);
@@ -428,8 +520,7 @@ fn malformed_records_are_bounded_and_reindexing_is_idempotent() {
     assert_eq!(found["results"].as_array().map(Vec::len), Some(1));
 }
 
-// Veritas claims: semantic/missing-models-fall-back,
-// models/download-is-explicit
+#[veritas::claims("semantic/missing-models-fall-back", "models/download-is-explicit")]
 #[test]
 fn search_without_models_falls_back_without_downloading() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -462,6 +553,8 @@ fn search_without_models_falls_back_without_downloading() {
             codex_root.to_str().expect("UTF-8 Codex path"),
             "--hermes-db",
             codex_root.to_str().expect("UTF-8 Codex path"),
+            "--pi-root",
+            codex_root.to_str().expect("UTF-8 Codex path"),
         ])
         .assert()
         .success();
@@ -484,7 +577,7 @@ fn search_without_models_falls_back_without_downloading() {
     assert!(!data_home.exists(), "search must not acquire model assets");
 }
 
-// Veritas claim: semantic/hybrid-reranks-with-models
+#[veritas::claims("semantic/hybrid-reranks-with-models")]
 #[test]
 #[ignore = "requires CASS_TEST_MODELS_DIR containing an explicit model installation"]
 fn hybrid_search_with_installed_models() {
@@ -523,6 +616,8 @@ fn hybrid_search_with_installed_models() {
         "--copilot-root",
         codex_root.to_str().expect("UTF-8 Codex path"),
         "--hermes-db",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--pi-root",
         codex_root.to_str().expect("UTF-8 Codex path"),
     ]);
     assert_eq!(indexed["embeddings"], 3);
@@ -581,6 +676,8 @@ fn lexical_search_applies_recency_filter() {
         codex_root.to_str().expect("UTF-8 Codex path"),
         "--hermes-db",
         codex_root.to_str().expect("UTF-8 Codex path"),
+        "--pi-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
     ]);
 
     let all = run_json(&["--db", database, "search", "temporal"]);
@@ -590,7 +687,7 @@ fn lexical_search_applies_recency_filter() {
     assert_eq!(recent["results"][0]["content"], "temporal new");
 }
 
-// Veritas claim: independence/no-dickles-franken-surface
+#[veritas::claims("independence/no-dickles-franken-surface")]
 #[test]
 fn maintained_repository_is_independent_and_minimal() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -626,6 +723,8 @@ fn maintained_repository_is_independent_and_minimal() {
         concat!("Dickles", "worthstone"),
     ];
     let mut maintained = String::new();
+    let mut production_lines = 0;
+    let mut test_lines = 0;
     for file in [
         "Cargo.toml",
         "Cargo.lock",
@@ -637,12 +736,21 @@ fn maintained_repository_is_independent_and_minimal() {
     }
     for entry in walkdir::WalkDir::new(root.join("app")) {
         let entry = entry.expect("walk app source");
-        if entry.file_type().is_file() {
-            maintained.push_str(
-                &std::fs::read_to_string(entry.path()).expect("UTF-8 maintained Rust source"),
-            );
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("rs")
+        {
+            let source =
+                std::fs::read_to_string(entry.path()).expect("UTF-8 maintained Rust source");
+            if entry.path().starts_with(root.join("app/tests")) {
+                test_lines += source.lines().count();
+            } else {
+                production_lines += source.lines().count();
+            }
+            maintained.push_str(&source);
         }
     }
+    assert!(production_lines <= 70_000, "production Rust LOC exceeded");
+    assert!(test_lines <= 30_000, "test Rust LOC exceeded");
     let maintained = maintained.to_ascii_lowercase();
     for name in forbidden {
         assert!(

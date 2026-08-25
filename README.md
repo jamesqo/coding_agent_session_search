@@ -1,7 +1,7 @@
 # cass
 
 `cass` is a local, JSON-only search CLI for Claude Code, Codex, OpenCode,
-GitHub Copilot CLI, and Hermes Agent histories. It stores normalized
+GitHub Copilot CLI, Hermes Agent, and Pi histories. It stores normalized
 conversations in SQLite, uses SQLite FTS5 for lexical retrieval, and optionally
 adds local semantic retrieval plus cross-encoder reranking after an explicit
 model installation.
@@ -29,9 +29,9 @@ CASS_TEST_MODELS_DIR=/path/to/cass-models \
 
 ```text
 cass index [--full] [--claude-root PATH] [--codex-root PATH] \
-  [--opencode-db PATH] [--copilot-root PATH] [--hermes-db PATH]
+  [--opencode-db PATH] [--copilot-root PATH] [--hermes-db PATH] [--pi-root PATH]
 cass search <query> [--limit N] \
-  [--provider claude-code|codex|opencode|github-copilot|hermes] [--days N]
+  [--provider claude-code|codex|opencode|github-copilot|hermes|pi] [--days N]
 cass view <message-id> [--context N]
 cass status
 cass forget <conversation-id>
@@ -44,10 +44,11 @@ to select model assets.
 
 Default history sources are `~/.claude/projects`, `~/.codex/sessions`,
 `~/.local/share/opencode/opencode.db`, and
-`~/.copilot/session-state`, plus `~/.hermes/state.db`. OpenCode and Hermes
+`~/.copilot/session-state`, `~/.hermes/state.db`, plus
+`~/.pi/agent/sessions`. OpenCode and Hermes
 support target their current SQLite schemas; GitHub Copilot support targets
 Copilot CLI `events.jsonl` histories. Legacy file storage, VS Code Copilot Chat
-storage, and cloud history are not scanned.
+storage, cloud history, Pi SQLite/native stores, and Oh My Pi are not scanned.
 
 ## Search behavior
 

@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL CHECK (
         provider IN (
-            'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes'
+            'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
         )
     ),
     source_path TEXT NOT NULL UNIQUE,
@@ -447,8 +447,9 @@ fn cutoff_timestamp(days: Option<u32>) -> Result<Option<i64>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use veritas_test_macros as veritas;
 
-    // Veritas claim: storage/full-rebuild-is-idempotent
+    #[veritas::claims("storage/full-rebuild-is-idempotent")]
     #[test]
     fn full_rebuild_is_idempotent() {
         let directory = tempfile::tempdir().expect("temporary directory");

@@ -9,7 +9,7 @@ Verification cadence: plan-final
 ## Scope
 
 Replace the application in place with a small Rust JSON CLI that indexes
-Claude Code and Codex JSONL histories, current OpenCode and Hermes SQLite
+Claude Code, Codex, and Pi JSONL histories, current OpenCode and Hermes SQLite
 histories, and GitHub Copilot CLI JSONL event logs; stores canonical records in Rusqlite;
 searches with SQLite FTS5 plus optional semantic retrieval and reranking; and
 exposes only `index`, `search`, `view`, `status`, `forget`, and `models install`.
@@ -29,7 +29,7 @@ evidence discovery, link review, approval, and terminal Veritas status/report.
 | ID | Decision | Rationale | Consequence |
 |---|---|---|---|
 | PC-1 | Replace the legacy application in place | The approved product boundary deliberately rejects compatibility | Old commands, code, tests, assets, workflows, and documentation are deleted |
-| PC-2 | Preserve current Claude Code, Codex, OpenCode, GitHub Copilot CLI, and Hermes Agent history readability | These are the only named consumers | Five concrete ingestion paths; no provider trait, registry, or FAD dependency |
+| PC-2 | Preserve current Claude Code, Codex, OpenCode, GitHub Copilot CLI, Hermes Agent, and Pi history readability | These are the only named consumers | Six concrete ingestion paths; no provider trait, registry, or FAD dependency |
 | PC-3 | Replace all storage with one current Rusqlite schema | SQLite is canonical and backward compatibility is a non-goal | No Frankensqlite, dual backend, migration museum, or salvage path |
 | PC-4 | Replace search with FTS5 plus one concrete semantic backend | The product requires lexical fallback, semantic retrieval, fusion, and reranking | No Frankensearch, CASS-owned ANN, model registry, or daemon |
 | PC-5 | Remove all human-oriented product surfaces | The stable consumer is an agent using JSON | No TUI, export, alternate encodings, aliases, or presentation framework |
@@ -38,7 +38,7 @@ evidence discovery, link review, approval, and terminal Veritas status/report.
 
 - `app/cli.rs`: the complete Clap command surface and JSON response boundary.
 - `app/ingestion.rs`: concrete Claude Code, Codex, OpenCode, GitHub Copilot
-  CLI, and Hermes Agent discovery/normalization.
+  CLI, Hermes Agent, and Pi discovery/normalization.
 - `app/storage.rs`: current schema, canonical writes, FTS5, context hydration,
   deletion, and embedding persistence.
 - `app/semantic.rs`: one concrete local embedding/reranking backend, exact
@@ -62,7 +62,7 @@ context view, and complete conversation deletion. Foundation: the current
 
 ### Supported-provider ingestion
 
-Outcome: representative Claude Code/Codex JSONL, current OpenCode/Hermes
+Outcome: representative Claude Code/Codex/Pi JSONL, current OpenCode/Hermes
 SQLite, and GitHub Copilot CLI JSONL histories are discovered and normalized;
 malformed records produce bounded diagnostics without panics.
 Owned claims: `ingestion/*`. Non-goal: a provider abstraction or format
@@ -134,13 +134,13 @@ shared schema are common ownership seams.
   fuzz, script, workflow, asset, or stale documentation surface. Owns all
   legacy paths outside the retained replacement and OpenSpec/Veritas contract.
   Exit: dependency/provider scans are clean and Rust LOC ceilings pass.
-- [x] **PH-5 — Add OpenCode, GitHub Copilot CLI, and Hermes ingestion.** Depends
-  on PH-4. Consumes the consolidated core and produces three concrete ingestion
+- [x] **PH-5 — Add OpenCode, GitHub Copilot CLI, Hermes, and Pi ingestion.** Depends
+  on PH-4. Consumes the consolidated core and produces four concrete ingestion
   paths, CLI root configuration, canonical storage support, and representative
   current-format tests without a provider abstraction or compatibility layer.
   Owns `app/ingestion.rs`, provider additions in `app/cli.rs` and
   `app/storage.rs`, focused fixtures/tests, and matching documentation. Exit:
-  all three providers index, search, view, filter, reindex, and fail malformed input
+  all four providers index, search, view, filter, reindex, and fail malformed input
   safely through focused Nextest scenarios.
 - [ ] **PH-6 — Integrated proof and consolidation.** Depends on PH-5. Consumes
   the complete replacement and produces final formatting, strict Clippy,
@@ -404,13 +404,13 @@ discovers 19 focused evidence declarations with no artifact drift. The 16
 uncovered claims remain assigned to PH-6 link review and approval. No exclusion
 was introduced. PH-5 is now ready.
 
-### PH-5 Execution Contract: OpenCode, GitHub Copilot CLI, and Hermes Ingestion
+### PH-5 Execution Contract: OpenCode, GitHub Copilot CLI, Hermes, and Pi Ingestion
 
-Status: approved
+Status: implemented
 Depends on: PH-4 (implemented)
 Consumes: consolidated core, canonical schema, and concrete
 Claude Code/Codex ingestion
-Produces: current OpenCode, GitHub Copilot CLI, and Hermes discovery,
+Produces: current OpenCode, GitHub Copilot CLI, Hermes, and Pi discovery,
 normalization, storage, filtering, and focused proof for PH-6
 Owns: `app/ingestion.rs`, provider/root additions in `app/cli.rs` and
 `app/storage.rs`, `app/tests/cli_contract.rs`, `README.md`, and `AGENTS.md`
@@ -422,17 +422,19 @@ Verification role: intermediate
 
 - **Outcome:** current OpenCode sessions from `opencode.db`, GitHub Copilot CLI
   sessions from `session-state/<id>/events.jsonl`, and Hermes Agent sessions
-  from `state.db` index into the same canonical records and work through
+  from `state.db`, plus Pi sessions from `~/.pi/agent/sessions/**/*.jsonl`,
+  index into the same canonical records and work through
   search, provider filters, view, and idempotent reindexing.
 - **Existing foundation:** concrete ingestion functions, stable BLAKE3 IDs,
   transactional conversation replacement, one Rusqlite schema, and the JSON
   index/search/view surface remain.
-- **Net-new work:** three explicit roots, read-only OpenCode and Hermes database
-  parsers, a Copilot CLI event parser, five-provider storage constraint,
+- **Net-new work:** four explicit roots, read-only OpenCode and Hermes database
+  parsers, Copilot CLI and Pi event parsers, six-provider storage constraint,
   representative fixtures, malformed-record accounting, and concise documentation.
 - **Not included:** provider traits or registries, FAD code, legacy OpenCode or
   Hermes file storage, VS Code Copilot Chat workspace storage, Copilot cloud
-  history, migrations, remote discovery, or compatibility heuristics.
+  history, Pi SQLite/native stores, Oh My Pi, migrations, remote discovery, or
+  compatibility heuristics.
 - **Claims and findings:** existing `ingestion/*` claims and their uncovered
   findings; the claim IDs remain stable because the provider requirement is
   expanded rather than replaced.
@@ -444,11 +446,12 @@ Verification role: intermediate
 
 1. Add representative black-box fixtures for current OpenCode
    `session`/`message`/`part` tables, Copilot CLI `user.message` plus
-   `assistant.message` events, and Hermes `sessions`/`messages` tables.
+   `assistant.message` events, Hermes `sessions`/`messages` tables, and Pi v3
+   `session` plus nested `message` JSONL entries.
    Establish red tests for index/search/filter/view and idempotent reindexing.
 2. Add explicit CLI roots and concrete parser functions. Open OpenCode and
    Hermes with Rusqlite read-only flags and normalize textual content; parse
-   Copilot events line-by-line and ignore non-conversation events.
+   Copilot and Pi events line-by-line and ignore non-conversation entries.
 3. Extend the canonical provider constraint and error accounting without a
    schema-version or provider abstraction. Update minimal user/developer docs.
 4. Run focused provider Nextest, the model-free suite, formatting, strict
@@ -457,13 +460,13 @@ Verification role: intermediate
 
 #### Proof
 
-- Targeted: `cargo nextest run -E 'test(/opencode|copilot|hermes/)'`.
+- Targeted: `cargo nextest run -E 'test(/opencode|copilot|hermes|pi/)'`.
 - Native: complete current model-free Nextest, strict Clippy, formatting, and
   doctests as an intermediate regression check.
 - Evidence: provider scenarios are compiler-discoverable Rust tests;
   `ingestion/*` links remain pending PH-6 individual semantic review.
 - Coverage exclusions: legacy OpenCode/Hermes storage, VS Code Copilot Chat,
-  and cloud history are scope boundaries, not exclusions from a retained
+  cloud history, Pi SQLite/native stores, and Oh My Pi are scope boundaries, not exclusions from a retained
   requirement.
 - Veritas: refresh discovery/status/report; do not approve links in this phase.
 
@@ -477,22 +480,24 @@ Verification role: intermediate
 
 #### Completion record
 
-Implemented outcome: CASS now discovers current OpenCode `opencode.db`, GitHub
+Implemented outcome: CASS discovers current OpenCode `opencode.db`, GitHub
 Copilot CLI `session-state/<id>/events.jsonl`, and Hermes Agent `state.db`
 through three concrete code paths. Both external databases open read-only.
 Provider filters, stable IDs, context view, malformed JSON accounting, skipped
 non-conversation records, and idempotent replacement are exercised by focused
 black-box fixtures. Legacy OpenCode/Hermes storage, VS Code Copilot Chat, and
-cloud history remain outside the approved boundary.
+cloud history remain outside the approved boundary. It also discovers current
+Pi version-3 JSONL sessions under an explicit/default sessions root, retains
+user/assistant/tool-result text plus searchable thinking and tool calls, and
+counts malformed lines without losing valid siblings. Pi SQLite/native stores
+and Oh My Pi remain outside the boundary.
 
-On Xenia, the complete model-free Nextest suite passed 20 tests with one
+On Xenia, the complete model-free Nextest suite passed 22 tests with one
 explicit-model test skipped; the installed-model hybrid test passed separately.
 Strict all-target Clippy, formatting, doctests, and diff hygiene passed. The
-repository remains 35 tracked files with 2,016 production Rust lines and 653
-test Rust lines. Veritas locked the three approved ingestion-claim wording
-changes and now discovers 21 evidence declarations with zero artifact drift.
-The 16 uncovered claims remain assigned to PH-6 review and approval; no
-coverage exclusion was introduced. PH-6 is now ready.
+repository remains 35 tracked files with 2,106 production Rust lines and 761
+test Rust lines. Veritas refresh and final approval review remain assigned to
+PH-6; no coverage exclusion was introduced. PH-6 is now ready.
 
 ### PH-6 Execution Contract: Integrated Proof and Consolidation
 

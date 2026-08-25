@@ -1,15 +1,24 @@
 {
   "schema": 1,
   "change_id": "cass-independent-core",
-  "contract_hash": "sha256:7b337874cb544dd1fe84fa4699da8154f57db3e92dea8c87b8fbde100b21dc3b",
-  "manifest_hash": "sha256:57d8a3bededf35511d627b14941ccfb309c44130acd00ad5b3bc30a98ef21b0e",
-  "reviewed_at": "2026-08-24T23:16:45Z",
-  "note": "Re-accepted after Veritas generated the approved claims baseline; normative spec text is unchanged.",
+  "contract_hash": "sha256:4d41620e6bcb6625d9f013bf7466d4bd08927939f246caeb486f407a7cea256f",
+  "manifest_hash": "sha256:bca473467d3a952a79c91b2a18d4e2b354e98fdaaae298ae3f849cb25bd38e79",
+  "reviewed_at": "2026-08-25T01:40:06Z",
   "history": [
     {
       "contract_hash": "sha256:2498a6dbd9bd2141b02a64dcdc88a54ceaac69fa34482cae791fc2d669776840",
       "reviewed_at": "2026-08-24T23:16:22Z",
       "superseded_at": "2026-08-24T23:16:45Z"
+    },
+    {
+      "contract_hash": "sha256:7b337874cb544dd1fe84fa4699da8154f57db3e92dea8c87b8fbde100b21dc3b",
+      "reviewed_at": "2026-08-24T23:16:45Z",
+      "superseded_at": "2026-08-25T01:27:32Z"
+    },
+    {
+      "contract_hash": "sha256:e806af3f80463a84a5d7c72ad0d6ab29020c26d62f7e0f9bcceb6dabfe0c13c4",
+      "reviewed_at": "2026-08-25T01:27:32Z",
+      "superseded_at": "2026-08-25T01:40:06Z"
     }
   ]
 }
