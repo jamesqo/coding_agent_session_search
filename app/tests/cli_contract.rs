@@ -23,6 +23,20 @@ fn run_json(arguments: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
+fn error_kind(output: &std::process::Output) -> Value {
+    serde_json::from_slice::<Value>(&output.stderr).expect("typed error")["error"]["kind"].clone()
+}
+
+fn sorted_lines(path: &Path) -> Vec<String> {
+    let mut lines = std::fs::read_to_string(path)
+        .expect("text file")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines
+}
+
 fn create_valid_model_marker(root: &Path) {
     std::fs::create_dir_all(root).expect("model root");
     std::fs::write(root.join("dummy-model"), [0_u8]).expect("dummy model asset");
@@ -111,6 +125,44 @@ fn write_config(path: &Path, local_node: &str, claude_root: &Path, codex_root: &
         .expect("configuration JSON"),
     )
     .expect("configuration file");
+}
+
+fn write_federation_config(path: &Path) {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "local_node": "xenia",
+            "nodes": [
+                {
+                    "name": "xenia",
+                    "ssh": "xenia-tail",
+                    "search": true,
+                    "providers": {}
+                },
+                {
+                    "name": "dev-macbook",
+                    "ssh": "dev-tail",
+                    "search": true,
+                    "providers": {}
+                },
+                {
+                    "name": "personal-macbook",
+                    "ssh": "personal-tail",
+                    "search": false,
+                    "providers": {}
+                },
+                {
+                    "name": "backup-macbook",
+                    "ssh": "backup-tail",
+                    "search": true,
+                    "providers": {}
+                }
+            ]
+        }))
+        .expect("federation configuration JSON"),
+    )
+    .expect("federation configuration");
 }
 
 #[veritas::claims("configuration/status-reports-resolved-settings")]
@@ -324,6 +376,64 @@ fn hidden_workers_are_config_blind_and_reject_explicit_config_flags() {
         let worker_error: Value =
             serde_json::from_slice(&worker_output.stderr).expect("worker runtime error");
         assert_eq!(worker_error["error"]["kind"], expected_kind);
+    }
+}
+
+#[cfg(unix)]
+#[veritas::claims("federated-search/remote-worker-is-nonrecursive")]
+#[test]
+fn hidden_workers_never_start_ssh_from_config_or_environment() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let xdg = directory.path().join("xdg");
+    let config = xdg.join("cass/config.json");
+    std::fs::create_dir_all(config.parent().unwrap()).expect("config parent");
+    write_federation_config(&config);
+    let log = directory.path().join("ssh.log");
+    let ssh = directory.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\nprintf started >> \"$CASS_FAKE_SSH_LOG\"\nexit 23\n",
+    )
+    .expect("fake ssh");
+    let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ssh, permissions).expect("executable ssh");
+    let path = std::env::join_paths(std::iter::once(directory.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("fake ssh path");
+
+    for (worker, request, expected_kind) in [
+        (
+            ["search", "--federation-request"],
+            r#"{"protocol":2,"query":"needle","limit":1}"#,
+            "model",
+        ),
+        (
+            ["view", "--federation-request"],
+            r#"{"protocol":2,"id":"message","context":0}"#,
+            "database-missing",
+        ),
+    ] {
+        let output = Command::cargo_bin("cass")
+            .expect("cass binary")
+            .env("PATH", &path)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("CASS_SEARCH_NODES", "dev-macbook")
+            .env("CASS_FAKE_SSH_LOG", &log)
+            .args([
+                "--db",
+                directory.path().join("missing.sqlite3").to_str().unwrap(),
+                "--models-dir",
+                directory.path().join("missing-models").to_str().unwrap(),
+            ])
+            .args(worker)
+            .write_stdin(request)
+            .output()
+            .expect("hidden worker");
+        let error: Value = serde_json::from_slice(&output.stderr).expect("worker JSON");
+        assert_eq!(error["error"]["kind"], expected_kind);
+        assert!(!log.exists());
     }
 }
 
@@ -699,6 +809,8 @@ fn status_reads_an_older_database_without_migrating_it() {
 #[test]
 fn federated_search_fails_when_local_semantic_search_is_unready() {
     let directory = tempfile::tempdir().expect("temporary directory");
+    let config = directory.path().join("config.json");
+    write_federation_config(&config);
     let ssh = directory.path().join("ssh");
     std::fs::write(
         &ssh,
@@ -723,6 +835,8 @@ fn federated_search_fails_when_local_semantic_search_is_unready() {
         .expect("cass binary")
         .env("PATH", path)
         .args([
+            "--config",
+            config.to_str().unwrap(),
             "--db",
             directory.path().join("missing.sqlite3").to_str().unwrap(),
             "--models-dir",
@@ -730,7 +844,7 @@ fn federated_search_fails_when_local_semantic_search_is_unready() {
             "search",
             "query",
             "--node",
-            "remote-node",
+            "dev-macbook",
         ])
         .output()
         .expect("federated search");
@@ -739,6 +853,164 @@ fn federated_search_fails_when_local_semantic_search_is_unready() {
     let error: Value = serde_json::from_slice(&output.stderr).expect("typed local error");
     assert_eq!(error["error"]["kind"], "model");
     assert_eq!(error["error"]["recommended_action"], "models install");
+}
+
+#[cfg(unix)]
+#[veritas::claims(
+    "configuration/environment-inputs-are-ignored",
+    "federated-search/node-selection-precedence",
+    "federated-search/configured-default-fanout",
+    "federated-search/concurrent-fanout",
+    "federated-search/remote-view"
+)]
+#[test]
+fn configured_federation_uses_inventory_destinations_and_logical_names() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config = directory.path().join("config.json");
+    let log = directory.path().join("ssh.log");
+    write_federation_config(&config);
+    let ssh = directory.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        concat!(
+            "#!/bin/sh\n",
+            "shift 9\n",
+            "destination=$1\n",
+            "operation=$3\n",
+            "if test \"$destination\" = dev-tail || test \"$destination\" = backup-tail; then\n",
+            "  touch \"$CASS_FAKE_SSH_SYNC/$destination\"\n",
+            "  while ! test -e \"$CASS_FAKE_SSH_SYNC/dev-tail\" || ! test -e \"$CASS_FAKE_SSH_SYNC/backup-tail\"; do sleep 0.01; done\n",
+            "fi\n",
+            "printf '%s %s\\n' \"$destination\" \"$operation\" >> \"$CASS_FAKE_SSH_LOG\"\n",
+            "cat >/dev/null\n",
+            "if test \"$operation\" = search; then\n",
+            "  printf '%s\\n' '{\"protocol\":2,\"kind\":\"search\",\"response\":{\"query\":\"query\",\"realized_mode\":\"hybrid\",\"results\":[]}}'\n",
+            "else\n",
+            "  printf '%s\\n' '{\"protocol\":2,\"kind\":\"view\",\"response\":{\"id\":\"message\",\"messages\":[{\"id\":\"message\",\"ordinal\":0,\"role\":\"user\",\"content\":\"remote view\",\"created_at\":null}]}}'\n",
+            "fi\n"
+        ),
+    )
+    .expect("fake ssh");
+    let mut permissions = std::fs::metadata(&ssh).expect("ssh metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ssh, permissions).expect("executable ssh");
+    let path = std::env::join_paths(std::iter::once(directory.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("fake ssh path");
+
+    let run_search = |nodes: &[&str]| {
+        let mut command = Command::cargo_bin("cass").expect("cass binary");
+        command
+            .env("PATH", &path)
+            .env("CASS_FAKE_SSH_LOG", &log)
+            .env("CASS_FAKE_SSH_SYNC", directory.path())
+            .args(["--config", config.to_str().unwrap()])
+            .args([
+                "--db",
+                directory.path().join("missing.sqlite3").to_str().unwrap(),
+                "--models-dir",
+                directory.path().join("missing-models").to_str().unwrap(),
+                "search",
+                "query",
+            ]);
+        for node in nodes {
+            command.args(["--node", node]);
+        }
+        command.output().expect("configured search")
+    };
+
+    let default = run_search(&[]);
+    assert_eq!(error_kind(&default), "model");
+    assert_eq!(
+        sorted_lines(&log),
+        ["backup-tail search", "dev-tail search"]
+    );
+
+    std::fs::write(&log, "").expect("clear log");
+    let explicit = run_search(&["personal-macbook", "personal-macbook"]);
+    assert_eq!(error_kind(&explicit), "model");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "personal-tail search\n"
+    );
+
+    for invalid in ["xenia", "unknown"] {
+        std::fs::write(&log, "").expect("clear log");
+        let output = run_search(&[invalid]);
+        assert_eq!(error_kind(&output), "usage");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+    }
+
+    std::fs::write(&log, "").expect("clear log");
+    let viewed = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", &path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .args(["--config", config.to_str().unwrap()])
+        .args(["view", "message", "--node", "personal-macbook"])
+        .output()
+        .expect("configured remote view");
+    assert!(viewed.status.success());
+    let response: Value = serde_json::from_slice(&viewed.stdout).expect("view JSON");
+    assert_eq!(response["messages"][0]["content"], "remote view");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "personal-tail view\n"
+    );
+
+    std::fs::write(&log, "").expect("clear log");
+    let ignored = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .env("CASS_SEARCH_NODES", "dev-macbook")
+        .args(["search", "query"])
+        .output()
+        .expect("local-only search");
+    assert_eq!(error_kind(&ignored), "model");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+}
+
+#[cfg(unix)]
+#[veritas::claims(
+    "federated-search/node-selection-precedence",
+    "federated-search/node-validation",
+    "federated-search/remote-view"
+)]
+#[test]
+fn explicit_remote_nodes_require_configuration_before_local_work_or_ssh() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let log = directory.path().join("ssh.log");
+    let ssh = directory.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\nprintf started >> \"$CASS_FAKE_SSH_LOG\"\nexit 23\n",
+    )
+    .expect("fake ssh");
+    let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ssh, permissions).expect("executable ssh");
+    let path = std::env::join_paths(std::iter::once(directory.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("fake ssh path");
+
+    for arguments in [
+        ["search", "query", "--node", "dev-macbook"],
+        ["view", "message", "--node", "dev-macbook"],
+    ] {
+        let output = Command::cargo_bin("cass")
+            .expect("cass binary")
+            .env("PATH", &path)
+            .env("CASS_FAKE_SSH_LOG", &log)
+            .args(arguments)
+            .output()
+            .expect("explicit node without configuration");
+        let error: Value = serde_json::from_slice(&output.stderr).expect("usage JSON");
+        assert_eq!(error["error"]["kind"], "usage");
+        assert!(!log.exists());
+    }
 }
 
 #[veritas::claims("view/tool-results-remain-visible")]

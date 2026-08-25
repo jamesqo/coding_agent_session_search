@@ -298,7 +298,7 @@ reads legacy environment inputs independently.
   links were semantically reviewed and approved under the user's delegated
   authority. Pre-existing semantic-search review debt remains outside PH-2.
 
-- [ ] **PH-3 — Resolve configured federation and integrate commands.** Depends
+- [x] **PH-3 — Resolve configured federation and integrate commands.** Depends
   on: PH-1 and PH-2. Replace raw/environment nodes with configured logical names
   and unique SSH destinations; implement enabled default fanout, explicit
   deduplication, explicit selection of `search:false` nodes, local selection
@@ -312,6 +312,56 @@ reads legacy environment inputs independently.
   tests plus the PH-1 native and Veritas gates. Owns federation selection/node
   types, search/view integration, and tests.
 
+  **PH-3 execution contract — approved under the plan's existing authority.**
+  Status: complete. Depends on: completed PH-2. Consumes the loaded
+  `ResolvedConfig` inventory, existing protocol-v2 request/envelope types,
+  fixed SSH runner, concurrent local/remote search, merge/provenance logic, and
+  remote view transport. Produces a concrete logical-name/SSH-destination
+  selection for search and view, with no environment fallback. Owns
+  `app/federation.rs`, search/view composition in `app/cli.rs`, PH-3 CLI and
+  fake-process tests, and the PH-3 portion of configuration evidence;
+  concurrent siblings: none. Verification cadence: phase; role: phase-final.
+
+  Contract: without a loaded file, absent `--node` stays local-only and any
+  explicit node fails before local model/database work or SSH. With a loaded
+  file, absent nodes select every nonlocal `search:true` entry; explicit names
+  replace defaults, deduplicate, may select `search:false`, and reject unknown
+  or local names before effects. User-facing provenance always uses logical
+  names while process launch receives the configured SSH destination as one
+  argument after `--`. Search fanout remains concurrent and bounded; remote
+  view uses the same resolver. Hidden workers remain configuration-blind and
+  nonrecursive. `CASS_SEARCH_NODES` is deleted with no compatibility path.
+
+  Execution increments:
+
+  1. Replace raw alias/environment selection with a concrete remote-node value
+     and table-driven no-config/default/explicit/disabled/unknown/local/cap
+     selection tests.
+  2. Separate logical provenance from SSH destination through the fixed
+     process runner; adapt concurrent search and view composition without
+     changing protocol, timeout, partial failure, or merge behavior.
+  3. Add fake-SSH CLI/process proof for configured default and explicit fanout,
+     nonrecursive workers, destination argument safety, environment removal,
+     and configured remote view; then run the phase-final native, OpenSpec,
+     independent review, and Veritas gates.
+
+  Exit:
+
+  - [x] Configured node selection and pre-effect rejection pass focused proof.
+  - [x] Logical provenance and SSH destinations remain distinct end to end.
+  - [x] Search fanout, worker nonrecursion, and remote view pass fake-process proof.
+  - [x] Canonical phase gate and delegated semantic approvals are current.
+
+  Completion record: complete on 2026-08-25. Configured logical names now
+  resolve to separately validated SSH destinations; default and explicit
+  selection, disabled-node overrides, remote view, and no-config failures are
+  covered end to end. The fake-process gate requires two default remote peers
+  to rendezvous, proving concurrent fanout, and confirms hidden workers never
+  recurse. The final gate passed 83/83 Nextest tests with two intentionally
+  skipped, strict Clippy, rustfmt, doctests, and strict OpenSpec validation.
+  All 17 changed federation evidence links were semantically reviewed and
+  approved under the user's delegated authority.
+
 - [ ] **PH-4 — Consolidate repository code and proof.** Depends on: PH-3.
   Remove obsolete environment/provider helpers, tests, and docs; collapse
   temporary resolution seams; update help and example configuration; and
@@ -322,6 +372,26 @@ reads legacy environment inputs independently.
   user or an explicitly delegated human. Agents stop rather than self-approve.
   Owns docs, generated Veritas state through CLI commands, and final plan
   records.
+
+  **PH-4 execution contract — approved under the plan's existing authority.**
+  Status: in progress. Depends on: completed PH-3. Consumes the finished
+  two-provider configuration, indexing, and federation paths. Produces one
+  accurate public README and repository metadata surface with no legacy
+  provider/environment claims or temporary compatibility seams. Owns README,
+  OpenSpec project context, help/example text, dependency and source cleanup,
+  generated Veritas state, and final change records; concurrent siblings:
+  none. Verification cadence: phase; role: phase-final.
+
+  Execution increments:
+
+  1. Audit maintained source, dependencies, help, docs, and project context for
+     stale six-provider, environment, or pre-configuration behavior.
+  2. Delete obsolete helpers and tests only where retained behavior has stronger
+     direct coverage; update the README and example configuration to the exact
+     two-provider, JSON-only command and precedence contract.
+  3. Run the complete native and strict OpenSpec gates, refresh Veritas,
+     semantically review every changed link under delegated authority, and
+     record the final repository state before rollout.
 
 - [ ] **PH-5 — Roll out and prove the three-machine fleet.** Depends on: PH-4
   and separate external-write authority. Create and test a restorable database

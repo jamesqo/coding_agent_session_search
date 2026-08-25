@@ -273,7 +273,10 @@ fn dispatch(
                 .map(|response| Response::FederationSearch(SearchEnvelope::new(response)))
             } else {
                 let query = query.ok_or_else(|| AppError::usage("search requires a query"))?;
-                let nodes = federation::select_nodes(&node)?;
+                let nodes = federation::select_nodes(
+                    resolved_config.expect("public command resolved configuration above"),
+                    &node,
+                )?;
                 search(
                     database_path,
                     models_dir,
@@ -303,6 +306,15 @@ fn dispatch(
                     .map(|response| Response::FederationView(ViewEnvelope::new(response)))
             } else {
                 let id = id.ok_or_else(|| AppError::usage("view requires an id"))?;
+                let node = node
+                    .map(|name| {
+                        federation::select_nodes(
+                            resolved_config.expect("public command resolved configuration above"),
+                            &[name],
+                        )
+                        .map(|mut nodes| nodes.pop().expect("one explicit node selected"))
+                    })
+                    .transpose()?;
                 view(database_path, id, context, node)
             }
         }
@@ -418,7 +430,7 @@ fn search(
     limit: usize,
     provider: Option<&str>,
     days: Option<u32>,
-    nodes: &[String],
+    nodes: &[federation::RemoteNode],
 ) -> Result<Response, AppError> {
     if nodes.is_empty() {
         return local_search(database_path, models_dir, query, limit, provider, days)
@@ -430,9 +442,10 @@ fn search(
             .iter()
             .map(|node| {
                 let node = node.clone();
+                let name = node.name.clone();
                 let request = &request;
                 (
-                    node.clone(),
+                    name,
                     scope.spawn(move || federation::remote_search(node, request)),
                 )
             })
@@ -566,12 +579,11 @@ fn view(
     database_path: &Path,
     id: String,
     context: u32,
-    node: Option<String>,
+    node: Option<federation::RemoteNode>,
 ) -> Result<Response, AppError> {
     let Some(node) = node else {
         return local_view(database_path, id, context).map(Response::View);
     };
-    federation::validate_node(&node)?;
     let remote = federation::remote_view(node, &ViewRequest::new(id, context));
     if let Some(response) = remote.response {
         return Ok(Response::View(response));

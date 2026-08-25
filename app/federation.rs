@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppError;
 use crate::cli::{SearchResponse, ViewResponse};
+use crate::config::ResolvedConfig;
 use crate::storage::SearchHit;
 
 const PROTOCOL_VERSION: u8 = 2;
@@ -113,6 +114,12 @@ pub(crate) struct RemoteResult<T> {
     pub(crate) outcome: NodeOutcome,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteNode {
+    pub(crate) name: String,
+    pub(crate) ssh: String,
+}
+
 pub(crate) fn thread_failure<T>(node: String) -> RemoteResult<T> {
     remote_error(
         node,
@@ -151,24 +158,49 @@ struct RemoteErrorBody {
     message: String,
 }
 
-pub(crate) fn select_nodes(explicit: &[String]) -> Result<Vec<String>, AppError> {
+pub(crate) fn select_nodes(
+    configuration: &ResolvedConfig,
+    explicit: &[String],
+) -> Result<Vec<RemoteNode>, AppError> {
+    if !configuration.loaded {
+        return if explicit.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(AppError::usage("--node requires a loaded configuration"))
+        };
+    }
+    let local = configuration
+        .local
+        .as_ref()
+        .expect("loaded configuration has a resolved local node");
     let candidates = if explicit.is_empty() {
-        std::env::var("CASS_SEARCH_NODES")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|node| !node.is_empty())
-            .map(ToOwned::to_owned)
+        configuration
+            .nodes
+            .iter()
+            .filter(|node| node.name != local.name && node.search)
+            .map(|node| node.name.clone())
             .collect::<Vec<_>>()
     } else {
         explicit.to_vec()
     };
     let mut seen = BTreeSet::new();
     let mut nodes = Vec::new();
-    for node in candidates {
-        validate_node(&node)?;
-        if seen.insert(node.clone()) {
-            nodes.push(node);
+    for name in candidates {
+        if name == local.name {
+            return Err(AppError::usage(format!(
+                "configured node is local and cannot be selected: {name}"
+            )));
+        }
+        let node = configuration
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .ok_or_else(|| AppError::usage(format!("unknown configured node: {name}")))?;
+        if seen.insert(name.clone()) {
+            nodes.push(RemoteNode {
+                name,
+                ssh: node.ssh.clone(),
+            });
         }
     }
     if nodes.len() > MAX_NODES {
@@ -177,19 +209,6 @@ pub(crate) fn select_nodes(explicit: &[String]) -> Result<Vec<String>, AppError>
         ));
     }
     Ok(nodes)
-}
-
-pub(crate) fn validate_node(node: &str) -> Result<(), AppError> {
-    let mut characters = node.chars();
-    let valid_start = characters
-        .next()
-        .is_some_and(|character| character.is_ascii_alphanumeric());
-    let valid_rest = characters
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'));
-    if !valid_start || !valid_rest || node == "local" {
-        return Err(AppError::usage(format!("invalid SSH node: {node}")));
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_protocol(protocol: u8) -> Result<(), AppError> {
@@ -275,13 +294,16 @@ fn merge_ranked_results(
     }
 }
 
-pub(crate) fn remote_search(node: String, request: &SearchRequest) -> RemoteResult<SearchResponse> {
+pub(crate) fn remote_search(
+    node: RemoteNode,
+    request: &SearchRequest,
+) -> RemoteResult<SearchResponse> {
     remote_search_with(OsStr::new("ssh"), node, request, REMOTE_TIMEOUT)
 }
 
 fn remote_search_with(
     ssh: &OsStr,
-    node: String,
+    node: RemoteNode,
     request: &SearchRequest,
     timeout: Duration,
 ) -> RemoteResult<SearchResponse> {
@@ -312,7 +334,7 @@ fn remote_search_with(
     result
 }
 
-pub(crate) fn remote_view(node: String, request: &ViewRequest) -> RemoteResult<ViewResponse> {
+pub(crate) fn remote_view(node: RemoteNode, request: &ViewRequest) -> RemoteResult<ViewResponse> {
     remote_call(
         OsStr::new("ssh"),
         node,
@@ -326,7 +348,7 @@ pub(crate) fn remote_view(node: String, request: &ViewRequest) -> RemoteResult<V
 
 fn remote_call<Request, Envelope, Response>(
     ssh: &OsStr,
-    node: String,
+    node: RemoteNode,
     operation: &'static str,
     request: &Request,
     timeout: Duration,
@@ -345,22 +367,22 @@ where
         }
         Err(error) => {
             return remote_error(
-                node,
+                node.name,
                 elapsed_millis(started),
                 "request",
                 format!("failed to encode federation request: {error}"),
             );
         }
     };
-    let process = match run_ssh(ssh, &node, operation, &payload, timeout) {
+    let process = match run_ssh(ssh, &node.ssh, operation, &payload, timeout) {
         Ok(process) => process,
         Err(error) => {
-            return remote_error(node, elapsed_millis(started), "spawn", error);
+            return remote_error(node.name, elapsed_millis(started), "spawn", error);
         }
     };
     if process.timed_out {
         return remote_error(
-            node,
+            node.name,
             process.elapsed_ms,
             "timeout",
             "remote request exceeded five-second deadline".to_owned(),
@@ -368,7 +390,7 @@ where
     }
     if process.stdout.overflowed {
         return remote_error(
-            node,
+            node.name,
             process.elapsed_ms,
             "output-too-large",
             "remote stdout exceeded 16 MiB".to_owned(),
@@ -378,14 +400,14 @@ where
         let diagnostic = bounded_diagnostic(&process.stderr.bytes);
         if let Some(remote) = parse_remote_error(&process.stderr.bytes) {
             return remote_error(
-                node,
+                node.name,
                 process.elapsed_ms,
                 remote.error.kind,
                 remote.error.message,
             );
         }
         return remote_error(
-            node,
+            node.name,
             process.elapsed_ms,
             "remote-exit",
             if diagnostic.is_empty() {
@@ -399,7 +421,7 @@ where
         Ok(envelope) => envelope,
         Err(error) => {
             return remote_error(
-                node,
+                node.name,
                 process.elapsed_ms,
                 "malformed-response",
                 format!("remote returned invalid JSON: {error}"),
@@ -408,7 +430,7 @@ where
     };
     if envelope.protocol() != PROTOCOL_VERSION || envelope.kind() != expected_kind {
         return remote_error(
-            node,
+            node.name,
             process.elapsed_ms,
             "incompatible-response",
             "remote returned an incompatible federation envelope".to_owned(),
@@ -417,7 +439,7 @@ where
     let response = extract(envelope);
     RemoteResult {
         outcome: NodeOutcome {
-            node,
+            node: node.name,
             status: "ok".to_owned(),
             elapsed_ms: process.elapsed_ms,
             realized_mode: None,
@@ -593,34 +615,141 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::config::{ResolvedNode, ResolvedProviders};
     use veritas_test_macros as veritas;
 
-    #[test]
-    fn node_alias_validation_covers_boundaries() {
-        for valid in ["xenia", "dev-macbook", "host.example", "node_1", "9node"] {
-            assert!(validate_node(valid).is_ok(), "expected valid node: {valid}");
-        }
-        for invalid in ["", "local", "-option", "bad host", "bad;host", "nødé"] {
-            assert!(
-                validate_node(invalid).is_err(),
-                "expected invalid node: {invalid}"
-            );
+    fn remote_node(name: &str, ssh: &str) -> RemoteNode {
+        RemoteNode {
+            name: name.to_owned(),
+            ssh: ssh.to_owned(),
         }
     }
 
+    fn configuration(nodes: &[(&str, &str, bool)], local: &str) -> ResolvedConfig {
+        let nodes = nodes
+            .iter()
+            .map(|(name, ssh, search)| ResolvedNode {
+                name: (*name).to_owned(),
+                ssh: (*ssh).to_owned(),
+                search: *search,
+                providers: ResolvedProviders::default(),
+                since_days: Some(90),
+            })
+            .collect::<Vec<_>>();
+        let local = nodes
+            .iter()
+            .find(|node| node.name == local)
+            .expect("local fixture")
+            .clone();
+        ResolvedConfig {
+            path: "/tmp/config.json".into(),
+            loaded: true,
+            providers: local.providers.clone(),
+            since_days: local.since_days,
+            local: Some(local),
+            nodes,
+        }
+    }
+
+    #[veritas::claims(
+        "federated-search/node-selection-precedence",
+        "federated-search/configured-default-fanout",
+        "federated-search/node-validation"
+    )]
     #[test]
-    fn explicit_node_selection_is_stable_and_bounded() {
-        let nodes = select_nodes(&[
-            "dev-macbook".to_owned(),
-            "xenia".to_owned(),
-            "dev-macbook".to_owned(),
-        ])
-        .expect("valid nodes");
-        assert_eq!(nodes, ["dev-macbook", "xenia"]);
-        let excessive = (0..17)
+    fn configured_node_selection_covers_defaults_overrides_and_failures() {
+        let configured = configuration(
+            &[
+                ("xenia", "xenia-tail", true),
+                ("dev-macbook", "dev-tail", true),
+                ("personal-macbook", "personal-tail", false),
+            ],
+            "xenia",
+        );
+        assert_eq!(
+            select_nodes(&configured, &[]).unwrap(),
+            [remote_node("dev-macbook", "dev-tail")]
+        );
+        assert_eq!(
+            select_nodes(
+                &configured,
+                &["personal-macbook".to_owned(), "personal-macbook".to_owned()]
+            )
+            .unwrap(),
+            [remote_node("personal-macbook", "personal-tail")]
+        );
+        assert!(select_nodes(&configured, &["xenia".to_owned()]).is_err());
+        assert!(select_nodes(&configured, &["unknown".to_owned()]).is_err());
+
+        let no_file = ResolvedConfig {
+            loaded: false,
+            local: None,
+            nodes: Vec::new(),
+            providers: ResolvedProviders::default(),
+            since_days: Some(90),
+            path: "/tmp/missing.json".into(),
+        };
+        assert_eq!(select_nodes(&no_file, &[]).unwrap(), []);
+        assert!(select_nodes(&no_file, &["dev-macbook".to_owned()]).is_err());
+
+        let mut excessive = configuration(&[("xenia", "xenia-tail", true)], "xenia");
+        let explicit = (0..17)
             .map(|index| format!("node-{index}"))
             .collect::<Vec<_>>();
-        assert!(select_nodes(&excessive).is_err());
+        excessive
+            .nodes
+            .extend(explicit.iter().map(|name| ResolvedNode {
+                name: name.clone(),
+                ssh: format!("ssh-{name}"),
+                search: false,
+                providers: ResolvedProviders::default(),
+                since_days: Some(90),
+            }));
+        assert!(select_nodes(&excessive, &explicit).is_err());
+    }
+
+    #[veritas::claims("federated-search/node-validation", "federated-search/remote-view")]
+    #[test]
+    fn transport_uses_ssh_destination_but_reports_logical_name() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let executable = fake_executable(
+            directory.path(),
+            "transport",
+            concat!(
+                "shift 9\n",
+                "test \"$1\" = 'tailscale-destination' || exit 17\n",
+                "test \"$2\" = '~/.local/bin/cass' || exit 18\n",
+                "operation=$3\n",
+                "test \"$4\" = '--federation-request' || exit 19\n",
+                "cat >/dev/null\n",
+                "if test \"$operation\" = search; then\n",
+                "  printf '%s\\n' '{\"protocol\":2,\"kind\":\"search\",\"response\":{\"query\":\"query\",\"realized_mode\":\"hybrid\",\"results\":[]}}'\n",
+                "else\n",
+                "  printf '%s\\n' '{\"protocol\":2,\"kind\":\"view\",\"response\":{\"id\":\"message\",\"messages\":[]}}'\n",
+                "fi\n"
+            ),
+        );
+        let node = remote_node("logical-node", "tailscale-destination");
+        let search = remote_search_with(
+            executable.as_os_str(),
+            node.clone(),
+            &SearchRequest::new("query".to_owned(), 1, None, None),
+            Duration::from_secs(1),
+        );
+        assert!(search.response.is_some());
+        assert_eq!(search.outcome.node, "logical-node");
+
+        let view = remote_call(
+            executable.as_os_str(),
+            node,
+            "view",
+            &ViewRequest::new("message".to_owned(), 0),
+            Duration::from_secs(1),
+            "view",
+            |envelope: ViewEnvelope| envelope.response,
+        );
+        assert!(view.response.is_some());
+        assert_eq!(view.outcome.node, "logical-node");
     }
 
     #[test]
@@ -630,7 +759,7 @@ mod tests {
         let request = SearchRequest::new("query".to_owned(), 1, None, None);
         let timed_out = remote_call(
             timeout.as_os_str(),
-            "node".to_owned(),
+            remote_node("node", "node"),
             "search",
             &request,
             Duration::from_millis(30),
@@ -642,7 +771,7 @@ mod tests {
         let malformed = fake_executable(directory.path(), "malformed", "printf 'not-json\\n'\n");
         let malformed = remote_call(
             malformed.as_os_str(),
-            "node".to_owned(),
+            remote_node("node", "node"),
             "search",
             &request,
             Duration::from_secs(1),
@@ -657,7 +786,7 @@ mod tests {
         let nonzero = fake_executable(directory.path(), "nonzero", "exit 7\n");
         let nonzero = remote_call(
             nonzero.as_os_str(),
-            "node".to_owned(),
+            remote_node("node", "node"),
             "search",
             &request,
             Duration::from_secs(1),
@@ -673,7 +802,7 @@ mod tests {
         );
         let oversized = remote_call(
             oversized.as_os_str(),
-            "node".to_owned(),
+            remote_node("node", "node"),
             "search",
             &request,
             Duration::from_secs(2),
@@ -686,10 +815,6 @@ mod tests {
         );
     }
 
-    #[veritas::claims(
-        "federated-search/semantic-unready-node-is-partial-failure",
-        "federated-search/successful-nodes-are-hybrid"
-    )]
     #[test]
     fn remote_search_accepts_only_v2_hybrid_successes() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -719,7 +844,7 @@ mod tests {
             let executable = fake_executable(directory.path(), name, body);
             let result = remote_search_with(
                 executable.as_os_str(),
-                name.to_owned(),
+                remote_node(name, name),
                 &request,
                 Duration::from_secs(1),
             );
@@ -780,6 +905,10 @@ mod tests {
         assert_eq!(merged.results[1].provider, "zeta");
     }
 
+    #[veritas::claims(
+        "federated-search/semantic-unready-node-is-partial-failure",
+        "federated-search/successful-nodes-are-hybrid"
+    )]
     #[test]
     fn rank_merge_preserves_ready_results_and_unready_node_outcomes() {
         let ready = RemoteResult {
