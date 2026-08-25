@@ -360,11 +360,11 @@ fn index(
         storage.rebuild_derived_search_state()?;
     }
     let search_refresh_milliseconds = elapsed_milliseconds(search_started);
-    storage.checkpoint_writer()?;
     emit_index_phase("semantic-embeddings", &summary);
     let embedding_started = Instant::now();
     storage.invalidate_embedding_generation(semantic::embedding_generation())?;
     let embeddings = if storage.has_pending_embeddings()? {
+        storage.commit_and_continue_writer()?;
         let model_started = Instant::now();
         let mut embedding_pool = models.load_indexer()?.ok_or_else(|| {
             AppError::model("semantic models are not installed; run `cass models install`")

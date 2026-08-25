@@ -173,6 +173,14 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_writer(&mut self) -> Result<(), AppError> {
+        self.commit_and_restart_writer("PRAGMA wal_checkpoint(PASSIVE); BEGIN IMMEDIATE")
+    }
+
+    pub(crate) fn commit_and_continue_writer(&mut self) -> Result<(), AppError> {
+        self.commit_and_restart_writer("BEGIN IMMEDIATE")
+    }
+
+    fn commit_and_restart_writer(&mut self, continuation: &str) -> Result<(), AppError> {
         self.require_writer()?;
         let threshold = self.measured_fts_bulk_threshold()?;
         self.finalize_pending_fts_updates(threshold)?;
@@ -182,7 +190,7 @@ impl Storage {
             .map_err(AppError::database)?;
         self.writer_active = false;
         self.connection
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE); BEGIN IMMEDIATE")
+            .execute_batch(continuation)
             .map_err(AppError::database)?;
         self.writer_active = true;
         self.transaction_base_messages = self.message_count()?;
