@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -187,11 +188,13 @@ fn index(
     roots: &ProviderRoots,
 ) -> Result<Response, AppError> {
     let mut storage = Storage::open_writer(database_path)?;
+    storage.defer_search_updates()?;
     if full {
-        storage.defer_search_updates()?;
+        storage.mark_derived_search_dirty()?;
     }
     let summary = ingestion::index(&mut storage, roots)?;
-    if full {
+    if storage.derived_search_is_dirty()? {
+        emit_index_phase("search-rebuild", &summary);
         storage.rebuild_derived_search_state()?;
     }
     #[cfg(feature = "semantic")]
@@ -211,6 +214,7 @@ fn index(
     #[cfg(not(feature = "semantic"))]
     let current_embeddings = 0;
     storage.commit_writer()?;
+    emit_index_phase("complete", &summary);
     let hybrid_ready = counts.messages > 0 && current_embeddings == counts.messages;
     Ok(Response::Index(IndexResponse {
         indexed_conversations: counts.conversations,
@@ -231,6 +235,24 @@ fn index(
         realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
         fallback_reason,
     }))
+}
+
+fn emit_index_phase(phase: &'static str, summary: &ingestion::IndexSummary) {
+    let event = serde_json::json!({
+        "event": "index-progress",
+        "phase": phase,
+        "processed_files": summary.processed_files,
+        "scanned_files": summary.scanned_files,
+        "processed_bytes": summary.processed_bytes,
+        "discovered_bytes": summary.discovered_bytes,
+        "changed_messages": summary.changed_messages,
+        "committed_batches": summary.committed_batches,
+    });
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    if serde_json::to_writer(&mut stderr, &event).is_ok() {
+        let _ = writeln!(stderr);
+    }
 }
 
 fn search(

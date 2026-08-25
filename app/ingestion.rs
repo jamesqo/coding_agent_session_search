@@ -99,7 +99,7 @@ struct ProgressEvent<'a> {
     changed_messages: u64,
     committed_batches: u64,
     elapsed_milliseconds: u64,
-    files_per_second: u64,
+    messages_per_second: u64,
     bytes_per_second: u64,
 }
 
@@ -198,7 +198,7 @@ pub(crate) fn index(
     )?;
 
     summary.processed_files = summary.scanned_files;
-    progress.emit(&summary, "complete", true);
+    progress.emit(&summary, "ingestion-complete", true);
 
     Ok(summary)
 }
@@ -277,9 +277,7 @@ fn index_provider(
             }
             batch_files = batch_files.saturating_add(1);
             batch_bytes = batch_bytes.saturating_add(source_bytes);
-            if storage.supports_ingestion_checkpoints()
-                && (batch_files >= CHECKPOINT_FILES || batch_bytes >= CHECKPOINT_BYTES)
-            {
+            if batch_files >= CHECKPOINT_FILES || batch_bytes >= CHECKPOINT_BYTES {
                 match storage.checkpoint_writer() {
                     Ok(()) => {
                         summary.committed_batches += 1;
@@ -390,8 +388,8 @@ impl IndexProgress {
             changed_messages: summary.changed_messages,
             committed_batches: summary.committed_batches,
             elapsed_milliseconds,
-            files_per_second: summary
-                .processed_files
+            messages_per_second: summary
+                .changed_messages
                 .saturating_mul(1_000)
                 .checked_div(elapsed_milliseconds)
                 .unwrap_or_default(),

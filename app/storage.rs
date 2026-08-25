@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS source_checkpoints (
     modified_ns INTEGER NOT NULL,
     PRIMARY KEY (provider, source_path)
 );
+CREATE TABLE IF NOT EXISTS derived_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    search_dirty INTEGER NOT NULL CHECK (search_dirty IN (0, 1))
+);
+INSERT OR IGNORE INTO derived_state(singleton, search_dirty) VALUES (1, 0);
 ";
 
 pub(crate) struct Storage {
@@ -182,14 +187,31 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn supports_ingestion_checkpoints(&self) -> bool {
-        !self.defer_search_updates
-    }
-
     pub(crate) fn defer_search_updates(&mut self) -> Result<(), AppError> {
         self.require_writer()?;
         self.defer_search_updates = true;
         Ok(())
+    }
+
+    pub(crate) fn mark_derived_search_dirty(&self) -> Result<(), AppError> {
+        self.require_writer()?;
+        self.connection
+            .execute(
+                "UPDATE derived_state SET search_dirty = 1 WHERE singleton = 1",
+                [],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
+    }
+
+    pub(crate) fn derived_search_is_dirty(&self) -> Result<bool, AppError> {
+        self.connection
+            .query_row(
+                "SELECT search_dirty FROM derived_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(AppError::database)
     }
 
     pub(crate) fn open_existing(path: &Path) -> Result<Self, AppError> {
@@ -303,6 +325,9 @@ impl Storage {
 
         let (changed_message_ids, removed_messages) =
             self.reconcile_messages(conversation, &existing_messages)?;
+        if self.defer_search_updates && (!changed_message_ids.is_empty() || removed_messages != 0) {
+            self.mark_derived_search_dirty()?;
+        }
         Ok(ConversationChange {
             changed_message_ids,
             removed_messages,
@@ -450,7 +475,8 @@ impl Storage {
                 "DELETE FROM message_fts;
                  DELETE FROM message_embeddings;
                  INSERT INTO message_fts(content, message_id, conversation_id)
-                 SELECT content, id, conversation_id FROM messages;",
+                 SELECT content, id, conversation_id FROM messages;
+                 UPDATE derived_state SET search_dirty = 0 WHERE singleton = 1;",
             )
             .map_err(AppError::database)?;
         self.defer_search_updates = false;
@@ -482,11 +508,15 @@ impl Storage {
                 continue;
             }
             self.connection
-                .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
-                .map_err(AppError::database)?;
-            self.connection
                 .execute("DELETE FROM conversations WHERE id = ?1", [&id])
                 .map_err(AppError::database)?;
+            if self.defer_search_updates {
+                self.mark_derived_search_dirty()?;
+            } else {
+                self.connection
+                    .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
+                    .map_err(AppError::database)?;
+            }
             removed += 1;
         }
         let mut statement = self
@@ -531,9 +561,13 @@ impl Storage {
         let Some(id) = id else {
             return Ok(false);
         };
-        self.connection
-            .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
-            .map_err(AppError::database)?;
+        if self.defer_search_updates {
+            self.mark_derived_search_dirty()?;
+        } else {
+            self.connection
+                .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
+                .map_err(AppError::database)?;
+        }
         self.connection
             .execute("DELETE FROM conversations WHERE id = ?1", [&id])
             .map_err(AppError::database)?;
@@ -1194,6 +1228,50 @@ mod tests {
                 .source_checkpoint_matches("codex", "/tmp/session-1.jsonl", 100, 200)
                 .expect("read checkpoint")
         );
+    }
+
+    #[test]
+    fn dirty_search_state_survives_a_batch_and_rebuilds_after_resume() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .defer_search_updates()
+            .expect("defer FTS maintenance");
+        writer
+            .replace_conversation(&conversation("resumable needle"))
+            .expect("message batch");
+        writer.checkpoint_writer().expect("durable message batch");
+        drop(writer);
+
+        let mut resumed = Storage::open_writer(&path).expect("resumed writer");
+        assert!(
+            resumed
+                .derived_search_is_dirty()
+                .expect("dirty search marker")
+        );
+        assert!(
+            resumed
+                .search("resumable", 10, None, None)
+                .expect("stale FTS is readable")
+                .is_empty()
+        );
+        resumed
+            .rebuild_derived_search_state()
+            .expect("bulk FTS rebuild");
+        assert!(
+            !resumed
+                .derived_search_is_dirty()
+                .expect("clean search marker")
+        );
+        assert_eq!(
+            resumed
+                .search("resumable", 10, None, None)
+                .expect("rebuilt search")
+                .len(),
+            1
+        );
+        resumed.commit_writer().expect("commit rebuilt state");
     }
 
     #[test]
