@@ -1,6 +1,6 @@
 # Optimize Semantic Indexing Delivery Plan
 
-Status: in progress
+Status: complete
 
 Verification cadence: plan-final
 
@@ -178,7 +178,7 @@ defines readiness.
   findings without weakening specs. Exit: all native gates pass and no
   change-owned claim lacks its intended runnable proof. Dependencies: PH-4.
 
-- [ ] **FC-1 — Consolidation, performance record, and rollout:** update this
+- [x] **FC-1 — Consolidation, performance record, and rollout:** update this
   plan with measured Xenia cold/warm numbers and selected constants, reconcile
   provisional claim markers, obtain the required Veritas transitions, deploy
   through the existing main-branch workflow, and repeat cold/warm ingestion on
@@ -186,7 +186,28 @@ defines readiness.
   binaries report the expected version; Xenia and dev-macbook results are
   recorded. Dependencies: IG-1.
 
-Ready set: IG-1. Critical path: IG-1 -> FC-1.
+  Rollout result: commits `05d4dffb` and `546f9d5f` were pushed to `main`.
+  GitHub Actions cross-compiled and atomically deployed the final Linux binary
+  to Xenia and the identical Apple Silicon binary to dev-macbook and
+  personal-macbook. The final deployment run completed successfully in 4m43s;
+  both Mac binaries had SHA-256
+  `3c5bbe92f4d45ef1bf27ddd166ba48831180fcdc1806086c7ff4cb029c87fce7`.
+
+  Xenia's deployed release binary cold-refreshed 19,261 vectors from 13,690
+  model inferences with 5,571 duplicate reuses. Embedding took 53,783 ms (358.1
+  stored vectors/second); the complete index took 54,794 ms. Its immediate warm
+  refresh skipped 99 of 100 sources, generated one newly changed vector, and
+  completed in 885 ms.
+
+  Dev-macbook disposable cold ingestion scanned 3,005 files / 3.010 GB, stored
+  296,276 messages with 190,320 searchable vectors, and performed 131,044 model
+  inferences with 59,276 duplicate reuses. Embedding took 533,671 ms (356.6
+  stored vectors/second); the complete index took 558,515 ms. An immediate warm
+  refresh skipped 3,004 unchanged sources, observed 97 newly changed messages,
+  generated 52 vectors, and completed in 3,677 ms. The warm run also confirmed
+  the final once-per-second-plus-final progress cadence.
+
+Ready set: none. Critical path: complete.
 
 ## Traceability and Evidence Assignment
 
