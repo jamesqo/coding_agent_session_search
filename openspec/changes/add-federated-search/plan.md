@@ -89,7 +89,7 @@ The only cross-process consumer is a compatible CASS binary, so one concrete pro
 - [x] **PH-2 — Implement node selection and protocol-safe SSH execution.** Depends on: PH-1. Add `app/federation.rs`, versioned request envelopes, hidden local-only endpoints, concurrent pipe draining, deadline kill/wait, and typed node outcomes. Exit: selection and subprocess boundary tests pass, including timeout and malformed/nonzero responses.
 - [x] **PH-3 — Implement federated search merge and response provenance.** Depends on: PH-2. Refactor current local search into a concrete reusable result function, fan out while it executes, merge/deduplicate results, and conditionally serialize federated fields. Exit: local response golden shape is unchanged and search federation claims pass through CLI evidence.
 - [x] **PH-4 — Implement origin-aware remote view.** Depends on: PH-2. Route explicit remote view through the versioned request runner while preserving local view. Exit: local and fake-remote view acceptance tests pass.
-- [ ] **PH-5 — Integration and Veritas consolidation.** Depends on: PH-3, PH-4. Run full Nextest, strict Clippy, rustfmt, doctests, lexical build/tests, reconcile provisional claims, discover/link/review Rust evidence, and require clean Veritas status/report. Push `main`, require CI/deployment success, then smoke-test real federated search and remote view across Xenia and both Macs. Exit: every plan checkbox is complete, all seven claims have approved runnable evidence, and no federation child remains running.
+- [x] **PH-5 — Integration and Veritas consolidation.** Depends on: PH-3, PH-4. Run full Nextest, strict Clippy, rustfmt, doctests, lexical build/tests, reconcile provisional claims, discover/link/review Rust evidence, and require clean Veritas status/report. Push `main`, require CI/deployment success, then smoke-test real federated search and remote view across Xenia and both Macs. Exit: every plan checkbox is complete, all seven claims have approved runnable evidence, and no federation child remains running.
 
 Dependency edges: `PH-1 → PH-2 → {PH-3, PH-4} → PH-5`.
 
@@ -149,7 +149,7 @@ Completion record: the new public remote-view acceptance test first failed at th
 
 ### PH-5 Execution Contract
 
-Status: in progress. Depends on: PH-3 and PH-4 implemented. Verification role: final consolidation.
+Status: implemented. Depends on: PH-3 and PH-4 implemented. Verification role: final consolidation.
 
 - **Outcome:** the integrated feature satisfies repository quality gates, Veritas coverage gates, deployment CI, and real three-machine smoke behavior.
 - **Owns:** only corrective edits revealed by full validation, generated Veritas state through `vtas`, final plan status, commit, push, and deployment/smoke evidence.
@@ -157,6 +157,8 @@ Status: in progress. Depends on: PH-3 and PH-4 implemented. Verification role: f
 - **Focused proof:** none; this is the single full repository gate required by the plan-final cadence.
 - **Expected transition:** every checkbox and claim is complete, CI is green, and deployed binaries interoperate on all three nodes.
 - **Isolation:** final serial integration only.
+
+Completion record: semantic Nextest passed 53/53 with only the explicit real-model test skipped; lexical-only Nextest passed 46/46. Strict Clippy passed for both feature realizations, rustfmt and doctests passed, OpenSpec strict validation passed, and the refreshed Veritas report contained 35 covered claims, 53 approved links, and zero findings. Commit `a9632c6c` passed CI and the cloud cross-compile/deploy workflow. Installed binaries on Xenia, dev-macbook, and personal-macbook expose federation; a live Xenia search reported successful lexical outcomes from both Macs, and remote view returned compatible JSON from each.
 
 ## Traceability and Evidence Assignment
 
