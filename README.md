@@ -63,6 +63,18 @@ cargo test --doc
 The real-model integration test is ignored by default and requires
 `CASS_TEST_MODELS_DIR` pointing at assets created by `cass models install`.
 
+## Automatic deployment
+
+Every push to `main` builds the semantic-enabled Linux x86-64 and Apple Silicon
+binaries in GitHub Actions, then atomically deploys `cass` to `~/.local/bin` on
+Xenia, `dev-macbook`, and `personal-macbook` over Tailscale. The macOS binary is
+cross-compiled on the Linux runner with `cargo-zigbuild`; destination machines
+need neither this repository nor a Rust toolchain. Cargo downloads and native,
+Linux, and Darwin build artifacts are cached by lockfile and toolchain.
+
+Deployment requires `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`,
+`DEPLOY_SSH_PRIVATE_KEY`, and `DEPLOY_SSH_KNOWN_HOSTS` repository secrets.
+
 ## License
 
 See [LICENSE](LICENSE).
