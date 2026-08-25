@@ -38,7 +38,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            target-macos
           key: cass-${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Restore macOS SDK cache
+        id: macos-sdk-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/MacOSX26.1.sdk.tar.xz
+          key: cass-macos-sdk-26.1-beee7212d265a6d2
 
       - name: Test semantic build
         run: |
@@ -60,30 +68,62 @@ jobs:
             --models-dir "$RUNNER_TEMP/cass-deploy-models" status \
             | grep -q '"ready":false'
 
+      - name: Acquire macOS SDK
+        if: steps.macos-sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_archive="$RUNNER_TEMP/MacOSX26.1.sdk.tar.xz"
+          curl --fail --location --retry 3 \
+            --output "$sdk_archive" \
+            https://github.com/joseluisq/macosx-sdks/releases/download/26.1/MacOSX26.1.sdk.tar.xz
+          printf '%s  %s\n' \
+            beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c \
+            "$sdk_archive" \
+            | sha256sum --check --strict
+
+      - name: Save macOS SDK cache
+        if: steps.macos-sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/MacOSX26.1.sdk.tar.xz
+          key: cass-macos-sdk-26.1-beee7212d265a6d2
+
       - name: Cross-compile Apple Silicon binary
         shell: bash
         run: |
           set -euo pipefail
+          sdk_root="$RUNNER_TEMP/MacOSX26.1.sdk"
+          mkdir -p "$sdk_root"
+          tar -xJf "$RUNNER_TEMP/MacOSX26.1.sdk.tar.xz" \
+            --strip-components=1 \
+            -C "$sdk_root"
+
           docker run --rm \
             --volume "$PWD:/io" \
             --volume "$HOME/.cargo/registry:/usr/local/cargo/registry" \
             --volume "$HOME/.cargo/git:/usr/local/cargo/git" \
             --volume "$HOME/.rustup:/usr/local/rustup" \
+            --volume "$sdk_root:/opt/MacOSX26.1.sdk:ro" \
+            --env SDKROOT=/opt/MacOSX26.1.sdk \
+            --env MACOSX_DEPLOYMENT_TARGET=13.4 \
+            --env CARGO_TARGET_DIR=/io/target-macos \
             --workdir /io \
-            ghcr.io/rust-cross/cargo-zigbuild:0.23.0@sha256:b8364c2c60cdcc9b95c402d17654bff517410926a35678bd89dd924b8158d6ae \
+            ghcr.io/rust-cross/cargo-zigbuild@sha256:e6557658133c14b710fd3318439666ba46a51cef2e979e113f693f517438a889 \
             cargo zigbuild --locked --release --target aarch64-apple-darwin
-          cp target/aarch64-apple-darwin/release/cass dist/darwin-arm64/cass
+          cp target-macos/aarch64-apple-darwin/release/cass dist/darwin-arm64/cass
           file dist/darwin-arm64/cass | tee /dev/stderr | grep -q 'arm64'
           sha256sum dist/linux-amd64/cass dist/darwin-arm64/cass
 
       - name: Save Cargo cache
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            target-macos
           key: cass-${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Join tailnet
