@@ -46,7 +46,6 @@ tempfile = "3.27.0"
 veritas-test-macros = { path = "vendor/veritas-test-macros" }
 
 [profile.release]
-lto = "thin"
 codegen-units = 16
 strip = true
 panic = "abort"
