@@ -1,10 +1,14 @@
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::DateTime;
 use rusqlite::{Connection as SqliteConnection, OpenFlags};
+use serde::Serialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -12,6 +16,8 @@ use crate::AppError;
 use crate::storage::Storage;
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
+const CHECKPOINT_FILES: u64 = 32;
+const CHECKPOINT_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) struct ProviderRoots {
     claude: Vec<PathBuf>,
@@ -28,8 +34,13 @@ pub(crate) struct IndexSummary {
     pub(crate) changed_messages: u64,
     pub(crate) removed_messages: u64,
     pub(crate) unchanged_sources: u64,
+    pub(crate) checkpoint_skipped_sources: u64,
     pub(crate) tombstoned_sources: u64,
     pub(crate) purged_conversations: u64,
+    pub(crate) committed_batches: u64,
+    pub(crate) discovered_bytes: u64,
+    pub(crate) processed_bytes: u64,
+    pub(crate) processed_files: u64,
 }
 
 pub(crate) struct Conversation {
@@ -58,6 +69,38 @@ struct ParsedFile {
 struct Discovery {
     files: Vec<PathBuf>,
     complete: bool,
+}
+
+struct SourceFile {
+    path: PathBuf,
+    source_path: String,
+    size_bytes: i64,
+    modified_ns: i64,
+}
+
+struct ParsedSource {
+    source: SourceFile,
+    parsed: Result<ParsedFile, AppError>,
+}
+
+struct IndexProgress {
+    started: Instant,
+    last_event: Instant,
+}
+
+#[derive(Serialize)]
+struct ProgressEvent<'a> {
+    event: &'static str,
+    phase: &'a str,
+    processed_files: u64,
+    scanned_files: u64,
+    processed_bytes: u64,
+    discovered_bytes: u64,
+    changed_messages: u64,
+    committed_batches: u64,
+    elapsed_milliseconds: u64,
+    files_per_second: u64,
+    bytes_per_second: u64,
 }
 
 type ExtractedMessage = (Option<String>, String, String, Option<i64>, Option<String>);
@@ -101,9 +144,15 @@ pub(crate) fn index(
         changed_messages: 0,
         removed_messages: 0,
         unchanged_sources: 0,
+        checkpoint_skipped_sources: 0,
         tombstoned_sources: 0,
         purged_conversations: 0,
+        committed_batches: 0,
+        discovered_bytes: 0,
+        processed_bytes: 0,
+        processed_files: 0,
     };
+    let mut progress = IndexProgress::new();
 
     index_provider(
         storage,
@@ -111,6 +160,7 @@ pub(crate) fn index(
         discover_jsonl_files(&roots.claude),
         parse_claude,
         &mut summary,
+        &mut progress,
     )?;
     index_database_provider(
         storage,
@@ -127,6 +177,7 @@ pub(crate) fn index(
         }),
         parse_copilot,
         &mut summary,
+        &mut progress,
     )?;
     index_database_provider(storage, "hermes", &roots.hermes, parse_hermes, &mut summary)?;
     index_provider(
@@ -135,6 +186,7 @@ pub(crate) fn index(
         discover_jsonl_files(&roots.pi),
         parse_pi,
         &mut summary,
+        &mut progress,
     )?;
     index_provider(
         storage,
@@ -142,7 +194,11 @@ pub(crate) fn index(
         discover_jsonl_files(&roots.codex),
         parse_codex,
         &mut summary,
+        &mut progress,
     )?;
+
+    summary.processed_files = summary.scanned_files;
+    progress.emit(&summary, "complete", true);
 
     Ok(summary)
 }
@@ -153,26 +209,224 @@ fn index_provider(
     discovery: Discovery,
     parse: fn(&Path) -> Result<ParsedFile, AppError>,
     summary: &mut IndexSummary,
+    progress: &mut IndexProgress,
 ) -> Result<(), AppError> {
-    let mut complete = discovery.complete;
+    let (mut pending, observed_paths, mut complete) =
+        prepare_sources(storage, provider, discovery, summary)?;
+    pending.sort_unstable_by(|left, right| {
+        right
+            .size_bytes
+            .cmp(&left.size_bytes)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+    progress.emit(summary, "discovered", true);
+
+    let worker_count = parser_worker_count(pending.len());
+    let next_source = AtomicUsize::new(0);
+    let (sender, receiver) = sync_channel(1);
+    let mut first_error = None;
+    let mut batch_files = 0_u64;
+    let mut batch_bytes = 0_u64;
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let pending = &pending;
+            let next_source = &next_source;
+            scope.spawn(move || {
+                loop {
+                    let index = next_source.fetch_add(1, Ordering::Relaxed);
+                    let Some(source) = pending.get(index) else {
+                        break;
+                    };
+                    let parsed = parse(&source.path);
+                    let source = SourceFile {
+                        path: source.path.clone(),
+                        source_path: source.source_path.clone(),
+                        size_bytes: source.size_bytes,
+                        modified_ns: source.modified_ns,
+                    };
+                    if sender.send(ParsedSource { source, parsed }).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        loop {
+            let result = match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(result) => result,
+                Err(RecvTimeoutError::Timeout) => {
+                    progress.emit(summary, "indexing", true);
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            let source_bytes = u64::try_from(result.source.size_bytes).unwrap_or_default();
+            summary.processed_files += 1;
+            summary.processed_bytes = summary.processed_bytes.saturating_add(source_bytes);
+            match apply_parsed_source(storage, provider, result, summary) {
+                Ok(source_complete) => complete &= source_complete,
+                Err(error) => {
+                    complete = false;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            }
+            batch_files = batch_files.saturating_add(1);
+            batch_bytes = batch_bytes.saturating_add(source_bytes);
+            if storage.supports_ingestion_checkpoints()
+                && (batch_files >= CHECKPOINT_FILES || batch_bytes >= CHECKPOINT_BYTES)
+            {
+                match storage.checkpoint_writer() {
+                    Ok(()) => {
+                        summary.committed_batches += 1;
+                        batch_files = 0;
+                        batch_bytes = 0;
+                        progress.emit(summary, "checkpoint", true);
+                    }
+                    Err(error) => {
+                        complete = false;
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+            progress.emit(summary, "indexing", false);
+        }
+    });
+    if complete {
+        summary.purged_conversations += storage.purge_missing_sources(provider, &observed_paths)?;
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn prepare_sources(
+    storage: &Storage,
+    provider: &str,
+    discovery: Discovery,
+    summary: &mut IndexSummary,
+) -> Result<(Vec<SourceFile>, BTreeSet<String>, bool), AppError> {
+    let complete = discovery.complete;
+    let mut pending = Vec::new();
     let mut observed_paths = BTreeSet::new();
     for path in discovery.files {
         summary.scanned_files += 1;
         let source_path = path.to_string_lossy().into_owned();
         observed_paths.insert(source_path.clone());
-        let parsed = parse(&path)?;
-        summary.malformed_records += parsed.malformed_records;
-        complete &= parsed.malformed_records == 0;
-        if let Some(conversation) = parsed.conversation {
-            apply_conversation(storage, &conversation, summary)?;
-        } else if parsed.malformed_records == 0 && storage.remove_source(provider, &source_path)? {
-            summary.purged_conversations += 1;
+        let (size_bytes, modified_ns) = source_stamp(&path)?;
+        let bytes = u64::try_from(size_bytes).unwrap_or_default();
+        summary.discovered_bytes = summary.discovered_bytes.saturating_add(bytes);
+        if storage.source_checkpoint_matches(provider, &source_path, size_bytes, modified_ns)? {
+            summary.unchanged_sources += 1;
+            summary.checkpoint_skipped_sources += 1;
+            summary.processed_files += 1;
+            summary.processed_bytes = summary.processed_bytes.saturating_add(bytes);
+        } else {
+            pending.push(SourceFile {
+                path,
+                source_path,
+                size_bytes,
+                modified_ns,
+            });
         }
     }
-    if complete {
-        summary.purged_conversations += storage.purge_missing_sources(provider, &observed_paths)?;
+    Ok((pending, observed_paths, complete))
+}
+
+fn apply_parsed_source(
+    storage: &mut Storage,
+    provider: &str,
+    result: ParsedSource,
+    summary: &mut IndexSummary,
+) -> Result<bool, AppError> {
+    let parsed = result.parsed?;
+    summary.malformed_records += parsed.malformed_records;
+    if let Some(conversation) = parsed.conversation {
+        apply_conversation(storage, &conversation, summary)?;
+    } else if parsed.malformed_records == 0
+        && storage.remove_source(provider, &result.source.source_path)?
+    {
+        summary.purged_conversations += 1;
     }
-    Ok(())
+    if parsed.malformed_records == 0 {
+        storage.record_source_checkpoint(
+            provider,
+            &result.source.source_path,
+            result.source.size_bytes,
+            result.source.modified_ns,
+        )?;
+    }
+    Ok(parsed.malformed_records == 0)
+}
+
+impl IndexProgress {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_event: now,
+        }
+    }
+
+    fn emit(&mut self, summary: &IndexSummary, phase: &str, force: bool) {
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_event) < Duration::from_secs(1) {
+            return;
+        }
+        self.last_event = now;
+        let elapsed_milliseconds =
+            u64::try_from(now.duration_since(self.started).as_millis().max(1)).unwrap_or(u64::MAX);
+        let event = ProgressEvent {
+            event: "index-progress",
+            phase,
+            processed_files: summary.processed_files,
+            scanned_files: summary.scanned_files,
+            processed_bytes: summary.processed_bytes,
+            discovered_bytes: summary.discovered_bytes,
+            changed_messages: summary.changed_messages,
+            committed_batches: summary.committed_batches,
+            elapsed_milliseconds,
+            files_per_second: summary
+                .processed_files
+                .saturating_mul(1_000)
+                .checked_div(elapsed_milliseconds)
+                .unwrap_or_default(),
+            bytes_per_second: summary
+                .processed_bytes
+                .saturating_mul(1_000)
+                .checked_div(elapsed_milliseconds)
+                .unwrap_or_default(),
+        };
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        if serde_json::to_writer(&mut stderr, &event).is_ok() {
+            let _ = writeln!(stderr);
+        }
+    }
+}
+
+fn parser_worker_count(source_count: usize) -> usize {
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    source_count.min(available.saturating_sub(1).max(1)).min(8)
+}
+
+fn source_stamp(path: &Path) -> Result<(i64, i64), AppError> {
+    let metadata = path.metadata().map_err(AppError::io)?;
+    let size_bytes = i64::try_from(metadata.len())
+        .map_err(|_| AppError::internal("source file is too large"))?;
+    let modified_ns = metadata
+        .modified()
+        .map_err(AppError::io)?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::internal("source modification time predates Unix epoch"))?
+        .as_nanos();
+    let modified_ns = i64::try_from(modified_ns)
+        .map_err(|_| AppError::internal("source modification time is out of range"))?;
+    Ok((size_bytes, modified_ns))
 }
 
 fn index_database_provider(

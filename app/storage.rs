@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS tombstones (
     conversation_id TEXT NOT NULL,
     forgotten_at INTEGER NOT NULL,
     PRIMARY KEY (provider, conversation_id)
+);
+CREATE TABLE IF NOT EXISTS source_checkpoints (
+    provider TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    modified_ns INTEGER NOT NULL,
+    PRIMARY KEY (provider, source_path)
 );
 ";
 
@@ -155,8 +162,28 @@ impl Storage {
                 .execute_batch("COMMIT")
                 .map_err(AppError::database)?;
             self.writer_active = false;
+            self.connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .map_err(AppError::database)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn checkpoint_writer(&mut self) -> Result<(), AppError> {
+        self.require_writer()?;
+        self.connection
+            .execute_batch("COMMIT")
+            .map_err(AppError::database)?;
+        self.writer_active = false;
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE); BEGIN IMMEDIATE")
+            .map_err(AppError::database)?;
+        self.writer_active = true;
+        Ok(())
+    }
+
+    pub(crate) fn supports_ingestion_checkpoints(&self) -> bool {
+        !self.defer_search_updates
     }
 
     pub(crate) fn defer_search_updates(&mut self) -> Result<(), AppError> {
@@ -281,6 +308,48 @@ impl Storage {
             removed_messages,
             ..ConversationChange::default()
         })
+    }
+
+    pub(crate) fn source_checkpoint_matches(
+        &self,
+        provider: &str,
+        source_path: &str,
+        size_bytes: i64,
+        modified_ns: i64,
+    ) -> Result<bool, AppError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM source_checkpoints
+                  WHERE provider = ?1 AND source_path = ?2
+                    AND size_bytes = ?3 AND modified_ns = ?4",
+                params![provider, source_path, size_bytes, modified_ns],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(AppError::database)?
+            .is_some())
+    }
+
+    pub(crate) fn record_source_checkpoint(
+        &mut self,
+        provider: &str,
+        source_path: &str,
+        size_bytes: i64,
+        modified_ns: i64,
+    ) -> Result<(), AppError> {
+        self.require_writer()?;
+        self.connection
+            .execute(
+                "INSERT INTO source_checkpoints(provider, source_path, size_bytes, modified_ns)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider, source_path) DO UPDATE SET
+                    size_bytes = excluded.size_bytes,
+                    modified_ns = excluded.modified_ns",
+                params![provider, source_path, size_bytes, modified_ns],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
     }
 
     fn reconcile_messages(
@@ -419,6 +488,27 @@ impl Storage {
                 .execute("DELETE FROM conversations WHERE id = ?1", [&id])
                 .map_err(AppError::database)?;
             removed += 1;
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT source_path FROM source_checkpoints WHERE provider = ?1")
+            .map_err(AppError::database)?;
+        let checkpoint_paths = statement
+            .query_map([provider], |row| row.get::<_, String>(0))
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(statement);
+        for source_path in checkpoint_paths {
+            if !observed_paths.contains(&source_path) {
+                self.connection
+                    .execute(
+                        "DELETE FROM source_checkpoints
+                          WHERE provider = ?1 AND source_path = ?2",
+                        params![provider, source_path],
+                    )
+                    .map_err(AppError::database)?;
+            }
         }
         Ok(removed)
     }
@@ -1072,6 +1162,38 @@ mod tests {
         assert_eq!(counts.conversations, 0);
         assert_eq!(counts.messages, 0);
         assert_eq!(counts.embeddings, 0);
+    }
+
+    #[test]
+    fn writer_checkpoint_survives_a_later_rollback() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("durable needle"))
+            .expect("durable mutation");
+        writer
+            .record_source_checkpoint("codex", "/tmp/session-1.jsonl", 100, 200)
+            .expect("durable source checkpoint");
+        writer.checkpoint_writer().expect("checkpoint batch");
+        writer
+            .replace_conversation(&conversation("rolled back text"))
+            .expect("later mutation");
+        drop(writer);
+
+        let storage = Storage::open_existing(&path).expect("reopen database");
+        assert_eq!(
+            storage
+                .search("durable", 10, None, None)
+                .expect("search committed batch")
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .source_checkpoint_matches("codex", "/tmp/session-1.jsonl", 100, 200)
+                .expect("read checkpoint")
+        );
     }
 
     #[test]

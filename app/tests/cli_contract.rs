@@ -41,6 +41,25 @@ fn run_json_with_roots(arguments: &[&str], claude_root: &Path, codex_root: &Path
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
+fn run_with_roots(
+    arguments: &[&str],
+    claude_root: &Path,
+    codex_root: &Path,
+) -> std::process::Output {
+    let absent = claude_root.join("providers-not-configured");
+    Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("CASS_CLAUDE_ROOTS", claude_root)
+        .env("CASS_CODEX_ROOTS", codex_root)
+        .env("CASS_OPENCODE_ROOTS", &absent)
+        .env("CASS_COPILOT_ROOTS", &absent)
+        .env("CASS_HERMES_ROOTS", &absent)
+        .env("CASS_PI_ROOTS", &absent)
+        .args(arguments)
+        .output()
+        .expect("run cass")
+}
+
 fn run_json_with_six_roots(arguments: &[&str], roots: [&Path; 6]) -> Value {
     let output = Command::cargo_bin("cass")
         .expect("cass binary")
@@ -455,6 +474,80 @@ fn malformed_records_are_bounded_and_reindexing_is_idempotent() {
 
     let found = run_json(&["--db", database, "search", "persistent"]);
     assert_eq!(found["results"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn index_emits_structured_progress_without_polluting_stdout() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let claude_root = directory.path().join("claude");
+    let codex_root = directory.path().join("codex");
+    std::fs::create_dir_all(&claude_root).expect("Claude root");
+    std::fs::create_dir_all(&codex_root).expect("Codex root");
+    std::fs::write(
+        claude_root.join("session.jsonl"),
+        "{\"type\":\"user\",\"sessionId\":\"progress\",\"uuid\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"show progress\"}}\n",
+    )
+    .expect("Claude fixture");
+    let database = directory.path().join("cass.sqlite3");
+
+    let output = run_with_roots(
+        &[
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "index",
+        ],
+        &claude_root,
+        &codex_root,
+    );
+    assert!(output.status.success());
+    serde_json::from_slice::<Value>(&output.stdout).expect("one JSON stdout response");
+    let events = String::from_utf8(output.stderr)
+        .expect("UTF-8 progress")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("JSON progress line"))
+        .collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| event["event"] == "index-progress"
+            && event["phase"] == "complete"
+            && event["processed_files"] == 1),
+        "missing completion progress event: {events:?}"
+    );
+}
+
+#[test]
+fn unchanged_source_uses_a_persisted_file_checkpoint() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let claude_root = directory.path().join("claude");
+    let codex_root = directory.path().join("codex");
+    std::fs::create_dir_all(&claude_root).expect("Claude root");
+    std::fs::create_dir_all(&codex_root).expect("Codex root");
+    let source = claude_root.join("session.jsonl");
+    std::fs::write(
+        &source,
+        "{\"type\":\"user\",\"sessionId\":\"checkpoint\",\"uuid\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"checkpoint me\"}}\n",
+    )
+    .expect("Claude fixture");
+    let database = directory.path().join("cass.sqlite3");
+    let arguments = [
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "index",
+    ];
+
+    run_json_with_roots(&arguments, &claude_root, &codex_root);
+    let connection = Connection::open(&database).expect("open indexed database");
+    let checkpoint_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM source_checkpoints WHERE source_path = ?1",
+            [source.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .expect("persisted source checkpoint");
+    assert_eq!(checkpoint_count, 1);
+
+    let second = run_json_with_roots(&arguments, &claude_root, &codex_root);
+    assert_eq!(second["checkpoint_skipped_sources"], 1);
+    assert_eq!(second["changed_messages"], 0);
 }
 
 #[veritas::claims("semantic/missing-models-fall-back", "models/download-is-explicit")]
