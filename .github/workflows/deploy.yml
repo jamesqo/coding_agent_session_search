@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Zunstable-options --jobs-frontend=4
 
 jobs:
   build-and-deploy:
@@ -39,7 +40,7 @@ jobs:
             ~/.cargo/git
             target
             target-macos
-          key: cass-${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: cass-${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.github/workflows/deploy.yml') }}
 
       - name: Restore macOS SDK cache
         id: macos-sdk-cache
@@ -108,6 +109,7 @@ jobs:
             --env SDKROOT=/opt/MacOSX26.1.sdk \
             --env MACOSX_DEPLOYMENT_TARGET=13.4 \
             --env CARGO_TARGET_DIR=/io/target-macos \
+            --env RUSTFLAGS \
             --workdir /io \
             ghcr.io/rust-cross/cargo-zigbuild@sha256:e6557658133c14b710fd3318439666ba46a51cef2e979e113f693f517438a889 \
             cargo zigbuild --locked --release --target aarch64-apple-darwin
@@ -124,7 +126,7 @@ jobs:
             ~/.cargo/git
             target
             target-macos
-          key: cass-${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: cass-${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.github/workflows/deploy.yml') }}
 
       - name: Join tailnet
         uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
