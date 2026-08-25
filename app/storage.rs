@@ -3109,6 +3109,22 @@ mod tests {
         assert_eq!(chunks.chunks[0].message_rowids, [1]);
         assert_eq!(
             storage
+                .semantic_chunks("generation", Some("claude-code"), None)
+                .expect("apply provider metadata filter")
+                .chunks[0]
+                .eligible,
+            [false]
+        );
+        assert_eq!(
+            storage
+                .semantic_chunks("generation", None, Some(90))
+                .expect("apply timestamp metadata filter")
+                .chunks[0]
+                .eligible,
+            [true]
+        );
+        assert_eq!(
+            storage
                 .search_hits(&[1])
                 .expect("hydrate stable storage identifiers")
                 .iter()
