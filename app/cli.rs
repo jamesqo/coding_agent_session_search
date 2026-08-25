@@ -34,24 +34,6 @@ enum Command {
         /// Recreate all derived search state.
         #[arg(long)]
         full: bool,
-        /// Claude Code projects directory.
-        #[arg(long, value_name = "PATH")]
-        claude_root: Option<PathBuf>,
-        /// Codex sessions directory.
-        #[arg(long, value_name = "PATH")]
-        codex_root: Option<PathBuf>,
-        /// Current `OpenCode` SQLite database.
-        #[arg(long, value_name = "PATH")]
-        opencode_db: Option<PathBuf>,
-        /// GitHub Copilot CLI session-state directory.
-        #[arg(long, value_name = "PATH")]
-        copilot_root: Option<PathBuf>,
-        /// Current Hermes Agent SQLite database.
-        #[arg(long, value_name = "PATH")]
-        hermes_db: Option<PathBuf>,
-        /// Pi coding-agent sessions directory.
-        #[arg(long, value_name = "PATH")]
-        pi_root: Option<PathBuf>,
     },
     /// Search indexed messages.
     Search {
@@ -161,27 +143,7 @@ where
     let models_dir = cli.models_dir.unwrap_or_else(default_models_path);
 
     match cli.command {
-        Command::Index {
-            full,
-            claude_root,
-            codex_root,
-            opencode_db,
-            copilot_root,
-            hermes_db,
-            pi_root,
-        } => index(
-            &database_path,
-            &models_dir,
-            full,
-            &ProviderRoots::new(
-                claude_root,
-                codex_root,
-                opencode_db,
-                copilot_root,
-                hermes_db,
-                pi_root,
-            ),
-        ),
+        Command::Index { full } => index(&database_path, &models_dir, full, &ProviderRoots::new()),
         Command::Search {
             query,
             limit,
@@ -241,6 +203,7 @@ fn search(
     provider: Option<&str>,
     days: Option<u32>,
 ) -> Result<Response, AppError> {
+    let provider = normalize_provider_filter(provider)?;
     let storage = Storage::open_existing(database_path)?;
     let counts = storage.counts()?;
     let models = Models::new(models_dir.to_path_buf());
@@ -268,6 +231,17 @@ fn search(
         fallback_mode,
         results,
     }))
+}
+
+fn normalize_provider_filter(provider: Option<&str>) -> Result<Option<&'static str>, AppError> {
+    match provider {
+        None => Ok(None),
+        Some("claude" | "claude-code" | "claude_code") => Ok(Some("claude-code")),
+        Some("codex") => Ok(Some("codex")),
+        Some(provider) => Err(AppError::usage(format!(
+            "unsupported provider filter: {provider}"
+        ))),
+    }
 }
 
 fn view(database_path: &Path, id: String, context: u32) -> Result<Response, AppError> {

@@ -1,37 +1,15 @@
 # cass
 
-`cass` is a local, JSON-only search CLI for Claude Code, Codex, OpenCode,
-GitHub Copilot CLI, Hermes Agent, and Pi histories. It stores normalized
-conversations in SQLite, uses SQLite FTS5 for lexical retrieval, and optionally
-adds local semantic retrieval plus cross-encoder reranking after an explicit
-model installation.
-
-## Build and test
-
-```bash
-cargo build --release
-cargo nextest run
-cargo clippy --all-targets -- -D warnings
-cargo test --doc
-```
-
-The ordinary test suite never downloads models. To run the real-model smoke
-test, first install models into a dedicated directory and pass it explicitly:
-
-```bash
-cargo run -- --models-dir /path/to/cass-models models install
-CASS_TEST_MODELS_DIR=/path/to/cass-models \
-  cargo nextest run --run-ignored ignored-only \
-  -E 'test(hybrid_search_with_installed_models)'
-```
+`cass` is a local, JSON-only search CLI for Claude Code and Codex JSONL
+histories. It stores normalized conversations in SQLite, uses SQLite FTS5 for
+lexical retrieval, and optionally adds local FastEmbed semantic retrieval plus
+cross-encoder reranking after explicit model installation.
 
 ## Commands
 
 ```text
-cass index [--full] [--claude-root PATH] [--codex-root PATH] \
-  [--opencode-db PATH] [--copilot-root PATH] [--hermes-db PATH] [--pi-root PATH]
-cass search <query> [--limit N] \
-  [--provider claude-code|codex|opencode|github-copilot|hermes|pi] [--days N]
+cass index [--full]
+cass search <query> [--limit N] [--provider claude-code|codex] [--days N]
 cass view <message-id> [--context N]
 cass status
 cass forget <conversation-id>
@@ -42,15 +20,18 @@ All operational commands emit one JSON value. Bare `cass` prints concise help.
 Use `--db PATH` to select the canonical SQLite database and `--models-dir PATH`
 to select model assets.
 
-Default history sources are `~/.claude/projects`, `~/.codex/sessions`,
-`~/.local/share/opencode/opencode.db`, and
-`~/.copilot/session-state`, `~/.hermes/state.db`, plus
-`~/.pi/agent/sessions`. OpenCode and Hermes
-support target their current SQLite schemas; GitHub Copilot support targets
-Copilot CLI `events.jsonl` histories. Legacy file storage, VS Code Copilot Chat
-storage, cloud history, Pi SQLite/native stores, and Oh My Pi are not scanned.
+## Discovery
 
-## Search behavior
+Default history roots are `~/.claude/projects`, `~/.config/claude/projects`,
+`~/.codex/sessions`, and `~/.local/share/codex/sessions`. To override them
+without expanding the CLI surface, set `CASS_CLAUDE_ROOTS` and
+`CASS_CODEX_ROOTS` to platform-separated path lists.
+
+Only Claude Code and Codex JSONL files are parsed. Other application databases,
+event logs, provider registries, plugin systems, compatibility shims, and
+generalized connector layers are outside the active product boundary.
+
+## Search Behavior
 
 - SQLite is canonical; FTS rows and embeddings are rebuildable derived state.
 - Search works immediately in lexical mode.
@@ -62,6 +43,20 @@ storage, cloud history, Pi SQLite/native stores, and Oh My Pi are not scanned.
 There is no TUI, export, daemon, remote sync, watch mode, analytics platform,
 provider registry, compatibility layer, or alternate output encoding.
 
-## License
+## Verification
 
-See [LICENSE](LICENSE).
+```bash
+cargo fmt --check
+env TMPDIR=/home/james/scratch/cass-tmp \
+  CARGO_TARGET_DIR=/home/james/scratch/cass-targets/integrated \
+  CARGO_INCREMENTAL=0 cargo nextest run
+env TMPDIR=/home/james/scratch/cass-tmp \
+  CARGO_TARGET_DIR=/home/james/scratch/cass-targets/integrated \
+  CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings
+env TMPDIR=/home/james/scratch/cass-tmp \
+  CARGO_TARGET_DIR=/home/james/scratch/cass-targets/integrated \
+  CARGO_INCREMENTAL=0 cargo test --doc
+```
+
+The real-model integration test is ignored by default and requires
+`CASS_TEST_MODELS_DIR` pointing at assets created by `cass models install`.

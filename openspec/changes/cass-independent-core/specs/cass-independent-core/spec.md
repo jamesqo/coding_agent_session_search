@@ -1,8 +1,7 @@
 ## Purpose
 
 Provide a small, independent JSON CLI that indexes and searches local Claude
-Code, Codex, OpenCode, GitHub Copilot CLI, Hermes Agent, and Pi conversations with
-lexical and semantic retrieval.
+Code and Codex conversations with lexical and semantic retrieval.
 
 ## ADDED Requirements
 
@@ -27,15 +26,13 @@ The system SHALL expose only `index`, `search`, `view`, `status`, `forget`, and
 ### Requirement: Provider boundary
 
 <!-- claim: ingestion/provider-boundary -->
-The system SHALL discover and normalize current Claude Code, Codex, and Pi
-JSONL histories, OpenCode and Hermes SQLite histories, and GitHub Copilot CLI
-JSONL event logs into CASS-owned canonical conversation and message records.
+The system SHALL discover and normalize Claude Code and Codex JSONL histories
+into CASS-owned canonical conversation and message records.
 
 #### Scenario: Supported histories
 
 <!-- claim: ingestion/supported-jsonl-indexes -->
-- **WHEN** configured roots contain representative histories for all six
-  supported providers
+- **WHEN** configured roots contain representative Claude Code and Codex JSONL histories
 - **THEN** `cass index` persists their conversations and messages with stable IDs
 
 #### Scenario: Unsupported provider
@@ -81,7 +78,7 @@ supported provider and recency filters.
 ### Requirement: Semantic retrieval and reranking
 
 The system SHALL support semantic candidates, RRF fusion, and cross-encoder
-reranking using a maintained non-Dickles model backend.
+reranking using a mainstream maintained model backend.
 
 #### Scenario: Models installed
 
@@ -126,15 +123,15 @@ and realized fallback state as JSON without repair planning machinery.
 ### Requirement: Complete independence
 
 The maintained project SHALL contain no runtime or build dependency on the
-Dickles/Franken ecosystem.
+legacy dependency ecosystem and no active removed-provider surface.
 
 #### Scenario: Dependency scan
 
 <!-- claim: independence/no-dickles-franken-surface -->
 - **WHEN** final manifests, lockfiles, build scripts, source, tests, workflows,
   and maintained documentation are scanned
-- **THEN** FAD, Frankensearch, Frankensqlite/fsqlite, Frankentorch, Asupersync,
-  FrankenTUI, TOON/tru, the Dickles HNSW fork, and Dickles git pins are absent
+- **THEN** prohibited legacy dependency surfaces and removed provider surfaces
+  are absent
 
 ### Requirement: Size boundary
 

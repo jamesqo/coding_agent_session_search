@@ -10,8 +10,8 @@ context: |
   Workflow skill catalog root: /home/james/.local/share/skill-issue/skills.
   Resolve named VSpec workflow skills under that root first. If a skill name
   resolves elsewhere, record its concrete catalog root here before use.
-  Product scope: independent CASS supporting Claude Code, Codex, current
-  OpenCode and Hermes SQLite histories, and GitHub Copilot CLI event logs.
+  Product scope: independent CASS supporting exactly Claude Code and Codex
+  JSONL histories.
   Test execution uses cargo nextest run for parallelism; cargo test remains
   only for doctests or cases nextest cannot execute.
 

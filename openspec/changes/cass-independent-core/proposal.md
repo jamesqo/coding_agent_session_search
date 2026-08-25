@@ -1,28 +1,27 @@
 ## Why
 
-Replace CASS in place with a completely independent Claude Code, Codex,
-OpenCode, GitHub Copilot CLI, Hermes Agent, and Pi search application using
-Rusqlite, SQLite FTS5, semantic retrieval, fusion, and reranking.
+Replace CASS in place with a completely independent Claude Code and Codex
+search application using Rusqlite, SQLite FTS5, semantic retrieval, fusion, and
+reranking.
 
 ## What Changes
 
-- Replace the existing application with six JSON-first commands: `index`,
-  `search`, `view`, `status`, `forget`, and `models install`.
-- Ingest current Claude Code, Codex, and Pi JSONL histories, OpenCode and
-  Hermes SQLite histories, and GitHub Copilot CLI JSONL event logs.
+- Keep exactly six JSON-first commands: `index`, `search`, `view`, `status`,
+  `forget`, and `models install`.
+- Ingest Claude Code and Codex JSONL histories through two concrete CASS-owned
+  parsers.
 - Store canonical conversations and messages in one current Rusqlite schema.
-- Combine SQLite FTS5 lexical retrieval with independent semantic retrieval,
-  reciprocal-rank fusion, and cross-encoder reranking.
-- Remove all other product surfaces, providers, compatibility systems, and the
-  complete Dickles/Franken dependency stack.
+- Combine SQLite FTS5 lexical retrieval with FastEmbed semantic retrieval,
+  reciprocal-rank fusion, and bounded cross-encoder reranking.
+- Remove all other provider surfaces, compatibility systems, and the complete
+  legacy dependency stack.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `cass-independent-core`: Index and retrieve Claude Code, Codex, OpenCode,
-  GitHub Copilot CLI, Hermes Agent, and Pi histories through a small, independent,
-  machine-readable command-line application.
+- `cass-independent-core`: Index and retrieve Claude Code and Codex histories
+  through a small, independent, machine-readable command-line application.
 
 ### Modified Capabilities
 
@@ -31,26 +30,27 @@ None.
 ## Success Boundary
 
 The retained commands pass their behavioral scenarios; semantic search and
-truthful lexical fallback both work; current supported data can be indexed,
-viewed, and forgotten; no maintained Dickles/Franken or removed-provider
+truthful lexical fallback both work; supported JSONL data can be indexed,
+viewed, and forgotten; no maintained legacy dependency or removed-provider
 surface remains; production Rust is at most 70,000 lines and test Rust is at
 most 30,000 lines.
 
 ## Non-Goals
 
-- Providers other than Claude Code, Codex, OpenCode, GitHub Copilot CLI,
-  Hermes Agent, and Pi; legacy OpenCode/Hermes file storage, non-JSONL Pi
-  stores, Oh My Pi, and VS Code Copilot Chat
-  storage are not part of this change.
+- Providers other than Claude Code and Codex.
+- External application database parsing, event-log ingestion, provider traits,
+  registries, plugins, connector compatibility, or legacy/cloud/IDE history
+  compatibility.
 - TUI, HTML or transcript export, analytics, remote sync, watch mode, daemons,
   self-update, shell completion, human-oriented rendering, or alternate output
   encodings.
 - Compatibility shims, multiple schemas or storage backends, salvage systems,
-  CASS-owned ANN/HNSW, plugin registries, or provider abstractions.
+  CASS-owned ANN indexes, plugin registries, or provider abstractions.
 - Preserving old CLI commands or presentation contracts.
 
 ## Impact
 
 This is an in-place replacement of CASS. Existing source, tests, workflows,
 scripts, documentation, assets, and dependencies outside the success boundary
-are deleted. Git history remains available as the reference implementation.
+are deleted or made inert. Git history and the external reference patch remain
+available as implementation references.

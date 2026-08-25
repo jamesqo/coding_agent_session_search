@@ -2,7 +2,7 @@
 name = "coding-agent-search"
 version = "0.7.0"
 edition = "2024"
-description = "Local search for coding-agent session histories"
+description = "Local search for Claude Code and Codex JSONL session histories"
 license-file = "LICENSE"
 repository = "https://github.com/jamesqo/coding_agent_session_search"
 default-run = "cass"
