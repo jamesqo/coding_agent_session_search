@@ -1,5 +1,8 @@
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use rusqlite::{Connection, params};
@@ -58,6 +61,59 @@ fn run_with_roots(
         .args(arguments)
         .output()
         .expect("run cass")
+}
+
+fn seed_search_database(directory: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let claude_root = directory.join("claude");
+    let codex_root = directory.join("codex");
+    std::fs::create_dir_all(&claude_root).expect("Claude root");
+    std::fs::create_dir_all(&codex_root).expect("Codex root");
+    std::fs::write(
+        claude_root.join("session.jsonl"),
+        "{\"type\":\"user\",\"sessionId\":\"federated-local\",\"uuid\":\"local-message\",\"message\":{\"role\":\"user\",\"content\":\"federated needle\"}}\n",
+    )
+    .expect("Claude fixture");
+    let database = directory.join("cass.sqlite3");
+    run_json_with_roots(
+        &[
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "index",
+        ],
+        &claude_root,
+        &codex_root,
+    );
+    (database, directory.join("models-empty"))
+}
+
+#[cfg(unix)]
+fn fake_ssh(directory: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    fake_ssh_with_body(
+        directory,
+        concat!(
+            "cat >/dev/null\n",
+            "printf '%s\\n' '{\"protocol\":1,\"kind\":\"search\",\"response\":{\"query\":\"federated\",\"realized_mode\":\"lexical\",\"fallback_mode\":\"lexical\",\"fallback_reason\":null,\"results\":[]}}'\n",
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn fake_ssh_with_body(directory: &Path, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = directory.join("bin");
+    std::fs::create_dir_all(&bin).expect("fake bin directory");
+    let log = directory.join("ssh.log");
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CASS_FAKE_SSH_LOG\"\n{body}"),
+    )
+    .expect("fake ssh");
+    let mut permissions = std::fs::metadata(&ssh)
+        .expect("fake ssh metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ssh, permissions).expect("executable fake ssh");
+    (bin, log)
 }
 
 fn run_json_with_six_roots(arguments: &[&str], roots: [&Path; 6]) -> Value {
@@ -286,6 +342,415 @@ fn index_search_view_and_forget_supported_histories() {
     assert_eq!(forgotten["forgotten"], true);
     let absent = run_json(&["--db", database, "search", "phosphorescent"]);
     assert_eq!(absent["results"].as_array().map(Vec::len), Some(0));
+}
+
+#[veritas::claims("federated-search/node-selection-precedence")]
+#[cfg(unix)]
+#[test]
+fn federated_explicit_nodes_override_environment_and_deduplicate() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let (bin, log) = fake_ssh(directory.path());
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .env("CASS_SEARCH_NODES", "environment-one,environment-two")
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "--models-dir",
+            models.to_str().expect("UTF-8 models path"),
+            "search",
+            "federated",
+            "--node",
+            "explicit-node",
+            "--node",
+            "explicit-node",
+        ])
+        .output()
+        .expect("federated search");
+    assert!(
+        output.status.success(),
+        "federated search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = std::fs::read_to_string(&log).expect("fake SSH calls");
+    assert_eq!(calls.lines().count(), 1);
+    assert!(calls.contains("explicit-node"));
+    assert!(!calls.contains("environment-one"));
+    assert!(!calls.contains("environment-two"));
+}
+
+#[veritas::claims("federated-search/node-selection-precedence")]
+#[cfg(unix)]
+#[test]
+fn federated_environment_nodes_are_used_without_explicit_nodes() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let (bin, log) = fake_ssh(directory.path());
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .env("CASS_SEARCH_NODES", "environment-one,environment-one")
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "--models-dir",
+            models.to_str().expect("UTF-8 models path"),
+            "search",
+            "federated",
+        ])
+        .output()
+        .expect("federated search");
+    assert!(
+        output.status.success(),
+        "federated search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = std::fs::read_to_string(&log).expect("fake SSH calls");
+    assert_eq!(calls.lines().count(), 1);
+    assert!(calls.contains("environment-one"));
+}
+
+#[veritas::claims("federated-search/node-validation")]
+#[cfg(unix)]
+#[test]
+fn federated_invalid_or_excess_nodes_fail_before_ssh() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let (bin, log) = fake_ssh(directory.path());
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+    let base = [
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "--models-dir",
+        models.to_str().expect("UTF-8 models path"),
+        "search",
+        "federated",
+    ];
+
+    let invalid = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", &path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .args(base)
+        .arg("--node=--option")
+        .output()
+        .expect("invalid-node search");
+    assert!(!invalid.status.success());
+    let invalid_stderr = String::from_utf8(invalid.stderr).expect("UTF-8 error");
+    assert!(invalid_stderr.contains("invalid SSH node"));
+
+    let mut excessive_arguments = base.iter().map(ToString::to_string).collect::<Vec<_>>();
+    for index in 0..17 {
+        excessive_arguments.push("--node".to_owned());
+        excessive_arguments.push(format!("node-{index}"));
+    }
+    let excessive = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .args(excessive_arguments)
+        .output()
+        .expect("excess-node search");
+    assert!(!excessive.status.success());
+    let excessive_stderr = String::from_utf8(excessive.stderr).expect("UTF-8 error");
+    assert!(excessive_stderr.contains("at most 16 remote nodes"));
+    assert!(!log.exists(), "invalid inputs must not invoke SSH");
+}
+
+#[veritas::claims("federated-search/node-selection-precedence")]
+#[test]
+fn local_search_response_omits_federated_fields() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let response = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "--models-dir",
+        models.to_str().expect("UTF-8 models path"),
+        "search",
+        "federated",
+    ]);
+    assert!(response.get("nodes").is_none());
+    assert!(response["results"][0].get("origins").is_none());
+    assert!(response["results"][0].get("federated_score").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn federation_search_request_is_versioned_and_forces_local_execution() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let (bin, log) = fake_ssh(directory.path());
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+    let mut command = Command::cargo_bin("cass").expect("cass binary");
+    let output = command
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .env("CASS_SEARCH_NODES", "must-not-run")
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "--models-dir",
+            models.to_str().expect("UTF-8 models path"),
+            "search",
+            "--federation-request",
+        ])
+        .write_stdin(
+            "{\"protocol\":1,\"query\":\"federated\",\"limit\":5,\"provider\":null,\"days\":null}\n",
+        )
+        .output()
+        .expect("federation request");
+    assert!(
+        output.status.success(),
+        "federation endpoint failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("versioned response");
+    assert_eq!(response["protocol"], 1);
+    assert_eq!(response["kind"], "search");
+    assert_eq!(response["response"]["query"], "federated");
+    assert_eq!(
+        response["response"]["results"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(!log.exists(), "remote request mode must not invoke SSH");
+}
+
+#[veritas::claims(
+    "federated-search/partial-failure",
+    "federated-search/deterministic-merge",
+    "federated-search/response-provenance"
+)]
+#[cfg(unix)]
+#[test]
+fn federated_search_merges_provenance_and_preserves_partial_results() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let local = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "--models-dir",
+        models.to_str().expect("UTF-8 models path"),
+        "search",
+        "federated",
+    ]);
+    let local_hit = &local["results"][0];
+    let duplicate = serde_json::json!({
+        "id": local_hit["id"],
+        "conversation_id": local_hit["conversation_id"],
+        "provider": local_hit["provider"],
+        "role": "user",
+        "content": "duplicate copy",
+        "fusion_score": 0.0
+    });
+    let response = serde_json::json!({
+        "protocol": 1,
+        "kind": "search",
+        "response": {
+            "query": "federated",
+            "realized_mode": "lexical",
+            "fallback_mode": "lexical",
+            "fallback_reason": null,
+            "results": [duplicate, {
+                "id": "remote-message",
+                "conversation_id": "remote-conversation",
+                "provider": "codex",
+                "role": "assistant",
+                "content": "remote only",
+                "fusion_score": 0.0
+            }]
+        }
+    });
+    let body = format!(
+        "cat >/dev/null\ncase \"$*\" in *bad-node*) printf 'remote failed\\n' >&2; exit 7;; esac\nprintf '%s\\n' '{response}'\n"
+    );
+    let (bin, log) = fake_ssh_with_body(directory.path(), &body);
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", log)
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "--models-dir",
+            models.to_str().expect("UTF-8 models path"),
+            "search",
+            "federated",
+            "--node",
+            "good-node",
+            "--node",
+            "bad-node",
+        ])
+        .output()
+        .expect("federated search");
+    assert!(
+        output.status.success(),
+        "federated search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("JSON response");
+    assert_eq!(response["realized_mode"], "federated");
+    assert_eq!(response["nodes"][0]["node"], "good-node");
+    assert_eq!(response["nodes"][0]["status"], "ok");
+    assert_eq!(response["nodes"][1]["node"], "bad-node");
+    assert_eq!(response["nodes"][1]["status"], "error");
+    assert_eq!(response["nodes"][1]["error_kind"], "remote-exit");
+    assert_eq!(response["results"].as_array().map(Vec::len), Some(2));
+    assert_eq!(response["results"][0]["id"], local_hit["id"]);
+    assert_eq!(
+        response["results"][0]["origins"],
+        serde_json::json!(["local", "good-node"])
+    );
+    assert_eq!(response["results"][0]["federated_score"], 1.0);
+    assert_eq!(
+        response["results"][1]["origins"],
+        serde_json::json!(["good-node"])
+    );
+}
+
+#[veritas::claims("federated-search/concurrent-fanout")]
+#[cfg(unix)]
+#[test]
+fn federated_search_fans_out_nodes_concurrently() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, models) = seed_search_database(directory.path());
+    let (bin, log) = fake_ssh_with_body(
+        directory.path(),
+        concat!(
+            "cat >/dev/null\n",
+            "sleep 1\n",
+            "printf '%s\\n' '{\"protocol\":1,\"kind\":\"search\",\"response\":{\"query\":\"federated\",\"realized_mode\":\"lexical\",\"fallback_mode\":\"lexical\",\"fallback_reason\":null,\"results\":[]}}'\n",
+        ),
+    );
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+    let started = std::time::Instant::now();
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", log)
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "--models-dir",
+            models.to_str().expect("UTF-8 models path"),
+            "search",
+            "federated",
+            "--node",
+            "one",
+            "--node",
+            "two",
+        ])
+        .output()
+        .expect("federated search");
+    assert!(output.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1_800),
+        "two one-second nodes did not execute concurrently"
+    );
+}
+
+#[veritas::claims("federated-search/remote-view")]
+#[cfg(unix)]
+#[test]
+fn remote_view_uses_versioned_ssh_protocol_and_returns_context() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, _) = seed_search_database(directory.path());
+    let (bin, log) = fake_ssh_with_body(
+        directory.path(),
+        concat!(
+            "request=$(cat)\n",
+            "case \"$request\" in *'\"protocol\":1'*'\"id\":\"remote-message\"'*) ;; *) exit 9;; esac\n",
+            "printf '%s\\n' '{\"protocol\":1,\"kind\":\"view\",\"response\":{\"id\":\"remote-message\",\"messages\":[{\"id\":\"remote-message\",\"ordinal\":3,\"role\":\"assistant\",\"content\":\"remote context\",\"created_at\":null}]}}'\n",
+        ),
+    );
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fake PATH");
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .env("CASS_FAKE_SSH_LOG", &log)
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "view",
+            "remote-message",
+            "--context",
+            "4",
+            "--node",
+            "dev-macbook",
+        ])
+        .output()
+        .expect("remote view");
+    assert!(
+        output.status.success(),
+        "remote view failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("JSON response");
+    assert_eq!(response["id"], "remote-message");
+    assert_eq!(response["messages"][0]["content"], "remote context");
+    let calls = std::fs::read_to_string(log).expect("SSH call log");
+    assert!(calls.contains("dev-macbook"));
+    assert!(calls.contains("view --federation-request"));
+}
+
+#[cfg(unix)]
+#[test]
+fn federation_view_request_forces_local_execution() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, _) = seed_search_database(directory.path());
+    let local = run_json(&[
+        "--db",
+        database.to_str().expect("UTF-8 database path"),
+        "search",
+        "federated",
+    ]);
+    let id = local["results"][0]["id"].as_str().expect("local result ID");
+    let mut command = Command::cargo_bin("cass").expect("cass binary");
+    let output = command
+        .env("CASS_SEARCH_NODES", "must-not-run")
+        .args([
+            "--db",
+            database.to_str().expect("UTF-8 database path"),
+            "view",
+            "--federation-request",
+        ])
+        .write_stdin(format!("{{\"protocol\":1,\"id\":{id:?},\"context\":0}}\n"))
+        .output()
+        .expect("local federation view request");
+    assert!(output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(response["protocol"], 1);
+    assert_eq!(response["kind"], "view");
+    assert_eq!(response["response"]["id"], id);
 }
 
 #[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]

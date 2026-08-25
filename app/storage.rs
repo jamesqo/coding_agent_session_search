@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AppError;
 use crate::ingestion::Conversation;
@@ -79,7 +79,7 @@ pub(crate) struct Counts {
     pub(crate) embeddings: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SearchHit {
     pub(crate) id: String,
     pub(crate) conversation_id: String,
@@ -93,9 +93,13 @@ pub(crate) struct SearchHit {
     pub(crate) fusion_score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rerank_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) federated_score: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Message {
     id: String,
     ordinal: i64,
@@ -613,6 +617,8 @@ impl Storage {
                     semantic_score: None,
                     fusion_score: 0.0,
                     rerank_score: None,
+                    origins: Vec::new(),
+                    federated_score: None,
                 })
             })
             .map_err(AppError::database)?;
@@ -763,6 +769,8 @@ impl Storage {
                         semantic_score: None,
                         fusion_score: 0.0,
                         rerank_score: None,
+                        origins: Vec::new(),
+                        federated_score: None,
                     })
                 })
                 .optional()

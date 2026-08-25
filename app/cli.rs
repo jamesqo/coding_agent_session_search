@@ -1,14 +1,16 @@
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use clap::CommandFactory;
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::AppError;
+use crate::federation::{self, SearchEnvelope, SearchRequest, ViewEnvelope, ViewRequest};
 use crate::ingestion::{self, ProviderRoots};
 use crate::semantic::{self, Models};
 use crate::storage::Storage;
@@ -38,19 +40,29 @@ enum Command {
     },
     /// Search indexed messages.
     Search {
-        query: String,
+        query: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
         provider: Option<String>,
         #[arg(long)]
         days: Option<u32>,
+        /// Search an SSH node in addition to this machine.
+        #[arg(long, value_name = "ALIAS")]
+        node: Vec<String>,
+        #[arg(long, hide = true)]
+        federation_request: bool,
     },
     /// Return a message and adjacent context.
     View {
-        id: String,
+        id: Option<String>,
         #[arg(long, default_value_t = 0)]
         context: u32,
+        /// Read the message from an SSH node.
+        #[arg(long, value_name = "ALIAS")]
+        node: Option<String>,
+        #[arg(long, hide = true)]
+        federation_request: bool,
     },
     /// Report canonical storage and model readiness.
     Status,
@@ -74,7 +86,9 @@ enum ModelsCommand {
 pub(super) enum Response {
     Index(IndexResponse),
     Search(SearchResponse),
+    FederationSearch(SearchEnvelope),
     View(ViewResponse),
+    FederationView(ViewEnvelope),
     Status(StatusResponse),
     Forget(ForgetResponse),
     ModelsInstall(ModelsInstallResponse),
@@ -101,19 +115,21 @@ pub(super) struct IndexResponse {
     fallback_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct SearchResponse {
-    query: String,
-    realized_mode: &'static str,
-    fallback_mode: Option<&'static str>,
-    fallback_reason: Option<String>,
-    results: Vec<crate::storage::SearchHit>,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SearchResponse {
+    pub(crate) query: String,
+    pub(crate) realized_mode: String,
+    pub(crate) fallback_mode: Option<String>,
+    pub(crate) fallback_reason: Option<String>,
+    pub(crate) results: Vec<crate::storage::SearchHit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) nodes: Option<Vec<federation::NodeOutcome>>,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct ViewResponse {
-    id: String,
-    messages: Vec<crate::storage::Message>,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ViewResponse {
+    pub(crate) id: String,
+    pub(crate) messages: Vec<crate::storage::Message>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,15 +180,61 @@ where
             limit,
             provider,
             days,
-        } => search(
-            &database_path,
-            &models_dir,
-            query,
-            limit,
-            provider.as_deref(),
-            days,
-        ),
-        Command::View { id, context } => view(&database_path, id, context),
+            node,
+            federation_request,
+        } => {
+            if federation_request {
+                if query.is_some() || !node.is_empty() {
+                    return Err(AppError::usage(
+                        "--federation-request reads its search request from stdin",
+                    ));
+                }
+                let request: SearchRequest = read_federation_request()?;
+                federation::validate_protocol(request.protocol)?;
+                local_search(
+                    &database_path,
+                    &models_dir,
+                    request.query,
+                    request.limit,
+                    request.provider.as_deref(),
+                    request.days,
+                )
+                .map(|response| Response::FederationSearch(SearchEnvelope::new(response)))
+            } else {
+                let query = query.ok_or_else(|| AppError::usage("search requires a query"))?;
+                let nodes = federation::select_nodes(&node)?;
+                search(
+                    &database_path,
+                    &models_dir,
+                    query,
+                    limit,
+                    provider.as_deref(),
+                    days,
+                    &nodes,
+                )
+            }
+        }
+        Command::View {
+            id,
+            context,
+            node,
+            federation_request,
+        } => {
+            if federation_request {
+                if id.is_some() || node.is_some() {
+                    return Err(AppError::usage(
+                        "--federation-request reads its view request from stdin",
+                    ));
+                }
+                let request: ViewRequest = read_federation_request()?;
+                federation::validate_protocol(request.protocol)?;
+                local_view(&database_path, request.id, request.context)
+                    .map(|response| Response::FederationView(ViewEnvelope::new(response)))
+            } else {
+                let id = id.ok_or_else(|| AppError::usage("view requires an id"))?;
+                view(&database_path, id, context, node)
+            }
+        }
         Command::Status => status(&database_path, &models_dir),
         Command::Forget { id } => forget(&database_path, id),
         Command::Models {
@@ -262,7 +324,49 @@ fn search(
     limit: usize,
     provider: Option<&str>,
     days: Option<u32>,
+    nodes: &[String],
 ) -> Result<Response, AppError> {
+    if nodes.is_empty() {
+        return local_search(database_path, models_dir, query, limit, provider, days)
+            .map(Response::Search);
+    }
+    let request = SearchRequest::new(query.clone(), limit, provider.map(ToOwned::to_owned), days);
+    let (local, remote) = std::thread::scope(|scope| {
+        let handles = nodes
+            .iter()
+            .map(|node| {
+                let node = node.clone();
+                let request = &request;
+                (
+                    node.clone(),
+                    scope.spawn(move || federation::remote_search(node, request)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let local = local_search(database_path, models_dir, query, limit, provider, days);
+        let remote = handles
+            .into_iter()
+            .map(|(node, handle)| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| federation::thread_failure(node))
+            })
+            .collect::<Vec<_>>();
+        (local, remote)
+    });
+    Ok(Response::Search(federation::merge_search(
+        local?, remote, limit,
+    )))
+}
+
+fn local_search(
+    database_path: &Path,
+    models_dir: &Path,
+    query: String,
+    limit: usize,
+    provider: Option<&str>,
+    days: Option<u32>,
+) -> Result<SearchResponse, AppError> {
     let provider = normalize_provider_filter(provider)?;
     let storage = Storage::open_existing(database_path)?;
     #[cfg(feature = "semantic")]
@@ -300,13 +404,14 @@ fn search(
             Some(error.message().to_owned()),
         ),
     };
-    Ok(Response::Search(SearchResponse {
+    Ok(SearchResponse {
         query,
-        realized_mode,
-        fallback_mode,
+        realized_mode: realized_mode.to_owned(),
+        fallback_mode: fallback_mode.map(ToOwned::to_owned),
         fallback_reason,
         results,
-    }))
+        nodes: None,
+    })
 }
 
 fn normalize_provider_filter(provider: Option<&str>) -> Result<Option<&'static str>, AppError> {
@@ -324,10 +429,46 @@ fn normalize_provider_filter(provider: Option<&str>) -> Result<Option<&'static s
     }
 }
 
-fn view(database_path: &Path, id: String, context: u32) -> Result<Response, AppError> {
+fn view(
+    database_path: &Path,
+    id: String,
+    context: u32,
+    node: Option<String>,
+) -> Result<Response, AppError> {
+    let Some(node) = node else {
+        return local_view(database_path, id, context).map(Response::View);
+    };
+    federation::validate_node(&node)?;
+    let remote = federation::remote_view(node, &ViewRequest::new(id, context));
+    if let Some(response) = remote.response {
+        return Ok(Response::View(response));
+    }
+    let kind = remote.outcome.error_kind.as_deref().unwrap_or("remote");
+    let detail = remote
+        .outcome
+        .error
+        .as_deref()
+        .unwrap_or("remote view failed");
+    Err(AppError::internal(format!(
+        "remote view on {} failed ({kind}): {detail}",
+        remote.outcome.node
+    )))
+}
+
+fn local_view(database_path: &Path, id: String, context: u32) -> Result<ViewResponse, AppError> {
     let storage = Storage::open_existing(database_path)?;
     let messages = storage.view(&id, context)?;
-    Ok(Response::View(ViewResponse { id, messages }))
+    Ok(ViewResponse { id, messages })
+}
+
+fn read_federation_request<T: DeserializeOwned>() -> Result<T, AppError> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut input)
+        .map_err(AppError::io)?;
+    serde_json::from_slice(&input)
+        .map_err(|error| AppError::usage(format!("invalid federation request: {error}")))
 }
 
 fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError> {

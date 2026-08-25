@@ -518,6 +518,8 @@ mod tests {
                 semantic_score: None,
                 fusion_score: 0.0,
                 rerank_score: None,
+                origins: Vec::new(),
+                federated_score: None,
             }
         }
 

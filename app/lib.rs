@@ -1,4 +1,5 @@
 mod cli;
+mod federation;
 mod ingestion;
 #[cfg(feature = "semantic")]
 mod semantic;
