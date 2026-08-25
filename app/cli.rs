@@ -340,11 +340,8 @@ fn index(
 ) -> Result<Response, AppError> {
     let total_started = Instant::now();
     let models = Models::new(models_dir.to_path_buf());
-    let model_started = Instant::now();
-    let mut embedding_pool = models.load_indexer()?.ok_or_else(|| {
-        AppError::model("semantic models are not installed; run `cass models install`")
-    })?;
-    let model_load_milliseconds = elapsed_milliseconds(model_started);
+    models.require_installed()?;
+    let mut model_load_milliseconds = 0;
     let storage_started = Instant::now();
     let mut storage = Storage::open_writer(database_path)?;
     if full || storage.derived_search_is_dirty()? {
@@ -367,12 +364,23 @@ fn index(
     emit_index_phase("semantic-embeddings", &summary);
     let embedding_started = Instant::now();
     storage.invalidate_embedding_generation(semantic::embedding_generation())?;
-    let embeddings =
-        semantic::rebuild_embeddings(&mut storage, &mut embedding_pool, emit_embedding_progress)?;
+    let embeddings = if storage.has_pending_embeddings()? {
+        let model_started = Instant::now();
+        let mut embedding_pool = models.load_indexer()?.ok_or_else(|| {
+            AppError::model("semantic models are not installed; run `cass models install`")
+        })?;
+        model_load_milliseconds = elapsed_milliseconds(model_started);
+        semantic::rebuild_embeddings(&mut storage, &mut embedding_pool, emit_embedding_progress)?
+    } else {
+        semantic::EmbeddingSummary::default()
+    };
     let embedding_milliseconds = elapsed_milliseconds(embedding_started);
     let counts = storage.counts()?;
     storage.mark_semantic_index_ready(semantic::embedding_generation())?;
     storage.commit_writer()?;
+    if full {
+        storage.truncate_wal()?;
+    }
     emit_index_phase("complete", &summary);
     Ok(Response::Index(IndexResponse {
         indexed_conversations: counts.conversations,

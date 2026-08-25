@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use super::semantic_chunks::rebuild_all_semantic_chunks;
 use crate::AppError;
 
-pub(super) const SCHEMA_VERSION: i64 = 11;
+pub(super) const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     norm REAL NOT NULL,
     vector BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_embeddings (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS semantic_chunks (
     chunk_id INTEGER PRIMARY KEY CHECK (chunk_id >= 0),
     generation TEXT NOT NULL,
@@ -153,12 +156,30 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), AppError> {
     if version < 11 {
         rebuild_all_semantic_chunks(&transaction)?;
     }
+    if version < 12 {
+        backfill_pending_embeddings(&transaction)?;
+    }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(AppError::database)?;
     transaction.commit().map_err(AppError::database)?;
     connection
         .pragma_update(None, "foreign_keys", true)
+        .map_err(AppError::database)
+}
+
+fn backfill_pending_embeddings(connection: &Connection) -> Result<(), AppError> {
+    connection
+        .execute_batch(
+            "DELETE FROM pending_embeddings
+              WHERE message_id NOT IN (SELECT id FROM messages);
+             INSERT OR IGNORE INTO pending_embeddings(message_id)
+             SELECT m.id
+               FROM messages m
+               LEFT JOIN message_embeddings e ON e.message_id = m.id
+              WHERE COALESCE(m.search_projection, m.content) <> ''
+                AND e.message_id IS NULL;",
+        )
         .map_err(AppError::database)
 }
 
@@ -293,6 +314,13 @@ fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> 
                      WHERE provider NOT IN ('claude-code', 'codex')
               );
              DELETE FROM message_embeddings
+              WHERE message_id IN (
+                    SELECT messages.id
+                      FROM messages
+                      JOIN conversations ON conversations.id = messages.conversation_id
+                     WHERE conversations.provider NOT IN ('claude-code', 'codex')
+              );
+             DELETE FROM pending_embeddings
               WHERE message_id IN (
                     SELECT messages.id
                       FROM messages

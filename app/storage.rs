@@ -162,11 +162,14 @@ impl Storage {
                 .execute_batch("COMMIT")
                 .map_err(AppError::database)?;
             self.writer_active = false;
-            self.connection
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-                .map_err(AppError::database)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn truncate_wal(&self) -> Result<(), AppError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(AppError::database)
     }
 
     pub(crate) fn checkpoint_writer(&mut self) -> Result<(), AppError> {
@@ -727,6 +730,14 @@ impl Storage {
             .connection
             .prepare_cached("DELETE FROM message_embeddings WHERE message_id = ?1")
             .map_err(AppError::database)?;
+        let mut queue_embedding = self
+            .connection
+            .prepare_cached("INSERT OR IGNORE INTO pending_embeddings(message_id) VALUES (?1)")
+            .map_err(AppError::database)?;
+        let mut unqueue_embedding = self
+            .connection
+            .prepare_cached("DELETE FROM pending_embeddings WHERE message_id = ?1")
+            .map_err(AppError::database)?;
         let mut delete_message = self
             .connection
             .prepare_cached("DELETE FROM messages WHERE id = ?1")
@@ -777,6 +788,15 @@ impl Storage {
                 delete_embedding
                     .execute([&message.id])
                     .map_err(AppError::database)?;
+                if message_search_text(message).is_empty() {
+                    unqueue_embedding
+                        .execute([&message.id])
+                        .map_err(AppError::database)?;
+                } else {
+                    queue_embedding
+                        .execute([&message.id])
+                        .map_err(AppError::database)?;
+                }
                 self.stage_semantic_message(&message.id, None)?;
             }
             changed.push(message.id.clone());
@@ -793,6 +813,10 @@ impl Storage {
                 "DELETE FROM message_embeddings;
                  DELETE FROM semantic_chunks;
                  DELETE FROM dirty_semantic_chunks;
+                 DELETE FROM pending_embeddings;
+                 INSERT INTO pending_embeddings(message_id)
+                    SELECT id FROM messages
+                     WHERE COALESCE(search_projection, content) <> '';
                  UPDATE derived_state
                     SET search_dirty = 0,
                         semantic_ready_generation = NULL
@@ -1010,25 +1034,18 @@ impl Storage {
             .map_err(AppError::database)
     }
 
-    pub(crate) fn messages_needing_embeddings(
-        &self,
-        generation: &str,
-    ) -> Result<Vec<SearchableMessage>, AppError> {
+    pub(crate) fn messages_needing_embeddings(&self) -> Result<Vec<SearchableMessage>, AppError> {
         let mut statement = self
             .connection
             .prepare(
                 "SELECT messages.id, COALESCE(messages.search_projection, messages.content)
-                   FROM messages
-                   LEFT JOIN message_embeddings
-                     ON message_embeddings.message_id = messages.id
-                    AND message_embeddings.generation = ?1
-                  WHERE message_embeddings.message_id IS NULL
-                    AND COALESCE(messages.search_projection, messages.content) <> ''
-                  ORDER BY messages.id",
+                   FROM pending_embeddings
+                   JOIN messages ON messages.id = pending_embeddings.message_id
+                  ORDER BY pending_embeddings.message_id",
             )
             .map_err(AppError::database)?;
         let rows = statement
-            .query_map([generation], |row| {
+            .query_map([], |row| {
                 Ok(SearchableMessage {
                     id: row.get(0)?,
                     content: row.get(1)?,
@@ -1036,6 +1053,16 @@ impl Storage {
             })
             .map_err(AppError::database)?;
         rows.collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)
+    }
+
+    pub(crate) fn has_pending_embeddings(&self) -> Result<bool, AppError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_embeddings LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
             .map_err(AppError::database)
     }
 
@@ -1065,6 +1092,10 @@ impl Storage {
                  ON CONFLICT(chunk_id) DO UPDATE SET generation = excluded.generation",
             )
             .map_err(AppError::database)?;
+        let mut dequeue = self
+            .connection
+            .prepare_cached("DELETE FROM pending_embeddings WHERE message_id = ?1")
+            .map_err(AppError::database)?;
         for embedding in embeddings {
             let dimensions = i64::try_from(embedding.vector.len())
                 .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
@@ -1083,6 +1114,9 @@ impl Storage {
                     SEMANTIC_CHUNK_ROWS,
                     generation
                 ])
+                .map_err(AppError::database)?;
+            dequeue
+                .execute([embedding.message_id])
                 .map_err(AppError::database)?;
         }
         Ok(())
@@ -1245,37 +1279,47 @@ impl Storage {
         generation: &str,
     ) -> Result<u64, AppError> {
         self.require_writer()?;
-        self.mark_semantic_index_incomplete()?;
-        let removed = self
+        let ready_generation = self
             .connection
-            .execute(
-                "DELETE FROM message_embeddings
-                  WHERE generation <> ?1
-                     OR message_id IN (
-                        SELECT id FROM messages
-                         WHERE COALESCE(search_projection, content) = ''
-                     )",
-                [generation],
+            .query_row(
+                "SELECT semantic_ready_generation FROM derived_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
             )
             .map_err(AppError::database)?;
-        if removed != 0 {
-            self.connection
-                .execute("DELETE FROM semantic_chunks", [])
-                .map_err(AppError::database)?;
-            self.connection
-                .execute(
-                    "INSERT INTO dirty_semantic_chunks(chunk_id, generation)
-                     SELECT (m.rowid - 1) / ?2, min(e.generation)
-                       FROM message_embeddings e
-                       JOIN messages m ON m.id = e.message_id
-                      WHERE e.generation = ?1
-                      GROUP BY (m.rowid - 1) / ?2
-                     ON CONFLICT(chunk_id) DO UPDATE SET
-                        generation = excluded.generation",
-                    params![generation, SEMANTIC_CHUNK_ROWS],
-                )
-                .map_err(AppError::database)?;
+        if ready_generation.as_deref() == Some(generation) && !self.has_pending_embeddings()? {
+            return Ok(0);
         }
+        self.mark_semantic_index_incomplete()?;
+        let stored_generation = self
+            .connection
+            .query_row(
+                "SELECT generation FROM message_embeddings LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(AppError::database)?;
+        if stored_generation
+            .as_deref()
+            .is_none_or(|stored| stored == generation)
+        {
+            return Ok(0);
+        }
+        let removed = self
+            .connection
+            .execute("DELETE FROM message_embeddings", [])
+            .map_err(AppError::database)?;
+        self.connection
+            .execute_batch(
+                "DELETE FROM semantic_chunks;
+                 DELETE FROM dirty_semantic_chunks;
+                 DELETE FROM pending_embeddings;
+                 INSERT INTO pending_embeddings(message_id)
+                    SELECT id FROM messages
+                     WHERE COALESCE(search_projection, content) <> '';",
+            )
+            .map_err(AppError::database)?;
         u64::try_from(removed).map_err(|_| AppError::internal("too many stale embeddings"))
     }
 
@@ -1487,6 +1531,13 @@ fn message_fingerprint(message: &crate::ingestion::NormalizedMessage) -> String 
         &message.created_at.unwrap_or_default().to_string(),
     );
     hasher.finalize().to_hex().to_string()
+}
+
+fn message_search_text(message: &crate::ingestion::NormalizedMessage) -> &str {
+    message
+        .search_projection
+        .as_deref()
+        .unwrap_or(&message.content)
 }
 
 fn update_hash(hasher: &mut blake3::Hasher, value: &str) {

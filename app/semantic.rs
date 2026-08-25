@@ -538,7 +538,7 @@ pub(crate) fn rebuild_embeddings(
     mut on_progress: impl FnMut(EmbeddingProgress),
 ) -> Result<EmbeddingSummary, AppError> {
     let generation = embedding_generation();
-    let groups = plan_embedding_groups(storage.messages_needing_embeddings(generation)?);
+    let groups = plan_embedding_groups(storage.messages_needing_embeddings()?);
     if groups.is_empty() {
         return Ok(EmbeddingSummary::default());
     }

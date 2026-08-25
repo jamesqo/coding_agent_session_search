@@ -421,7 +421,7 @@ fn search_projection_controls_fts_embeddings_and_rerank_text_not_view() {
         .replace_conversation(&corpus)
         .expect("store projected messages");
     let pending = writer
-        .messages_needing_embeddings("generation")
+        .messages_needing_embeddings()
         .expect("embedding selection");
     assert_eq!(
         pending
@@ -548,7 +548,7 @@ fn bulk_fts_refresh_preserves_unchanged_embeddings() {
     assert_eq!(writer.embedding_count("generation-a").unwrap(), 1);
     assert_eq!(
         writer
-            .messages_needing_embeddings("generation-a")
+            .messages_needing_embeddings()
             .unwrap()
             .into_iter()
             .map(|message| message.id)
@@ -755,7 +755,7 @@ fn committed_embedding_checkpoint_resumes_from_only_missing_rows() {
             .expect("partial coverage")
     );
     let missing = resumed
-        .messages_needing_embeddings("generation")
+        .messages_needing_embeddings()
         .expect("missing embeddings");
     assert_eq!(
         missing
@@ -1356,7 +1356,7 @@ fn conversation_reconciliation_writes_only_changed_messages() {
     assert_eq!(unchanged.changed_message_ids, Vec::<String>::new());
     assert!(
         storage
-            .messages_needing_embeddings("generation-a")
+            .messages_needing_embeddings()
             .expect("embedding selection")
             .is_empty()
     );
@@ -1366,7 +1366,7 @@ fn conversation_reconciliation_writes_only_changed_messages() {
     assert_eq!(changed.changed_message_ids, ["message-1"]);
     assert_eq!(
         storage
-            .messages_needing_embeddings("generation-a")
+            .messages_needing_embeddings()
             .expect("embedding selection")
             .iter()
             .map(|message| message.id.as_str())
@@ -1478,7 +1478,7 @@ fn stale_embedding_generation_is_excluded_and_replaced() {
     );
     assert_eq!(
         writer
-            .messages_needing_embeddings("new-generation")
+            .messages_needing_embeddings()
             .expect("re-embedding selection")
             .iter()
             .map(|message| message.id.as_str())
@@ -1534,4 +1534,57 @@ fn tombstone_prevents_reinsertion() {
     assert!(change.tombstoned);
     writer.commit_writer().expect("commit");
     assert_eq!(writer.counts().expect("counts").conversations, 0);
+}
+
+#[test]
+fn changed_searchable_messages_are_transactionally_queued_for_embedding() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("cass.sqlite3");
+    let mut writer = Storage::open_writer(&path).expect("writer");
+    writer
+        .replace_conversation(&conversation("searchable message"))
+        .expect("insert conversation");
+
+    let pending: i64 = writer
+        .connection
+        .query_row("SELECT count(*) FROM pending_embeddings", [], |row| {
+            row.get(0)
+        })
+        .expect("pending embedding count");
+    assert_eq!(pending, 1);
+
+    writer
+        .replace_embeddings(
+            "generation",
+            &[EmbeddingWrite {
+                message_id: "message-1",
+                vector: &[127, 0],
+                norm: 127.0,
+            }],
+        )
+        .expect("store embedding");
+    let pending: i64 = writer
+        .connection
+        .query_row("SELECT count(*) FROM pending_embeddings", [], |row| {
+            row.get(0)
+        })
+        .expect("drained embedding count");
+    assert_eq!(pending, 0);
+}
+
+#[test]
+fn ordinary_writer_commits_leave_wal_checkpointing_to_sqlite() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("cass.sqlite3");
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    let mut writer = Storage::open_writer(&path).expect("writer");
+    writer
+        .replace_conversation(&conversation("small incremental write"))
+        .expect("insert conversation");
+    writer.commit_writer().expect("commit writer");
+
+    assert!(
+        std::fs::metadata(wal_path).is_ok_and(|metadata| metadata.len() > 0),
+        "a small commit must not force a blocking WAL truncation"
+    );
 }

@@ -99,6 +99,22 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
                 message_id TEXT PRIMARY KEY, generation TEXT NOT NULL,
                 dimensions INTEGER NOT NULL, norm REAL NOT NULL, vector BLOB NOT NULL
              );
+             CREATE TABLE pending_embeddings (
+                message_id TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             CREATE VIRTUAL TABLE message_fts USING fts5(
+                content, message_id UNINDEXED, conversation_id UNINDEXED,
+                tokenize = 'unicode61'
+             );
+             CREATE TABLE tombstones (
+                provider TEXT NOT NULL, conversation_id TEXT NOT NULL,
+                forgotten_at INTEGER NOT NULL, PRIMARY KEY(provider, conversation_id)
+             );
+             CREATE TABLE source_checkpoints (
+                provider TEXT NOT NULL, source_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
+                PRIMARY KEY(provider, source_path)
+             );
              CREATE TABLE semantic_chunks (
                 chunk_id INTEGER PRIMARY KEY, generation TEXT NOT NULL,
                 dimensions INTEGER NOT NULL, vector_count INTEGER NOT NULL,
@@ -112,7 +128,7 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
              INSERT INTO derived_state VALUES (1, 0, NULL);
              INSERT INTO conversations(id, provider, source_path)
                 VALUES ('session', 'codex', '/tmp/session.jsonl');
-             PRAGMA user_version = 11;",
+             PRAGMA user_version = 12;",
         )
         .expect("readiness schema");
     connection
@@ -592,6 +608,40 @@ fn index_without_models_fails_before_creating_the_database() {
     assert_eq!(error["error"]["recommended_action"], "models install");
     assert!(!database.exists());
     assert!(!models.exists());
+}
+
+#[veritas::claims("semantic/index-noop-does-not-load-model")]
+#[test]
+fn index_without_pending_embeddings_validates_but_does_not_load_models() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("cass.sqlite3");
+    let models = directory.path().join("models");
+    let config = directory.path().join("config.json");
+    let claude = directory.path().join("claude");
+    let codex = directory.path().join("codex");
+    std::fs::create_dir_all(&claude).expect("Claude root");
+    std::fs::create_dir_all(&codex).expect("Codex root");
+    seed_readiness_database(&database, Some(""));
+    create_valid_model_marker(&models);
+    write_config(&config, "test-node", &claude, &codex);
+
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .args(["--config", config.to_str().unwrap()])
+        .args(["--db", database.to_str().unwrap()])
+        .args(["--models-dir", models.to_str().unwrap()])
+        .arg("index")
+        .output()
+        .expect("run no-op index");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&output.stdout).expect("index JSON");
+    assert_eq!(indexed["embeddings"], 0);
+    assert_eq!(indexed["model_load_milliseconds"], 0);
 }
 
 #[veritas::claims("semantic/missing-models-fail-search", "models/download-is-explicit")]
