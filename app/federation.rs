@@ -128,7 +128,6 @@ struct ProcessOutput {
     stderr: BoundedOutput,
     timed_out: bool,
     elapsed_ms: u64,
-    stdin_error: Option<String>,
 }
 
 struct BoundedOutput {
@@ -396,9 +395,6 @@ where
             },
         );
     }
-    if let Some(error) = process.stdin_error {
-        return remote_error(node, process.elapsed_ms, "transport", error);
-    }
     let envelope: Envelope = match serde_json::from_slice(&process.stdout.bytes) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -515,12 +511,9 @@ fn run_ssh(
         .ok_or_else(|| "failed to capture remote stderr".to_owned())?;
     let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
     let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
-    let stdin_error = child.stdin.take().and_then(|mut stdin| {
-        stdin
-            .write_all(payload)
-            .err()
-            .map(|error| format!("failed to send remote request: {error}"))
-    });
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload);
+    }
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -554,7 +547,6 @@ fn run_ssh(
         stderr,
         timed_out,
         elapsed_ms: elapsed_millis(started),
-        stdin_error,
     })
 }
 
