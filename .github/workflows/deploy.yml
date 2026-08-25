@@ -55,7 +55,10 @@ jobs:
           mkdir -p dist/linux-amd64 dist/darwin-arm64
           cp target/release/cass dist/linux-amd64/cass
           file dist/linux-amd64/cass | tee /dev/stderr | grep -q 'x86-64'
-          dist/linux-amd64/cass --version
+          dist/linux-amd64/cass \
+            --db "$RUNNER_TEMP/cass-deploy-smoke.sqlite3" \
+            --models-dir "$RUNNER_TEMP/cass-deploy-models" status \
+            | grep -q '"ready":false'
 
       - name: Cross-compile Apple Silicon binary
         shell: bash
@@ -124,7 +127,6 @@ jobs:
               smoke_db="$HOME/.cache/cass-deploy-${revision}.sqlite3"
               smoke_models="$HOME/.cache/cass-deploy-models-${revision}"
               chmod 0755 "$HOME/$staged"
-              "$HOME/$staged" --version
               "$HOME/$staged" --db "$smoke_db" --models-dir "$smoke_models" status \
                 | grep -q '"ready":false'
               mv -f "$HOME/$staged" "$HOME/.local/bin/cass"
