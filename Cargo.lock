@@ -287,6 +287,8 @@ dependencies = [
  "clap",
  "directories",
  "fastembed",
+ "hf-hub",
+ "ort",
  "predicates",
  "rusqlite",
  "serde",

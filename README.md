@@ -38,6 +38,12 @@ embeddings while preserving it for `view`. `--full` rebuilds derived search
 state. The default source horizon is 90 days; `--since-days N` overrides it and
 `--all-history` removes it for one run.
 
+On Apple Silicon, indexing runs the FP32 embedding model through Core ML and
+quantizes only the resulting vectors for storage. Other targets use the
+quantized ONNX CPU model. After upgrading an existing Mac installation, rerun
+`cass models install` once to install the FP32 asset and compile its Core ML
+cache.
+
 Without a configuration file, CASS indexes these built-in roots when present:
 
 - Claude Code: `~/.claude/projects`, `~/.config/claude/projects`

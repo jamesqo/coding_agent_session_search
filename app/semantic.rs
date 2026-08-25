@@ -4,11 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use fastembed::QuantizationMode;
 use fastembed::{
     EmbeddingModel, InitOptionsUserDefined, RerankInitOptions, RerankInitOptionsUserDefined,
     RerankerModel, TextEmbedding, TextInitOptions, TextRerank, TokenizerFiles,
     UserDefinedEmbeddingModel, UserDefinedRerankingModel,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use hf_hub::api::sync::ApiBuilder;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use ort::ep;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
@@ -25,7 +31,15 @@ const RERANK_LIMIT: usize = 10;
 const EMBEDDING_BATCH_SIZE: usize = 8;
 const EMBEDDING_WORKERS: usize = 8;
 const EMBEDDING_THREADS_PER_WORKER: usize = 2;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const EMBEDDING_WAVE_SIZE: usize = EMBEDDING_BATCH_SIZE * EMBEDDING_WORKERS;
+const COREML_BATCH_SIZE: usize = 32;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const COREML_SESSION_BATCH_SIZE: usize = COREML_BATCH_SIZE + 1;
+const COREML_SEQUENCE_LENGTH: usize = 512;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const COREML_MODEL_FILE: &str = "onnx/model.onnx";
+const COREML_CACHE_DIRECTORY: &str = "coreml-cache";
 const EMBEDDING_CHECKPOINT_ROWS: u64 = 4_096;
 const EMBEDDING_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const RRF_K: f32 = 60.0;
@@ -41,7 +55,14 @@ pub(crate) struct Backend {
 }
 
 pub(crate) struct EmbeddingPool {
-    workers: Vec<TextEmbedding>,
+    backend: EmbeddingPoolBackend,
+}
+
+enum EmbeddingPoolBackend {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    Cpu(Vec<TextEmbedding>),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    CoreMl(TextEmbedding),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -86,6 +107,8 @@ struct InstallMarker {
     embedding_model: String,
     reranker_model: String,
     embedding_dimensions: usize,
+    #[serde(default)]
+    coreml_embedding: bool,
     files: Vec<InstalledFile>,
 }
 
@@ -130,6 +153,19 @@ impl Models {
                 "reranker returned an unexpected smoke result count",
             ));
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let mut indexer = EmbeddingPool::load_local(&self.root)?;
+            let smoke = [EmbeddingGroup {
+                content: "semantic Core ML installation check".to_owned(),
+                message_ids: vec!["smoke".to_owned()],
+            }];
+            if indexer.embed_wave(&smoke)?.len() != 1 {
+                return Err(AppError::model(
+                    "Core ML embedding model returned an unexpected smoke result count",
+                ));
+            }
+        }
 
         let files = inventory(&self.root)?;
         if files.is_empty() {
@@ -140,11 +176,12 @@ impl Models {
             embedding_model: EMBEDDING_MODEL.to_string(),
             reranker_model: RERANKER_MODEL.to_string(),
             embedding_dimensions,
+            coreml_embedding: coreml_embedding_enabled(),
             files,
         };
         write_marker(&self.root, &marker)?;
         Ok(InstallSummary {
-            embedding_model: "sentence-transformers/all-MiniLM-L6-v2 (quantized ONNX)",
+            embedding_model: embedding_model_description(),
             reranker_model: "jinaai/jina-reranker-v1-turbo-en",
             embedding_dimensions,
             files: marker.files.len(),
@@ -176,6 +213,7 @@ impl Models {
         if marker.schema != 1
             || marker.embedding_model != EMBEDDING_MODEL.to_string()
             || marker.reranker_model != RERANKER_MODEL.to_string()
+            || marker.coreml_embedding != coreml_embedding_enabled()
             || marker.files.is_empty()
         {
             return Err(AppError::model(
@@ -209,6 +247,8 @@ impl Backend {
                 .with_show_download_progress(false),
         )
         .map_err(|error| AppError::model(format!("failed to load reranking model: {error}")))?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        download_coreml_embedding(root)?;
         Ok(Self {
             embedding,
             reranker,
@@ -255,41 +295,109 @@ impl Backend {
 }
 
 impl EmbeddingPool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn load_local(root: &Path) -> Result<Self, AppError> {
+        Ok(Self {
+            backend: EmbeddingPoolBackend::CoreMl(load_coreml_embedding(root)?),
+        })
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     fn load_local(root: &Path) -> Result<Self, AppError> {
         let workers = (0..EMBEDDING_WORKERS)
             .map(|_| load_local_embedding(root, Some(EMBEDDING_THREADS_PER_WORKER)))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { workers })
+        Ok(Self {
+            backend: EmbeddingPoolBackend::Cpu(workers),
+        })
     }
 
     fn embed_wave(&mut self, groups: &[EmbeddingGroup]) -> Result<Vec<Vec<f32>>, AppError> {
-        let worker_batches = groups.chunks(EMBEDDING_BATCH_SIZE);
-        let results = std::thread::scope(|scope| {
-            self.workers
-                .iter_mut()
-                .zip(worker_batches)
-                .map(|(worker, batch)| {
-                    scope.spawn(move || {
-                        let texts = batch
-                            .iter()
-                            .map(|group| group.content.as_str())
-                            .collect::<Vec<_>>();
-                        worker.embed(texts, None).map_err(|error| {
-                            AppError::model(format!("embedding inference failed: {error}"))
-                        })
+        match &mut self.backend {
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            EmbeddingPoolBackend::Cpu(workers) => embed_cpu_wave(workers, groups),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            EmbeddingPoolBackend::CoreMl(embedding) => embed_coreml_wave(embedding, groups),
+        }
+    }
+
+    const fn batch_size(&self) -> usize {
+        match self.backend {
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            EmbeddingPoolBackend::Cpu(_) => EMBEDDING_BATCH_SIZE,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            EmbeddingPoolBackend::CoreMl(_) => COREML_BATCH_SIZE,
+        }
+    }
+
+    const fn wave_size(&self) -> usize {
+        match self.backend {
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            EmbeddingPoolBackend::Cpu(_) => EMBEDDING_WAVE_SIZE,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            EmbeddingPoolBackend::CoreMl(_) => COREML_BATCH_SIZE,
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn embed_cpu_wave(
+    workers: &mut [TextEmbedding],
+    groups: &[EmbeddingGroup],
+) -> Result<Vec<Vec<f32>>, AppError> {
+    let worker_batches = groups.chunks(EMBEDDING_BATCH_SIZE);
+    let results = std::thread::scope(|scope| {
+        workers
+            .iter_mut()
+            .zip(worker_batches)
+            .map(|(worker, batch)| {
+                scope.spawn(move || {
+                    let texts = batch
+                        .iter()
+                        .map(|group| group.content.as_str())
+                        .collect::<Vec<_>>();
+                    worker.embed(texts, None).map_err(|error| {
+                        AppError::model(format!("embedding inference failed: {error}"))
                     })
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| AppError::internal("embedding worker panicked"))?
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        Ok(results.into_iter().flatten().collect())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| AppError::internal("embedding worker panicked"))?
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(results.into_iter().flatten().collect())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn embed_coreml_wave(
+    embedding: &mut TextEmbedding,
+    groups: &[EmbeddingGroup],
+) -> Result<Vec<Vec<f32>>, AppError> {
+    if groups.len() > COREML_BATCH_SIZE {
+        return Err(AppError::internal("Core ML embedding wave is too large"));
     }
+    let real_count = groups.len();
+    let mut texts = groups
+        .iter()
+        .map(|group| group.content.clone())
+        .collect::<Vec<_>>();
+    texts.push("hello ".repeat(COREML_SEQUENCE_LENGTH + 1));
+    texts.resize(COREML_SESSION_BATCH_SIZE, String::new());
+    let mut vectors = embedding
+        .embed(texts, None)
+        .map_err(|error| AppError::model(format!("Core ML embedding inference failed: {error}")))?;
+    if vectors.len() != COREML_SESSION_BATCH_SIZE {
+        return Err(AppError::model(
+            "Core ML embedding model returned an unexpected result count",
+        ));
+    }
+    vectors.truncate(real_count);
+    Ok(vectors)
 }
 
 fn load_local_embedding(
@@ -313,6 +421,67 @@ fn load_local_embedding(
     });
     TextEmbedding::try_new_from_user_defined(embedding_model, options)
         .map_err(|error| AppError::model(format!("failed to load embedding model: {error}")))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn load_coreml_embedding(root: &Path) -> Result<TextEmbedding, AppError> {
+    let embedding_snapshot = snapshot(root, EMBEDDING_REPOSITORY)?;
+    let embedding_info = TextEmbedding::get_model_info(&EMBEDDING_MODEL)
+        .map_err(|error| AppError::model(format!("unknown embedding model: {error}")))?;
+    let mut embedding_model = UserDefinedEmbeddingModel::new(
+        read_model_file(&embedding_snapshot.join(COREML_MODEL_FILE))?,
+        read_tokenizer_files(&embedding_snapshot)?,
+    )
+    .with_quantization(QuantizationMode::None);
+    embedding_model.pooling = TextEmbedding::get_default_pooling_method(&EMBEDDING_MODEL);
+    embedding_model
+        .output_key
+        .clone_from(&embedding_info.output_key);
+
+    let cache_dir = root.join(COREML_CACHE_DIRECTORY);
+    fs::create_dir_all(&cache_dir).map_err(AppError::io)?;
+    let provider = ep::CoreML::default()
+        .with_model_format(ep::coreml::ModelFormat::MLProgram)
+        .with_compute_units(ep::coreml::ComputeUnits::All)
+        .with_specialization_strategy(ep::coreml::SpecializationStrategy::FastPrediction)
+        .with_model_cache_dir(cache_dir.to_string_lossy())
+        .build()
+        .error_on_failure();
+    let options = InitOptionsUserDefined::default()
+        .with_execution_providers(vec![provider])
+        .with_disable_cpu_fallback(true)
+        .with_dimension_override("batch_size", 33)
+        .with_dimension_override("sequence_length", 512);
+    TextEmbedding::try_new_from_user_defined(embedding_model, options).map_err(|error| {
+        AppError::model(format!("failed to load Core ML embedding model: {error}"))
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn download_coreml_embedding(root: &Path) -> Result<(), AppError> {
+    let api = ApiBuilder::new()
+        .with_cache_dir(root.to_path_buf())
+        .with_progress(false)
+        .build()
+        .map_err(|error| {
+            AppError::model(format!("failed to initialize model download: {error}"))
+        })?;
+    api.model("Xenova/all-MiniLM-L6-v2".to_owned())
+        .get(COREML_MODEL_FILE)
+        .map(|_| ())
+        .map_err(|error| AppError::model(format!("failed to download Core ML model: {error}")))
+}
+
+const fn coreml_embedding_enabled() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+const fn embedding_model_description() -> &'static str {
+    if coreml_embedding_enabled() {
+        "sentence-transformers/all-MiniLM-L6-v2 (Core ML FP32)"
+    } else {
+        "sentence-transformers/all-MiniLM-L6-v2 (quantized ONNX)"
+    }
 }
 
 fn snapshot(root: &Path, repository: &str) -> Result<PathBuf, AppError> {
@@ -346,11 +515,19 @@ fn read_tokenizer_files(snapshot: &Path) -> Result<TokenizerFiles, AppError> {
 
 pub(crate) fn embedding_generation() -> &'static str {
     EMBEDDING_GENERATION.get_or_init(|| {
-        let specification = format!(
-            "fastembed=6.0.1;model={EMBEDDING_MODEL};batch={EMBEDDING_BATCH_SIZE};\
-             workers={EMBEDDING_WORKERS};threads={EMBEDDING_THREADS_PER_WORKER};\
-             vector=i8-per-vector-symmetric;cosine=quantized-flat-exact;schema=3"
-        );
+        let specification = if coreml_embedding_enabled() {
+            format!(
+                "fastembed=6.0.1;model={EMBEDDING_MODEL};backend=coreml-fp32;\
+                 batch={COREML_BATCH_SIZE};sequence={COREML_SEQUENCE_LENGTH};\
+                 vector=i8-per-vector-symmetric;cosine=quantized-flat-exact;schema=4"
+            )
+        } else {
+            format!(
+                "fastembed=6.0.1;model={EMBEDDING_MODEL};batch={EMBEDDING_BATCH_SIZE};\
+                 workers={EMBEDDING_WORKERS};threads={EMBEDDING_THREADS_PER_WORKER};\
+                 vector=i8-per-vector-symmetric;cosine=quantized-flat-exact;schema=3"
+            )
+        };
         blake3::hash(specification.as_bytes()).to_hex().to_string()
     })
 }
@@ -374,17 +551,16 @@ pub(crate) fn rebuild_embeddings(
     let mut last_progress = started;
     let mut summary = EmbeddingSummary::default();
     let mut rows_since_checkpoint = 0_u64;
-    for wave in groups.chunks(EMBEDDING_WAVE_SIZE) {
+    let wave_size = pool.wave_size();
+    let batch_size = pool.batch_size();
+    for wave in groups.chunks(wave_size) {
         let wave_vectors = pool.embed_wave(wave)?;
         if wave.len() != wave_vectors.len() {
             return Err(AppError::model(
                 "embedding model returned an unexpected result count",
             ));
         }
-        for (batch, batch_vectors) in wave
-            .chunks(EMBEDDING_BATCH_SIZE)
-            .zip(wave_vectors.chunks(EMBEDDING_BATCH_SIZE))
-        {
+        for (batch, batch_vectors) in wave.chunks(batch_size).zip(wave_vectors.chunks(batch_size)) {
             let quantized = batch_vectors
                 .iter()
                 .map(|vector| quantize_vector(vector))
@@ -686,6 +862,9 @@ fn inventory(root: &Path) -> Result<Vec<InstalledFile>, AppError> {
             .path()
             .strip_prefix(root)
             .map_err(|error| AppError::model(error.to_string()))?;
+        if path.starts_with(COREML_CACHE_DIRECTORY) {
+            continue;
+        }
         let metadata = fs::metadata(entry.path()).map_err(AppError::io)?;
         files.push(InstalledFile {
             path: path.to_string_lossy().into_owned(),

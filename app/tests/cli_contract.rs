@@ -72,6 +72,7 @@ fn create_valid_model_marker(root: &Path) {
             "embedding_model": "AllMiniLML6V2Q",
             "reranker_model": "jinaai/jina-reranker-v1-turbo-en",
             "embedding_dimensions": 384,
+            "coreml_embedding": cfg!(all(target_os = "macos", target_arch = "aarch64")),
             "files": [{"path": "dummy-model", "size": 1}]
         }))
         .expect("model marker JSON"),
@@ -119,17 +120,22 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
 }
 
 fn current_embedding_generation() -> String {
-    blake3::hash(
+    let specification = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        concat!(
+            "fastembed=6.0.1;model=AllMiniLML6V2Q;",
+            "backend=coreml-fp32;batch=32;sequence=512;",
+            "vector=i8-per-vector-symmetric;",
+            "cosine=quantized-flat-exact;schema=4"
+        )
+    } else {
         concat!(
             "fastembed=6.0.1;model=AllMiniLML6V2Q;",
             "batch=8;workers=8;threads=2;",
             "vector=i8-per-vector-symmetric;",
             "cosine=quantized-flat-exact;schema=3"
         )
-        .as_bytes(),
-    )
-    .to_hex()
-    .to_string()
+    };
+    blake3::hash(specification.as_bytes()).to_hex().to_string()
 }
 
 fn write_config(path: &Path, local_node: &str, claude_root: &Path, codex_root: &Path) {
