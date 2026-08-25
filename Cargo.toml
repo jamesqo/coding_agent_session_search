@@ -33,7 +33,6 @@ fastembed = { version = "6.0.1", default-features = false, features = ["hf-hub-r
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-thiserror = "2.0.18"
 walkdir = "2.5.0"
 
 [dev-dependencies]

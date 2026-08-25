@@ -292,7 +292,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "veritas-test-macros",
  "walkdir",
 ]

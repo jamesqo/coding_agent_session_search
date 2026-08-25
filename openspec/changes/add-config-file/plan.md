@@ -362,7 +362,7 @@ reads legacy environment inputs independently.
   All 17 changed federation evidence links were semantically reviewed and
   approved under the user's delegated authority.
 
-- [ ] **PH-4 — Consolidate repository code and proof.** Depends on: PH-3.
+- [x] **PH-4 — Consolidate repository code and proof.** Depends on: PH-3.
   Remove obsolete environment/provider helpers, tests, and docs; collapse
   temporary resolution seams; update help and example configuration; and
   confirm no new abstraction or dependency survived. Exit: zero legacy
@@ -374,7 +374,7 @@ reads legacy environment inputs independently.
   records.
 
   **PH-4 execution contract — approved under the plan's existing authority.**
-  Status: in progress. Depends on: completed PH-3. Consumes the finished
+  Status: complete. Depends on: completed PH-3. Consumes the finished
   two-provider configuration, indexing, and federation paths. Produces one
   accurate public README and repository metadata surface with no legacy
   provider/environment claims or temporary compatibility seams. Owns README,
@@ -393,6 +393,15 @@ reads legacy environment inputs independently.
      semantically review every changed link under delegated authority, and
      record the final repository state before rollout.
 
+  Completion record: complete on 2026-08-25. The maintained README and project
+  context now describe exactly Claude Code, Codex, mandatory semantic search,
+  configured federation, and the 90-day default. Obsolete provider/environment
+  instructions and duplicate no-feature CI jobs are gone, the unused direct
+  `thiserror` dependency was removed, and CLI help names configured nodes
+  consistently. The final gate passed 83/83 Nextest tests with two intentionally
+  skipped, strict Clippy, rustfmt, doctests, and strict OpenSpec validation.
+  Changed evidence was reviewed and is current under delegated authority.
+
 - [ ] **PH-5 — Roll out and prove the three-machine fleet.** Depends on: PH-4
   and separate external-write authority. Create and test a restorable database
   backup on Xenia, dev-macbook, and personal-macbook. Stage one validated config
@@ -402,6 +411,16 @@ reads legacy environment inputs independently.
   hybrid search, default three-node federation, explicit subset, and remote
   view. Exit: backup/restore path recorded, deployment green, and live smoke
   results recorded. Owns deployment configuration/state and rollout records.
+
+  **PH-5 execution contract — approved by the user's standing deployment
+  authority.** Status: in progress. Depends on: completed PH-4. Consume the
+  pushed `main` deployment workflow and the validated version-1 schema. Back up
+  any existing database and configuration before replacement, stage a
+  machine-specific config atomically, wait for the main-branch CI/deployment,
+  then prove local status/search before configured indexing and federation.
+  Never copy databases between nodes; each node remains authoritative for its
+  own histories. Record commands, backup locations, revisions, and measured
+  smoke/performance results in the rollout record.
 
 Dependency edges: `PH-1 → PH-2 → PH-3 → PH-4 → PH-5`. Initial ready set:
 `PH-1`. Native tests within a phase run in parallel through Nextest. Fleet

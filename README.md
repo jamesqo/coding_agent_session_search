@@ -1,56 +1,93 @@
 # cass
 
-`cass` is a local, JSON-only search CLI for Claude Code, Codex, current
-OpenCode, GitHub Copilot CLI, Hermes Agent, and Pi histories. It stores
-normalized conversations in SQLite, uses SQLite FTS5 for
-lexical retrieval, and optionally adds local FastEmbed semantic retrieval plus
-cross-encoder reranking after explicit model installation.
+`cass` is a small, JSON-only search CLI for Claude Code and Codex JSONL
+histories. SQLite is the canonical store; SQLite FTS5, local FastEmbed
+embeddings, reciprocal-rank fusion, and bounded cross-encoder reranking provide
+hybrid retrieval. CASS can also federate searches and views across configured
+machines over SSH.
 
 ## Commands
 
 ```text
-cass index [--full]
-cass search <query> [--limit N] [--provider PROVIDER] [--days N]
-cass view <message-id> [--context N]
+cass index [--full] [--provider claude-code|codex]... [--since-days N|--all-history]
+cass search <query> [--node NAME]... [--limit N] [--provider PROVIDER] [--days N]
+cass view <message-id> [--node NAME] [--context N]
 cass status
 cass forget <conversation-id>
 cass models install
 ```
 
-All operational commands emit one JSON value. Bare `cass` prints concise help.
-Use `--db PATH` to select the canonical SQLite database and `--models-dir PATH`
-to select model assets.
+All operational commands emit one JSON value. Bare `cass` prints help. Global
+options are `--config PATH`, `--local-node NAME`, `--db PATH`, and
+`--models-dir PATH`.
 
-## Discovery
+## Models and indexing
 
-Default sources are the current local stores under `~/.claude`, `~/.codex`,
-`~/.local/share/opencode`, `~/.copilot`, `~/.hermes`, and `~/.pi`. Override
-them with the corresponding `CASS_<PROVIDER>_ROOTS` environment variable,
-using a platform-separated path list. OpenCode and Hermes use their current
-SQLite schemas; Copilot uses CLI `events.jsonl`; the remaining providers use
-their current JSONL stores. Legacy IDE, cloud, and alternate-store formats are
-not scanned.
+Search is semantic by default and has no production lexical-only mode. Install
+models explicitly, then build the local index:
 
-## Search Behavior
+```bash
+cass models install
+cass index
+```
 
-- SQLite is canonical; FTS rows and embeddings are rebuildable derived state.
-- Search works immediately in lexical mode.
-- `cass models install` is the only command that downloads model assets.
-- Once models are installed and `cass index` has built embeddings, search uses
-  exact cosine candidates, reciprocal-rank fusion, and bounded reranking.
-- Search reports `realized_mode` and `fallback_mode` truthfully in JSON.
-- Ordinary refreshes fingerprint sources and messages, skip unchanged input,
-  and embed only added or changed messages in bounded batches.
-- Embeddings carry a model/vector-schema generation hash. Search excludes stale
-  generations immediately and the next index re-embeds them.
-- `forget` writes a durable tombstone. Complete scans purge disappeared
-  sources; incomplete scans preserve committed state.
+No other command downloads models. Indexing fingerprints sources and messages,
+skips unchanged input, updates FTS incrementally for small changes, embeds only
+new or changed searchable messages, and excludes raw tool output from FTS and
+embeddings while preserving it for `view`. `--full` rebuilds derived search
+state. The default source horizon is 90 days; `--since-days N` overrides it and
+`--all-history` removes it for one run.
 
-Semantic support is enabled in ordinary and release builds. For a faster
-lexical-only development build, use `cargo build --no-default-features`; the
-same commands remain available and report semantic support as unavailable.
+Without a configuration file, CASS indexes these built-in roots when present:
 
-There is no TUI, export, daemon, remote sync, watch mode, analytics platform,
+- Claude Code: `~/.claude/projects`, `~/.config/claude/projects`
+- Codex: `~/.codex/sessions`, `~/.local/share/codex/sessions`
+
+## Configuration
+
+CASS reads `config.json` from the platform CASS configuration directory. Use
+`cass status` to see the resolved path, or pass `--config PATH` explicitly.
+The file is strict, versioned JSON. Provider presence enables that provider for
+the node; roots must be absolute. `since_days` defaults to 90 and may be `null`
+for all history.
+
+```json
+{
+  "version": 1,
+  "local_node": "xenia",
+  "nodes": [
+    {
+      "name": "xenia",
+      "ssh": "xenia",
+      "search": true,
+      "providers": {
+        "claude-code": {"roots": ["/home/james/.claude/projects"]},
+        "codex": {"roots": ["/home/james/.codex/sessions"]}
+      },
+      "index": {"since_days": 90}
+    },
+    {
+      "name": "dev-macbook",
+      "ssh": "dev-macbook",
+      "search": true,
+      "providers": {
+        "claude-code": {"roots": ["/Users/jko/.claude/projects"]},
+        "codex": {"roots": ["/Users/jko/.codex/sessions"]}
+      }
+    }
+  ]
+}
+```
+
+The configured `local_node` selects this machine's roots and indexing horizon;
+`--local-node` overrides that identity. CLI indexing flags override the local
+node settings. A search without `--node` contacts every other node with
+`"search": true`; repeated `--node NAME` values replace that default set and
+may explicitly select a node whose `search` value is false. Logical node names
+are reported in results while `ssh` supplies the transport destination.
+
+There are no provider or federation environment-variable overrides. There is
+also no TUI, export, daemon, remote sync, watch mode, analytics platform,
 provider registry, compatibility layer, or alternate output encoding.
 
 ## Verification
@@ -67,12 +104,11 @@ The real-model integration test is ignored by default and requires
 
 ## Automatic deployment
 
-Every push to `main` builds the semantic-enabled Linux x86-64 and Apple Silicon
-binaries in GitHub Actions, then atomically deploys `cass` to `~/.local/bin` on
-Xenia, `dev-macbook`, and `personal-macbook` over Tailscale. The macOS binary is
+Every push to `main` builds the Linux x86-64 and Apple Silicon binaries in
+GitHub Actions, then atomically deploys `cass` to `~/.local/bin` on Xenia,
+dev-macbook, and personal-macbook over Tailscale. The macOS binary is
 cross-compiled on the Linux runner with `cargo-zigbuild`; destination machines
-need neither this repository nor a Rust toolchain. Cargo downloads and native,
-Linux, and Darwin build artifacts are cached by lockfile and toolchain.
+need neither this repository nor a Rust toolchain.
 
 Deployment requires `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`,
 `DEPLOY_SSH_PRIVATE_KEY`, and `DEPLOY_SSH_KNOWN_HOSTS` repository secrets.

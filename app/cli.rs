@@ -67,7 +67,7 @@ enum Command {
         #[arg(long)]
         days: Option<u32>,
         /// Search an SSH node in addition to this machine.
-        #[arg(long, value_name = "ALIAS")]
+        #[arg(long, value_name = "NAME")]
         node: Vec<String>,
         #[arg(long, hide = true)]
         federation_request: bool,
@@ -78,7 +78,7 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         context: u32,
         /// Read the message from an SSH node.
-        #[arg(long, value_name = "ALIAS")]
+        #[arg(long, value_name = "NAME")]
         node: Option<String>,
         #[arg(long, hide = true)]
         federation_request: bool,

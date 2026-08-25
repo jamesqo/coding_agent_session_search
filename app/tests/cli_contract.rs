@@ -1042,7 +1042,8 @@ fn cargo_and_ci_make_semantic_support_unconditional() {
     assert!(manifest.contains("fastembed = { version = \"6.0.1\", default-features = false"));
     assert!(!manifest.contains("optional = true"));
     assert!(!manifest.contains("semantic = ["));
-    assert!(ci.contains("cargo nextest run --profile ci --no-default-features"));
+    assert!(ci.contains("cargo nextest run --profile ci"));
+    assert!(!ci.contains("--no-default-features"));
     assert!(release.contains("cargo build --release --locked"));
     assert!(!root.join("app/semantic_disabled.rs").exists());
 }
@@ -1057,6 +1058,10 @@ fn maintained_repository_is_independent_and_minimal() {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo manifest");
     for removed in ["franken", "asupersync", "toon", "msgpack"] {
         assert!(!manifest.to_ascii_lowercase().contains(removed));
+    }
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
+    for removed in ["OpenCode", "Copilot", "Hermes", "Pi histories"] {
+        assert!(!readme.contains(removed), "stale provider docs: {removed}");
     }
 }
 

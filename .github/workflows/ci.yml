@@ -33,5 +33,3 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo nextest run --profile ci
       - run: cargo test --doc
-      - run: cargo check --all-targets --no-default-features
-      - run: cargo nextest run --profile ci --no-default-features
