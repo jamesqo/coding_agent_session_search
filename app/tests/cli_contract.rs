@@ -16,6 +16,90 @@ fn run_json(arguments: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
+fn create_opencode_fixture(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("OpenCode fixture database");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                directory TEXT NOT NULL, title TEXT NOT NULL,
+                time_created INTEGER, time_updated INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER, data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER,
+                data TEXT NOT NULL
+            );
+            INSERT INTO session VALUES
+                ('open-session', 'project-1', '/work/open', 'OpenCode proof',
+                 1700000000000, 1700000002000);
+            INSERT INTO message VALUES
+                ('open-user', 'open-session', 1700000001000,
+                 '{"role":"user"}'),
+                ('open-assistant', 'open-session', 1700000002000,
+                 '{"role":"assistant"}');
+            INSERT INTO part VALUES
+                ('part-user', 'open-user', 'open-session', 1700000001000,
+                 '{"type":"text","text":"locate the opalescent-otter"}'),
+                ('part-assistant', 'open-assistant', 'open-session', 1700000002000,
+                 '{"type":"text","text":"the otter is in OpenCode"}'),
+                ('part-bad', 'open-assistant', 'open-session', 1700000002001,
+                 'not-json');
+            "#,
+        )
+        .expect("OpenCode fixture schema");
+}
+
+fn create_copilot_fixture(root: &std::path::Path) {
+    let session = root.join("copilot-session");
+    std::fs::create_dir_all(&session).expect("Copilot session root");
+    std::fs::write(
+        session.join("events.jsonl"),
+        concat!(
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"find the cerulean-ibis\"},\"timestamp\":\"2026-03-01T10:00:01Z\"}\n",
+            "not-json\n",
+            "{\"type\":\"tool.execution_start\",\"data\":{\"content\":\"ignore me\"}}\n",
+            "{\"type\":\"assistant.message\",\"data\":{\"content\":\"the ibis is in Copilot CLI\"},\"timestamp\":\"2026-03-01T10:00:02Z\"}\n",
+        ),
+    )
+    .expect("Copilot fixture");
+}
+
+fn create_hermes_fixture(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("Hermes fixture database");
+    connection
+        .execute_batch(
+            r"
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT,
+                started_at REAL NOT NULL, ended_at REAL
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT,
+                reasoning TEXT, timestamp REAL NOT NULL
+            );
+            INSERT INTO sessions VALUES
+                ('hermes-session', 'cli', 'Hermes proof',
+                 1700000000.0, 1700000002.0);
+            INSERT INTO messages(session_id, role, content, reasoning, timestamp)
+                VALUES
+                ('hermes-session', 'session_meta', 'ignore metadata', NULL,
+                 1700000000.0),
+                ('hermes-session', 'user', 'locate the vermilion-vicuna', NULL,
+                 1700000001.0),
+                ('hermes-session', 'assistant', 'the vicuna is in Hermes',
+                 'checked canonical storage', 1700000002.0);
+            ",
+        )
+        .expect("Hermes fixture schema");
+}
+
 // Veritas claim: cli/bare-invocation-prints-help
 #[test]
 fn bare_invocation_prints_help_without_starting_an_interface() {
@@ -99,6 +183,12 @@ fn index_search_view_and_forget_supported_histories() {
         claude_root,
         "--codex-root",
         codex_root,
+        "--opencode-db",
+        codex_root,
+        "--copilot-root",
+        codex_root,
+        "--hermes-db",
+        codex_root,
     ]);
     assert_eq!(indexed["indexed_conversations"], 2);
     assert_eq!(indexed["indexed_messages"], 3);
@@ -125,6 +215,129 @@ fn index_search_view_and_forget_supported_histories() {
     assert_eq!(absent["results"].as_array().map(Vec::len), Some(0));
 }
 
+// Veritas claims: ingestion/provider-boundary,
+// ingestion/supported-jsonl-indexes, ingestion/malformed-records-do-not-panic
+#[test]
+fn opencode_and_copilot_cli_histories_are_searchable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let claude_root = directory.path().join("claude");
+    let codex_root = directory.path().join("codex");
+    let copilot_root = directory.path().join("session-state");
+    std::fs::create_dir_all(&claude_root).expect("Claude root");
+    std::fs::create_dir_all(&codex_root).expect("Codex root");
+
+    let opencode_db = directory.path().join("opencode.db");
+    create_opencode_fixture(&opencode_db);
+    create_copilot_fixture(&copilot_root);
+
+    let database = directory.path().join("cass.sqlite3");
+    let database = database.to_str().expect("UTF-8 database path");
+    let indexed = run_json(&[
+        "--db",
+        database,
+        "index",
+        "--full",
+        "--claude-root",
+        claude_root.to_str().expect("UTF-8 Claude path"),
+        "--codex-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--opencode-db",
+        opencode_db.to_str().expect("UTF-8 OpenCode path"),
+        "--copilot-root",
+        copilot_root.to_str().expect("UTF-8 Copilot path"),
+        "--hermes-db",
+        claude_root.to_str().expect("UTF-8 Claude path"),
+    ]);
+    assert_eq!(indexed["indexed_conversations"], 2);
+    assert_eq!(indexed["indexed_messages"], 4);
+    assert_eq!(indexed["scanned_files"], 2);
+    assert_eq!(indexed["malformed_records"], 2);
+
+    for (query, provider, conversation_id) in [
+        ("opalescent", "opencode", "open-session"),
+        ("cerulean", "github-copilot", "copilot-session"),
+    ] {
+        let found = run_json(&["--db", database, "search", query, "--provider", provider]);
+        assert_eq!(found["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(found["results"][0]["conversation_id"], conversation_id);
+        let message_id = found["results"][0]["id"].as_str().expect("message ID");
+        let viewed = run_json(&["--db", database, "view", message_id, "--context", "10"]);
+        assert_eq!(viewed["messages"].as_array().map(Vec::len), Some(2));
+    }
+
+    let reindexed = run_json(&[
+        "--db",
+        database,
+        "index",
+        "--full",
+        "--claude-root",
+        claude_root.to_str().expect("UTF-8 Claude path"),
+        "--codex-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--opencode-db",
+        opencode_db.to_str().expect("UTF-8 OpenCode path"),
+        "--copilot-root",
+        copilot_root.to_str().expect("UTF-8 Copilot path"),
+        "--hermes-db",
+        claude_root.to_str().expect("UTF-8 Claude path"),
+    ]);
+    assert_eq!(reindexed["indexed_conversations"], 2);
+    assert_eq!(reindexed["indexed_messages"], 4);
+}
+
+// Veritas claims: ingestion/provider-boundary,
+// ingestion/supported-jsonl-indexes
+#[test]
+fn hermes_histories_are_searchable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let empty_root = directory.path().join("empty");
+    std::fs::create_dir_all(&empty_root).expect("empty provider root");
+    let hermes_db = directory.path().join("state.db");
+    create_hermes_fixture(&hermes_db);
+    let database = directory.path().join("cass.sqlite3");
+    let database = database.to_str().expect("UTF-8 database path");
+    let empty_root = empty_root.to_str().expect("UTF-8 empty path");
+    let hermes_db = hermes_db.to_str().expect("UTF-8 Hermes path");
+    let arguments = [
+        "--db",
+        database,
+        "index",
+        "--full",
+        "--claude-root",
+        empty_root,
+        "--codex-root",
+        empty_root,
+        "--opencode-db",
+        empty_root,
+        "--copilot-root",
+        empty_root,
+        "--hermes-db",
+        hermes_db,
+    ];
+    let indexed = run_json(&arguments);
+    assert_eq!(indexed["indexed_conversations"], 1);
+    assert_eq!(indexed["indexed_messages"], 2);
+    assert_eq!(indexed["scanned_files"], 1);
+
+    let found = run_json(&[
+        "--db",
+        database,
+        "search",
+        "vermilion",
+        "--provider",
+        "hermes",
+    ]);
+    assert_eq!(found["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(found["results"][0]["conversation_id"], "hermes-session");
+    let message_id = found["results"][0]["id"].as_str().expect("message ID");
+    let viewed = run_json(&["--db", database, "view", message_id, "--context", "10"]);
+    assert_eq!(viewed["messages"].as_array().map(Vec::len), Some(2));
+
+    let reindexed = run_json(&arguments);
+    assert_eq!(reindexed["indexed_conversations"], 1);
+    assert_eq!(reindexed["indexed_messages"], 2);
+}
+
 // Veritas claim: ingestion/unsupported-providers-ignored
 #[test]
 fn unsupported_provider_records_are_ignored() {
@@ -147,6 +360,12 @@ fn unsupported_provider_records_are_ignored() {
         "--claude-root",
         claude_root.to_str().expect("UTF-8 Claude path"),
         "--codex-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--opencode-db",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--copilot-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--hermes-db",
         codex_root.to_str().expect("UTF-8 Codex path"),
     ]);
 
@@ -182,6 +401,12 @@ fn malformed_records_are_bounded_and_reindexing_is_idempotent() {
         "--claude-root",
         claude_root.to_str().expect("UTF-8 Claude path"),
         "--codex-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--opencode-db",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--copilot-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--hermes-db",
         codex_root.to_str().expect("UTF-8 Codex path"),
     ];
     let first = run_json(&arguments);
@@ -230,6 +455,12 @@ fn search_without_models_falls_back_without_downloading() {
             "--claude-root",
             claude_root.to_str().expect("UTF-8 Claude path"),
             "--codex-root",
+            codex_root.to_str().expect("UTF-8 Codex path"),
+            "--opencode-db",
+            codex_root.to_str().expect("UTF-8 Codex path"),
+            "--copilot-root",
+            codex_root.to_str().expect("UTF-8 Codex path"),
+            "--hermes-db",
             codex_root.to_str().expect("UTF-8 Codex path"),
         ])
         .assert()
@@ -287,6 +518,12 @@ fn hybrid_search_with_installed_models() {
         claude_root.to_str().expect("UTF-8 Claude path"),
         "--codex-root",
         codex_root.to_str().expect("UTF-8 Codex path"),
+        "--opencode-db",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--copilot-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--hermes-db",
+        codex_root.to_str().expect("UTF-8 Codex path"),
     ]);
     assert_eq!(indexed["embeddings"], 3);
     assert_eq!(indexed["realized_mode"], "hybrid");
@@ -337,6 +574,12 @@ fn lexical_search_applies_recency_filter() {
         "--claude-root",
         claude_root.to_str().expect("UTF-8 Claude path"),
         "--codex-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--opencode-db",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--copilot-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+        "--hermes-db",
         codex_root.to_str().expect("UTF-8 Codex path"),
     ]);
 

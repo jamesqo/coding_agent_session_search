@@ -1,9 +1,10 @@
 # cass
 
-`cass` is a local, JSON-only search CLI for Claude Code and Codex histories.
-It stores normalized conversations in SQLite, uses SQLite FTS5 for lexical
-retrieval, and optionally adds local semantic retrieval plus cross-encoder
-reranking after an explicit model installation.
+`cass` is a local, JSON-only search CLI for Claude Code, Codex, OpenCode,
+GitHub Copilot CLI, and Hermes Agent histories. It stores normalized
+conversations in SQLite, uses SQLite FTS5 for lexical retrieval, and optionally
+adds local semantic retrieval plus cross-encoder reranking after an explicit
+model installation.
 
 ## Build and test
 
@@ -27,8 +28,10 @@ CASS_TEST_MODELS_DIR=/path/to/cass-models \
 ## Commands
 
 ```text
-cass index [--full] [--claude-root PATH] [--codex-root PATH]
-cass search <query> [--limit N] [--provider claude-code|codex] [--days N]
+cass index [--full] [--claude-root PATH] [--codex-root PATH] \
+  [--opencode-db PATH] [--copilot-root PATH] [--hermes-db PATH]
+cass search <query> [--limit N] \
+  [--provider claude-code|codex|opencode|github-copilot|hermes] [--days N]
 cass view <message-id> [--context N]
 cass status
 cass forget <conversation-id>
@@ -39,8 +42,12 @@ All operational commands emit one JSON value. Bare `cass` prints concise help.
 Use `--db PATH` to select the canonical SQLite database and `--models-dir PATH`
 to select model assets.
 
-Default history roots are `~/.claude/projects` and `~/.codex/sessions`. Only
-Claude Code and Codex JSONL files are supported.
+Default history sources are `~/.claude/projects`, `~/.codex/sessions`,
+`~/.local/share/opencode/opencode.db`, and
+`~/.copilot/session-state`, plus `~/.hermes/state.db`. OpenCode and Hermes
+support target their current SQLite schemas; GitHub Copilot support targets
+Copilot CLI `events.jsonl` histories. Legacy file storage, VS Code Copilot Chat
+storage, and cloud history are not scanned.
 
 ## Search behavior
 

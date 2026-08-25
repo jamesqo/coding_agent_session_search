@@ -1,7 +1,8 @@
 ## Purpose
 
 Provide a small, independent JSON CLI that indexes and searches local Claude
-Code and Codex conversations with lexical and semantic retrieval.
+Code, Codex, OpenCode, GitHub Copilot CLI, and Hermes Agent conversations with
+lexical and semantic retrieval.
 
 ## ADDED Requirements
 
@@ -26,19 +27,21 @@ The system SHALL expose only `index`, `search`, `view`, `status`, `forget`, and
 ### Requirement: Provider boundary
 
 <!-- claim: ingestion/provider-boundary -->
-The system SHALL discover and normalize only Claude Code and Codex JSONL
-histories into CASS-owned canonical conversation and message records.
+The system SHALL discover and normalize current Claude Code and Codex JSONL
+histories, OpenCode and Hermes SQLite histories, and GitHub Copilot CLI JSONL
+event logs into CASS-owned canonical conversation and message records.
 
 #### Scenario: Supported histories
 
 <!-- claim: ingestion/supported-jsonl-indexes -->
-- **WHEN** configured roots contain representative Claude Code and Codex histories
+- **WHEN** configured roots contain representative histories for all five
+  supported providers
 - **THEN** `cass index` persists their conversations and messages with stable IDs
 
 #### Scenario: Unsupported provider
 
 <!-- claim: ingestion/unsupported-providers-ignored -->
-- **WHEN** a root contains only an OpenCode or another removed-provider history
+- **WHEN** a root contains only another provider's history
 - **THEN** no conversation from that provider is indexed or advertised as supported
 
 #### Scenario: Malformed line

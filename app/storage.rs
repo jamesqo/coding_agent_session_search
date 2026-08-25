@@ -12,7 +12,11 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
-    provider TEXT NOT NULL CHECK (provider IN ('claude-code', 'codex')),
+    provider TEXT NOT NULL CHECK (
+        provider IN (
+            'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes'
+        )
+    ),
     source_path TEXT NOT NULL UNIQUE,
     title TEXT,
     created_at INTEGER,

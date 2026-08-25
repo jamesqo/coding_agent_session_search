@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
+use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -14,6 +15,9 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
 pub(crate) struct ProviderRoots {
     claude: PathBuf,
     codex: PathBuf,
+    opencode: PathBuf,
+    copilot: PathBuf,
+    hermes: PathBuf,
 }
 
 pub(crate) struct IndexSummary {
@@ -47,11 +51,20 @@ struct ParsedFile {
 type ExtractedMessage = (Option<String>, String, String, Option<i64>, Option<String>);
 
 impl ProviderRoots {
-    pub(crate) fn new(claude: Option<PathBuf>, codex: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        claude: Option<PathBuf>,
+        codex: Option<PathBuf>,
+        opencode: Option<PathBuf>,
+        copilot: Option<PathBuf>,
+        hermes: Option<PathBuf>,
+    ) -> Self {
         let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
         Self {
             claude: claude.unwrap_or_else(|| home.join(".claude/projects")),
             codex: codex.unwrap_or_else(|| home.join(".codex/sessions")),
+            opencode: opencode.unwrap_or_else(|| home.join(".local/share/opencode/opencode.db")),
+            copilot: copilot.unwrap_or_else(|| home.join(".copilot/session-state")),
+            hermes: hermes.unwrap_or_else(|| home.join(".hermes/state.db")),
         }
     }
 }
@@ -91,7 +104,293 @@ pub(crate) fn index(
             }
         }
     }
+    if roots.opencode.is_file() {
+        summary.scanned_files += 1;
+        let parsed = parse_opencode(&roots.opencode)?;
+        summary.malformed_records += parsed.malformed_records;
+        for conversation in parsed.conversations {
+            storage.replace_conversation(&conversation)?;
+        }
+    }
+    if roots.copilot.is_dir() {
+        for entry in WalkDir::new(&roots.copilot).follow_links(false) {
+            let entry = entry.map_err(|error| AppError::internal(error.to_string()))?;
+            let path = entry.path();
+            if !entry.file_type().is_file()
+                || path.file_name().and_then(|name| name.to_str()) != Some("events.jsonl")
+            {
+                continue;
+            }
+            summary.scanned_files += 1;
+            let parsed = parse_copilot(path)?;
+            summary.malformed_records += parsed.malformed_records;
+            if let Some(conversation) = parsed.conversation {
+                storage.replace_conversation(&conversation)?;
+            }
+        }
+    }
+    if roots.hermes.is_file() {
+        summary.scanned_files += 1;
+        for conversation in parse_hermes(&roots.hermes)? {
+            storage.replace_conversation(&conversation)?;
+        }
+    }
     Ok(summary)
+}
+
+struct ParsedDatabase {
+    conversations: Vec<Conversation>,
+    malformed_records: u64,
+}
+
+fn parse_opencode(path: &Path) -> Result<ParsedDatabase, AppError> {
+    let connection = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(AppError::database)?;
+    let mut conversations = Vec::new();
+    let mut malformed_records = 0;
+    for (session_id, title, created_at, updated_at) in opencode_sessions(&connection)? {
+        let mut message_query = connection
+            .prepare(
+                "SELECT id, data, time_created
+                 FROM message WHERE session_id = ?1
+                 ORDER BY time_created, id",
+            )
+            .map_err(AppError::database)?;
+        let rows = message_query
+            .query_map([&session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(message_query);
+
+        let mut messages = Vec::new();
+        for (source_id, message_data, message_created_at) in rows {
+            let role = if let Ok(data) = serde_json::from_str::<Value>(&message_data) {
+                data.get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                    .to_owned()
+            } else {
+                malformed_records += 1;
+                continue;
+            };
+            let Some(content) =
+                opencode_message_content(&connection, &source_id, &mut malformed_records)?
+            else {
+                continue;
+            };
+            let ordinal = i64::try_from(messages.len())
+                .map_err(|_| AppError::internal("conversation contains too many messages"))?;
+            messages.push(NormalizedMessage {
+                id: stable_id(
+                    "message",
+                    &["opencode", &path.to_string_lossy(), &source_id],
+                ),
+                ordinal,
+                role,
+                content,
+                created_at: message_created_at,
+            });
+        }
+        if messages.is_empty() {
+            continue;
+        }
+        conversations.push(Conversation {
+            id: session_id.clone(),
+            provider: "opencode",
+            source_path: PathBuf::from(format!("{}#{session_id}", path.display())),
+            title,
+            created_at,
+            updated_at,
+            messages,
+        });
+    }
+    Ok(ParsedDatabase {
+        conversations,
+        malformed_records,
+    })
+}
+
+type OpenCodeSession = (String, Option<String>, Option<i64>, Option<i64>);
+
+fn opencode_sessions(connection: &SqliteConnection) -> Result<Vec<OpenCodeSession>, AppError> {
+    let mut query = connection
+        .prepare(
+            "SELECT id, title, time_created, time_updated
+             FROM session ORDER BY time_created, id",
+        )
+        .map_err(AppError::database)?;
+    query
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)
+}
+
+fn opencode_message_content(
+    connection: &SqliteConnection,
+    message_id: &str,
+    malformed_records: &mut u64,
+) -> Result<Option<String>, AppError> {
+    let mut query = connection
+        .prepare(
+            "SELECT data FROM part WHERE message_id = ?1
+             ORDER BY time_created, id",
+        )
+        .map_err(AppError::database)?;
+    let parts = query
+        .query_map([message_id], |row| row.get::<_, String>(0))
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)?;
+    let mut content = Vec::new();
+    for part in parts {
+        if let Ok(data) = serde_json::from_str::<Value>(&part) {
+            let part_type = data.get("type").and_then(Value::as_str);
+            if matches!(part_type, Some("text" | "reasoning"))
+                && let Some(text) = data.get("text").and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                content.push(text.to_owned());
+            }
+        } else {
+            *malformed_records += 1;
+        }
+    }
+    Ok((!content.is_empty()).then(|| content.join("\n")))
+}
+
+fn parse_copilot(path: &Path) -> Result<ParsedFile, AppError> {
+    let mut parsed = parse_jsonl(path, "github-copilot", |raw| {
+        let role = match raw.get("type").and_then(Value::as_str)? {
+            "user.message" => "user",
+            "assistant.message" => "assistant",
+            _ => return None,
+        };
+        let payload = raw.get("data").unwrap_or(raw);
+        let content = payload
+            .get("content")
+            .or_else(|| payload.get("message"))
+            .or_else(|| payload.get("text"))
+            .and_then(flatten_content)?;
+        Some((
+            raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            role.to_owned(),
+            content,
+            parse_timestamp(raw.get("timestamp")),
+            None,
+        ))
+    })?;
+    if let Some(conversation) = &mut parsed.conversation
+        && let Some(session_id) = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+    {
+        session_id.clone_into(&mut conversation.id);
+    }
+    Ok(parsed)
+}
+
+fn parse_hermes(path: &Path) -> Result<Vec<Conversation>, AppError> {
+    let connection = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(AppError::database)?;
+    let mut query = connection
+        .prepare(
+            "SELECT id, title,
+                    CAST(started_at * 1000 AS INTEGER),
+                    CAST(ended_at * 1000 AS INTEGER)
+             FROM sessions ORDER BY started_at, id",
+        )
+        .map_err(AppError::database)?;
+    let sessions = query
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::database)?;
+    drop(query);
+
+    let mut conversations = Vec::new();
+    for (session_id, title, created_at, updated_at) in sessions {
+        let mut message_query = connection
+            .prepare(
+                "SELECT id, role, content, reasoning,
+                        CAST(timestamp * 1000 AS INTEGER)
+                 FROM messages WHERE session_id = ?1
+                 ORDER BY timestamp, id",
+            )
+            .map_err(AppError::database)?;
+        let rows = message_query
+            .query_map([&session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(message_query);
+
+        let mut messages = Vec::new();
+        for (source_id, role, content, reasoning, message_created_at) in rows {
+            if role == "session_meta" {
+                continue;
+            }
+            let content = [content, reasoning]
+                .into_iter()
+                .flatten()
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n[reasoning]\n");
+            if content.is_empty() {
+                continue;
+            }
+            let ordinal = i64::try_from(messages.len())
+                .map_err(|_| AppError::internal("conversation contains too many messages"))?;
+            messages.push(NormalizedMessage {
+                id: stable_id(
+                    "message",
+                    &["hermes", &path.to_string_lossy(), &source_id.to_string()],
+                ),
+                ordinal,
+                role,
+                content,
+                created_at: message_created_at,
+            });
+        }
+        if messages.is_empty() {
+            continue;
+        }
+        conversations.push(Conversation {
+            id: session_id.clone(),
+            provider: "hermes",
+            source_path: PathBuf::from(format!("{}#{session_id}", path.display())),
+            title,
+            created_at,
+            updated_at,
+            messages,
+        });
+    }
+    Ok(conversations)
 }
 
 fn parse_claude(path: &Path) -> Result<ParsedFile, AppError> {

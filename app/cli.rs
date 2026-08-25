@@ -40,6 +40,15 @@ enum Command {
         /// Codex sessions directory.
         #[arg(long, value_name = "PATH")]
         codex_root: Option<PathBuf>,
+        /// Current `OpenCode` SQLite database.
+        #[arg(long, value_name = "PATH")]
+        opencode_db: Option<PathBuf>,
+        /// GitHub Copilot CLI session-state directory.
+        #[arg(long, value_name = "PATH")]
+        copilot_root: Option<PathBuf>,
+        /// Current Hermes Agent SQLite database.
+        #[arg(long, value_name = "PATH")]
+        hermes_db: Option<PathBuf>,
     },
     /// Search indexed messages.
     Search {
@@ -153,11 +162,20 @@ where
             full,
             claude_root,
             codex_root,
+            opencode_db,
+            copilot_root,
+            hermes_db,
         } => index(
             &database_path,
             &models_dir,
             full,
-            &ProviderRoots::new(claude_root, codex_root),
+            &ProviderRoots::new(
+                claude_root,
+                codex_root,
+                opencode_db,
+                copilot_root,
+                hermes_db,
+            ),
         ),
         Command::Search {
             query,

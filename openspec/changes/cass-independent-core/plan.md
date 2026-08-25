@@ -8,9 +8,10 @@ Verification cadence: plan-final
 
 ## Scope
 
-Replace the application in place with a small Rust JSON CLI that indexes only
-Claude Code and Codex JSONL histories, stores canonical records in Rusqlite,
-searches with SQLite FTS5 plus optional semantic retrieval and reranking, and
+Replace the application in place with a small Rust JSON CLI that indexes
+Claude Code and Codex JSONL histories, current OpenCode and Hermes SQLite
+histories, and GitHub Copilot CLI JSONL event logs; stores canonical records in Rusqlite;
+searches with SQLite FTS5 plus optional semantic retrieval and reranking; and
 exposes only `index`, `search`, `view`, `status`, `forget`, and `models install`.
 The legacy implementation is an implementation reference only and will be
 deleted. No compatibility surface is preserved.
@@ -28,7 +29,7 @@ evidence discovery, link review, approval, and terminal Veritas status/report.
 | ID | Decision | Rationale | Consequence |
 |---|---|---|---|
 | PC-1 | Replace the legacy application in place | The approved product boundary deliberately rejects compatibility | Old commands, code, tests, assets, workflows, and documentation are deleted |
-| PC-2 | Preserve only current Claude Code and Codex history readability | These are the only named consumers | Two concrete parsers; no provider trait, registry, or FAD dependency |
+| PC-2 | Preserve current Claude Code, Codex, OpenCode, GitHub Copilot CLI, and Hermes Agent history readability | These are the only named consumers | Five concrete ingestion paths; no provider trait, registry, or FAD dependency |
 | PC-3 | Replace all storage with one current Rusqlite schema | SQLite is canonical and backward compatibility is a non-goal | No Frankensqlite, dual backend, migration museum, or salvage path |
 | PC-4 | Replace search with FTS5 plus one concrete semantic backend | The product requires lexical fallback, semantic retrieval, fusion, and reranking | No Frankensearch, CASS-owned ANN, model registry, or daemon |
 | PC-5 | Remove all human-oriented product surfaces | The stable consumer is an agent using JSON | No TUI, export, alternate encodings, aliases, or presentation framework |
@@ -36,7 +37,8 @@ evidence discovery, link review, approval, and terminal Veritas status/report.
 ## Stack and Target Structure
 
 - `app/cli.rs`: the complete Clap command surface and JSON response boundary.
-- `app/ingestion.rs`: concrete Claude Code and Codex discovery/normalization.
+- `app/ingestion.rs`: concrete Claude Code, Codex, OpenCode, GitHub Copilot
+  CLI, and Hermes Agent discovery/normalization.
 - `app/storage.rs`: current schema, canonical writes, FTS5, context hydration,
   deletion, and embedding persistence.
 - `app/semantic.rs`: one concrete local embedding/reranking backend, exact
@@ -60,8 +62,9 @@ context view, and complete conversation deletion. Foundation: the current
 
 ### Supported-provider ingestion
 
-Outcome: only representative Claude Code and Codex JSONL files are discovered
-and normalized; malformed lines produce bounded diagnostics without panics.
+Outcome: representative Claude Code/Codex JSONL, current OpenCode/Hermes
+SQLite, and GitHub Copilot CLI JSONL histories are discovered and normalized;
+malformed records produce bounded diagnostics without panics.
 Owned claims: `ingestion/*`. Non-goal: a provider abstraction or format
 compatibility beyond observed current histories.
 
@@ -97,11 +100,12 @@ red checks are never deferred.
 
 ## Delivery Plan
 
-Delivery edges: PH-1 -> PH-2 -> PH-3 -> PH-4 -> PH-5. The order is deliberate:
-semantic retrieval consumes canonical messages, deletion follows replacement
-behavior, and final proof consumes the consolidated repository. Initial ready
-set: PH-1. There are no safe parallel write groups because the crate manifest,
-CLI contract, and shared schema are common ownership seams.
+Delivery edges: PH-1 -> PH-2 -> PH-3 -> PH-4 -> PH-5 -> PH-6. The order is
+deliberate: semantic retrieval consumes canonical messages, deletion follows
+replacement behavior, requested provider expansion modifies the consolidated
+core, and final proof consumes the result. Initial ready set: PH-1. There are
+no safe parallel write groups because the crate manifest, CLI contract, and
+shared schema are common ownership seams.
 
 - [x] **PH-1 — Establish independent lexical core.** Consumes the approved
   contract. Produces the `app/` crate composition, JSON CLI, Rusqlite schema,
@@ -130,7 +134,15 @@ CLI contract, and shared schema are common ownership seams.
   fuzz, script, workflow, asset, or stale documentation surface. Owns all
   legacy paths outside the retained replacement and OpenSpec/Veritas contract.
   Exit: dependency/provider scans are clean and Rust LOC ceilings pass.
-- [ ] **PH-5 — Integrated proof and consolidation.** Depends on PH-4. Consumes
+- [x] **PH-5 — Add OpenCode, GitHub Copilot CLI, and Hermes ingestion.** Depends
+  on PH-4. Consumes the consolidated core and produces three concrete ingestion
+  paths, CLI root configuration, canonical storage support, and representative
+  current-format tests without a provider abstraction or compatibility layer.
+  Owns `app/ingestion.rs`, provider additions in `app/cli.rs` and
+  `app/storage.rs`, focused fixtures/tests, and matching documentation. Exit:
+  all three providers index, search, view, filter, reindex, and fail malformed input
+  safely through focused Nextest scenarios.
+- [ ] **PH-6 — Integrated proof and consolidation.** Depends on PH-5. Consumes
   the complete replacement and produces final formatting, strict Clippy,
   full Nextest, doctest, dependency scan, LOC accounting, evidence discovery,
   per-link semantic review, authorized approvals, and terminal Veritas
@@ -165,8 +177,9 @@ Verification role: intermediate
   migration/salvage, watch mode, and any provider abstraction.
 - **Claims and findings:** all `ingestion/*` claims and their current
   `UNCOVERED_CLAIM` findings.
-- **Constraints:** PC-2 and PC-3; only Claude Code and Codex, concrete parsers,
-  one current schema, external data never panics.
+- **Constraints:** the then-current PC-2 boundary covered Claude Code and Codex;
+  concrete parsers, one current schema, and external data never panics. PH-5
+  owns the subsequently approved provider expansion.
 
 #### Execution
 
@@ -178,15 +191,15 @@ Verification role: intermediate
    deterministic IDs, then make the smallest parser changes needed for green.
 3. Run formatting, strict Clippy for all targets, the complete current Nextest
    suite, and doctests. Discovery/status/report are refreshed, while broad
-   evidence linking and approval remain assigned to PH-5 under plan-final.
+   evidence linking and approval remain assigned to PH-6 under plan-final.
 
 #### Proof
 
 - Targeted: `cargo nextest run -E 'test(/ingestion|unsupported|malformed|reindex/)'`
-- Full enabled tests: deferred to PH-5 after the complete current Nextest suite
+- Full enabled tests: deferred to PH-6 after the complete current Nextest suite
   runs as an intermediate regression check.
 - Evidence: Rust producer discovery must retain or increase the current eight
-  declarations; `ingestion/*` links remain pending PH-5 semantic review.
+  declarations; `ingestion/*` links remain pending PH-6 semantic review.
 - Coverage exclusions: none.
 - Veritas: refresh discovery/status/report; do not approve links in this phase.
 
@@ -194,7 +207,7 @@ Verification role: intermediate
 
 - [x] Outcome demonstrated and assigned checks pass for cadence.
 - [x] Runnable evidence freshly discovered; required links remain explicitly
-  assigned to PH-5 review/approval.
+  assigned to PH-6 review/approval.
 - [x] No phase-owned coverage exclusion exists.
 - [x] PH-2 outputs are available to PH-3 and remaining work retains an owner.
 
@@ -211,7 +224,7 @@ without losing valid records, and repeated full indexing does not duplicate
 canonical rows. `cargo nextest run` passed 11/11 tests; strict all-target Clippy,
 formatting, and the library doctest passed. Veritas discovery added three
 evidence declarations and retained eight, with no artifact drift. All claim
-links and approval remain assigned to PH-5; no exclusion or deviation was
+links and approval remain assigned to PH-6; no exclusion or deviation was
 introduced. PH-3 is now ready.
 
 ### PH-3 Execution Contract: Semantic Retrieval and Explicit Models
@@ -263,7 +276,7 @@ Verification role: intermediate
    realized/fallback mode truthfully. Add model-present integration coverage
    without downloading during ordinary test discovery.
 5. Run focused semantic tests, full current Nextest, formatting, strict Clippy,
-   and doctests. Refresh Veritas discovery/status/report; PH-5 retains link
+   and doctests. Refresh Veritas discovery/status/report; PH-6 retains link
    review, approval, and final accumulated proof.
 
 #### Proof
@@ -271,10 +284,10 @@ Verification role: intermediate
 - Targeted: `cargo nextest run -E 'test(/semantic|model|fallback|rrf|cosine/)'`
 - Portability: load both selected models and run one embedding plus rerank on
   Linux amd64 and macOS arm64.
-- Full enabled tests: deferred to PH-5 after the complete current suite runs as
+- Full enabled tests: deferred to PH-6 after the complete current suite runs as
   an intermediate regression check.
 - Evidence: new semantic/model declarations discovered; claim links remain
-  pending PH-5 individual semantic review.
+  pending PH-6 individual semantic review.
 - Coverage exclusions: none.
 - Veritas: refresh discovery/status/report; do not approve links in this phase.
 
@@ -282,7 +295,7 @@ Verification role: intermediate
 
 - [x] Outcome demonstrated and assigned checks pass for cadence.
 - [x] Runnable evidence freshly discovered; required links remain explicitly
-  assigned to PH-5 review/approval.
+  assigned to PH-6 review/approval.
 - [x] No phase-owned coverage exclusion exists.
 - [x] PH-3 outputs are available to PH-4 and remaining work retains an owner.
 
@@ -301,7 +314,7 @@ On Xenia, the model-free Nextest suite passed 16 tests with the model test
 skipped; the explicitly enabled real-model test passed separately. Strict
 all-target Clippy, formatting, and doctests passed. Veritas discovery now sees
 18 evidence declarations with no artifact drift. The 16 uncovered-claim
-findings remain assigned to PH-5 link review and approval. No exclusion was
+findings remain assigned to PH-6 link review and approval. No exclusion was
 introduced. PH-4 is now ready.
 
 ### PH-4 Execution Contract: Delete the Legacy Product
@@ -334,7 +347,7 @@ Verification role: intermediate
 - **Not included:** semantic behavior changes, release publishing, migration or
   compatibility work, evidence-link approval, or OpenSpec archival.
 - **Claims and findings:** `independence/no-dickles-franken-surface` and final
-  size accounting; its current uncovered finding remains assigned to PH-5.
+  size accounting; its current uncovered finding remains assigned to PH-6.
 - **Constraints:** PC-1 and PC-5; deletions are authorized, explicit path lists
   are reviewed before execution, and git history is the recovery mechanism.
 
@@ -351,7 +364,7 @@ Verification role: intermediate
    Count production/test Rust and tracked files.
 4. Run model-free Nextest, the explicitly enabled installed-model test,
    formatting, strict Clippy, doctests, and minimal CI syntax inspection.
-   Refresh Veritas discovery/status/report; PH-5 retains link review and final
+   Refresh Veritas discovery/status/report; PH-6 retains link review and final
    accumulated proof.
 
 #### Proof
@@ -368,7 +381,7 @@ Verification role: intermediate
 
 - [x] Outcome demonstrated and assigned checks pass for cadence.
 - [x] Runnable evidence freshly discovered; required links remain explicitly
-  assigned to PH-5 review/approval.
+  assigned to PH-6 review/approval.
 - [x] No phase-owned coverage exclusion exists.
 - [x] PH-4 outputs are available to PH-5 and remaining work retains an owner.
 
@@ -388,8 +401,166 @@ protects this boundary. On Xenia, 18 model-free Nextest tests and the separately
 enabled real-model test passed; strict all-target Clippy, formatting, doctests,
 diff hygiene, file accounting, LOC accounting, and scans passed. Veritas now
 discovers 19 focused evidence declarations with no artifact drift. The 16
-uncovered claims remain assigned to PH-5 link review and approval. No exclusion
+uncovered claims remain assigned to PH-6 link review and approval. No exclusion
 was introduced. PH-5 is now ready.
+
+### PH-5 Execution Contract: OpenCode, GitHub Copilot CLI, and Hermes Ingestion
+
+Status: approved
+Depends on: PH-4 (implemented)
+Consumes: consolidated core, canonical schema, and concrete
+Claude Code/Codex ingestion
+Produces: current OpenCode, GitHub Copilot CLI, and Hermes discovery,
+normalization, storage, filtering, and focused proof for PH-6
+Owns: `app/ingestion.rs`, provider/root additions in `app/cli.rs` and
+`app/storage.rs`, `app/tests/cli_contract.rs`, `README.md`, and `AGENTS.md`
+Concurrent siblings: none
+Verification cadence: plan-final
+Verification role: intermediate
+
+#### Contract
+
+- **Outcome:** current OpenCode sessions from `opencode.db`, GitHub Copilot CLI
+  sessions from `session-state/<id>/events.jsonl`, and Hermes Agent sessions
+  from `state.db` index into the same canonical records and work through
+  search, provider filters, view, and idempotent reindexing.
+- **Existing foundation:** concrete ingestion functions, stable BLAKE3 IDs,
+  transactional conversation replacement, one Rusqlite schema, and the JSON
+  index/search/view surface remain.
+- **Net-new work:** three explicit roots, read-only OpenCode and Hermes database
+  parsers, a Copilot CLI event parser, five-provider storage constraint,
+  representative fixtures, malformed-record accounting, and concise documentation.
+- **Not included:** provider traits or registries, FAD code, legacy OpenCode or
+  Hermes file storage, VS Code Copilot Chat workspace storage, Copilot cloud
+  history, migrations, remote discovery, or compatibility heuristics.
+- **Claims and findings:** existing `ingestion/*` claims and their uncovered
+  findings; the claim IDs remain stable because the provider requirement is
+  expanded rather than replaced.
+- **Constraints:** PC-2 and PC-3; external provider databases are opened
+  read-only, a malformed row/event cannot panic, and only current documented
+  storage surfaces are accepted.
+
+#### Execution
+
+1. Add representative black-box fixtures for current OpenCode
+   `session`/`message`/`part` tables, Copilot CLI `user.message` plus
+   `assistant.message` events, and Hermes `sessions`/`messages` tables.
+   Establish red tests for index/search/filter/view and idempotent reindexing.
+2. Add explicit CLI roots and concrete parser functions. Open OpenCode and
+   Hermes with Rusqlite read-only flags and normalize textual content; parse
+   Copilot events line-by-line and ignore non-conversation events.
+3. Extend the canonical provider constraint and error accounting without a
+   schema-version or provider abstraction. Update minimal user/developer docs.
+4. Run focused provider Nextest, the model-free suite, formatting, strict
+   Clippy, and doctests. Refresh Veritas discovery/status/report; PH-6 retains
+   link review, approval, fresh-clone proof, and final accumulated gates.
+
+#### Proof
+
+- Targeted: `cargo nextest run -E 'test(/opencode|copilot|hermes/)'`.
+- Native: complete current model-free Nextest, strict Clippy, formatting, and
+  doctests as an intermediate regression check.
+- Evidence: provider scenarios are compiler-discoverable Rust tests;
+  `ingestion/*` links remain pending PH-6 individual semantic review.
+- Coverage exclusions: legacy OpenCode/Hermes storage, VS Code Copilot Chat,
+  and cloud history are scope boundaries, not exclusions from a retained
+  requirement.
+- Veritas: refresh discovery/status/report; do not approve links in this phase.
+
+#### Exit
+
+- [x] Outcome demonstrated and assigned checks pass for cadence.
+- [x] Runnable evidence freshly discovered; required links remain assigned to
+  PH-6 review/approval.
+- [x] No phase-owned coverage exclusion exists.
+- [x] PH-5 outputs are available to PH-6 and remaining work retains an owner.
+
+#### Completion record
+
+Implemented outcome: CASS now discovers current OpenCode `opencode.db`, GitHub
+Copilot CLI `session-state/<id>/events.jsonl`, and Hermes Agent `state.db`
+through three concrete code paths. Both external databases open read-only.
+Provider filters, stable IDs, context view, malformed JSON accounting, skipped
+non-conversation records, and idempotent replacement are exercised by focused
+black-box fixtures. Legacy OpenCode/Hermes storage, VS Code Copilot Chat, and
+cloud history remain outside the approved boundary.
+
+On Xenia, the complete model-free Nextest suite passed 20 tests with one
+explicit-model test skipped; the installed-model hybrid test passed separately.
+Strict all-target Clippy, formatting, doctests, and diff hygiene passed. The
+repository remains 35 tracked files with 2,016 production Rust lines and 653
+test Rust lines. Veritas locked the three approved ingestion-claim wording
+changes and now discovers 21 evidence declarations with zero artifact drift.
+The 16 uncovered claims remain assigned to PH-6 review and approval; no
+coverage exclusion was introduced. PH-6 is now ready.
+
+### PH-6 Execution Contract: Integrated Proof and Consolidation
+
+Status: approved
+Depends on: PH-5
+Consumes: consolidated independent repository and all phase-owned tests
+Produces: reviewed evidence links, terminal gates, and an archive-ready change
+Owns: test citation attributes, temporary Veritas macro vendor path, evidence
+and approval locks, final plan record, and any final proof-only corrections
+Concurrent siblings: none
+Verification cadence: plan-final
+Verification role: plan-final
+
+#### Contract
+
+- **Outcome:** every locked claim is connected to semantically appropriate
+  passing Rust evidence, final native/fresh-clone gates pass, no blocking
+  Veritas finding remains, and all implemented phases become complete.
+- **Existing foundation:** 21 focused evidence declarations, 16 locked claims,
+  clean claim/evidence drift, the Xenia/macOS real-model caches, and the minimal
+  CI workflow remain.
+- **Net-new work:** vendor the exact released `veritas-test-macros` 0.1.0 crate
+  as the documented fallback, add compiler-checked claim attributes, review and
+  approve each link, validate a fresh clone, and record terminal results.
+- **Not included:** product behavior, provider expansion, release publishing,
+  migration compatibility, or Veritas implementation changes.
+- **Claims and findings:** all 16 claims and their current uncovered findings.
+- **Constraints:** no claim is deleted or excluded; each link is reviewed
+  individually; native test success and evidence approval remain distinct.
+
+#### Execution
+
+1. Vendor the unmodified released macro source from Veritas release
+   `1b3a2db`, add a portable path dev-dependency, and convert existing claim
+   comments to `#[veritas::claims(...)]` attributes.
+2. Run focused/native tests and evidence discovery. Inspect every new link for
+   trigger, bounds, assertion, and ownership; approve only exact reviewed pairs.
+3. Clone the pushed repository into an isolated directory and run formatting,
+   strict Clippy, Nextest, and doctests. Confirm GitHub CI if the repository has
+   Actions enabled; absence of a run is reported rather than silently treated
+   as green.
+4. Run the accumulated Xenia model-free and installed-model gates, macOS arm64
+   installed-model test if stale, prohibited scans, LOC/file accounting, and
+   final Veritas diff/status/report. Remove temporary residue but retain the
+   macro vendor fallback until upstream #54 is deployed.
+
+#### Proof
+
+- Native: fresh-clone and canonical Xenia formatting, strict Clippy, full
+  Nextest, installed-model test, and doctests.
+- Cross-platform: previously current Linux amd64 and macOS arm64 model
+  load/inference records remain current unless product/model code changes.
+- Evidence: all 16 claims linked to reviewed Rust declarations and approved
+  using current refs; zero drift and zero blocking findings.
+- Coverage exclusions: none.
+- Veritas: discovery, per-link review, approval, final diff/status/report.
+
+#### Exit
+
+- [ ] Outcome demonstrated and all accumulated checks pass.
+- [ ] Every claim has current reviewed/approved runnable evidence.
+- [ ] No coverage exclusion or blocking Veritas finding remains.
+- [ ] Repository is archive-ready and no implementation work remains.
+
+#### Completion record
+
+Pending. GitHub’s unauthenticated Actions API currently reports no workflow run
+for cutover commit `91aed620`; fresh-clone proof is therefore mandatory.
 
 ## Traceability and Evidence Assignment
 
@@ -397,7 +568,7 @@ was introduced. PH-5 is now ready.
 - PH-2 owns every ingestion claim and fixture.
 - PH-3 owns explicit model acquisition, fallback, and hybrid/reranking evidence.
 - PH-4 owns independence scanning and LOC accounting.
-- PH-5 owns producer discovery, individual semantic link review, approval, and
+- PH-6 owns producer discovery, individual semantic link review, approval, and
   the final authoritative status/report refresh.
 
 No claim is excluded. Requirement prose and scenarios are documentation;
@@ -412,6 +583,6 @@ by themselves create Veritas evidence or approval.
   spike; selecting it is implementation work within the already-approved
   concrete-backend decision, not permission to add a registry or daemon.
 - Veritas macro packaging is under upstream review. Native implementation may
-  continue, but PH-5 cannot close until citations can be linked and approved.
+  continue, but PH-6 cannot close until citations can be linked and approved.
 - Legacy deletion is destructive but explicitly authorized by PC-1; git history
   remains the recovery mechanism.
