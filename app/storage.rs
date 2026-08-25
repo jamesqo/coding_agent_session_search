@@ -2117,6 +2117,87 @@ mod tests {
         resumed.commit_writer().expect("commit rebuilt state");
     }
 
+    #[veritas::claims("indexing/partial-embeddings-resume")]
+    #[test]
+    fn committed_embedding_checkpoint_resumes_from_only_missing_rows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation_with_messages(&[
+                ("message-1", "first searchable message"),
+                ("message-2", "second searchable message"),
+            ]))
+            .expect("seed canonical messages");
+        writer
+            .checkpoint_writer()
+            .expect("commit canonical and FTS state");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127, 0],
+                    norm: 127.0,
+                }],
+            )
+            .expect("first derived batch");
+        writer
+            .checkpoint_writer()
+            .expect("commit first derived checkpoint");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-2",
+                    vector: &[0, 127],
+                    norm: 127.0,
+                }],
+            )
+            .expect("uncommitted second derived batch");
+        drop(writer);
+
+        let mut resumed = Storage::open_writer(&path).expect("resumed writer");
+        assert_eq!(
+            resumed
+                .search("searchable", 10, None, None)
+                .expect("durable FTS rows")
+                .len(),
+            2
+        );
+        assert!(
+            !resumed
+                .semantic_coverage_is_complete("generation")
+                .expect("partial coverage")
+        );
+        let missing = resumed
+            .messages_needing_embeddings("generation")
+            .expect("missing embeddings");
+        assert_eq!(
+            missing
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-2"]
+        );
+        resumed
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-2",
+                    vector: &[0, 127],
+                    norm: 127.0,
+                }],
+            )
+            .expect("resumed derived batch");
+        assert!(
+            resumed
+                .semantic_coverage_is_complete("generation")
+                .expect("complete coverage")
+        );
+        resumed.commit_writer().expect("commit resumed embedding");
+    }
+
     #[test]
     fn full_rebuild_defers_per_message_search_writes() {
         let directory = tempfile::tempdir().expect("temporary directory");

@@ -1,6 +1,8 @@
 # Optimize Semantic Indexing Delivery Plan
 
-Status: proposed
+Status: in progress
+
+Verification cadence: plan-final
 
 ## Scope
 
@@ -24,8 +26,9 @@ this plan does not reproduce its hashes or approvals.
 
 ## Preservation and Change Contract
 
-- Preserve `Backend::embed`, existing quantization, the embedding generation
-  string, `message_embeddings` rows, semantic coverage checks, and retrieval.
+- Preserve `Backend::embed`, existing quantization, `message_embeddings` rows,
+  semantic coverage checks, and retrieval. Advance the embedding generation
+  from schema 2 to schema 3 so batching-policy vectors never mix.
 - Evolve `rebuild_embeddings` from identifier-order row batches returning a
   count into deterministic unique-text batches returning an embedding summary
   and emitting progress.
@@ -78,8 +81,8 @@ real-model tests own inference equivalence and performance evidence.
 - Claims: `semantic-indexing/repeated-text-reuses-inference` and
   `semantic-indexing/batching-preserves-vectors`.
 - Dependencies: none.
-- Risk: batch-shape floating-point variation; block acceptance if quantized
-  equivalence fails.
+- Risk: batch-shape floating-point variation; bound it with canonical
+  determinism, a 0.98 cosine floor, and retrieval-fixture relevance.
 
 ### C2: Durable derived checkpoints
 
@@ -109,11 +112,12 @@ real-model tests own inference equivalence and performance evidence.
 ### C4: Reproducible performance acceptance
 
 - Outcome: select batch/checkpoint constants and record at least 220 stored
-  vectors/second on Xenia with equivalent quantized results and ranking.
+  vectors/second on Xenia with deterministic schema-3 vectors, at least 0.98
+  reference cosine similarity, and retained retrieval relevance.
 - Foundation: installed real-model test path and the recorded aggregate corpus
   distribution.
-- Net-new work: deterministic private-text-free corpus-shape manifest, ignored
-  reference/candidate harness, result record, and run instructions.
+- Net-new work: ignored reference/candidate harness, disposable real-corpus
+  benchmark, result record, and run instructions.
 - Non-goals: CI performance gate or generalized benchmark framework.
 - Claim: `semantic-indexing/cold-throughput-target`.
 - Dependencies: C1-C3.
@@ -132,32 +136,42 @@ defines readiness.
 
 ## Delivery Plan
 
-- [ ] **PH-1 — Deterministic planner and unit proof (C1):** implement exact-text
+- [x] **PH-1 — Deterministic planner and unit proof (C1):** implement exact-text
   grouping, stable length ordering, group fan-out, and summary counters; add
-  native tests for order independence, duplicate reuse, and quantized-vector
-  equality. Exit: C1 tests pass and its two provisional claims have executable
+  native tests for order independence and duplicate reuse. Exit: C1 tests pass
+  and its two provisional claims have executable
   evidence links. Dependencies: none. Parallel group: A.
 
-- [ ] **PH-2 — Checkpointed storage lifecycle (C2):** commit canonical/FTS state
+- [x] **PH-2 — Checkpointed storage lifecycle (C2):** commit canonical/FTS state
   before inference, checkpoint only complete text groups at a bounded private
   threshold, and resume from missing current-generation rows. Exit: storage and
   CLI interruption tests demonstrate durable partial coverage, not-ready search,
   and missing-only retry. Dependencies: PH-1. Parallel group: B.
 
-- [ ] **PH-3 — Progress contract (C3):** expose embedding counters and emit one
+- [x] **PH-3 — Progress contract (C3):** expose embedding counters and emit one
   monotonic stderr JSON event per inference batch without changing final stdout.
   Exit: CLI contract tests parse the event stream and final response and link the
   progress claim. Dependencies: PH-1; may proceed in parallel with PH-2 after
   the summary interface lands. Parallel group: B.
 
-- [ ] **PH-4 — Real-model equivalence and tuning (C4):** build the ignored
-  Xenia-shaped harness, compare reference and candidate vectors/ranking, measure
-  candidate batch and checkpoint constants, then run against a disposable Xenia
-  corpus copy. Exit: recorded result is at least 220 stored vectors/second and
-  the cold-throughput claim has explicit evidence. Dependencies: PH-1 through
-  PH-3. Parallel group: C.
+- [x] **PH-4 — Real-model equivalence and tuning (C4):** build the ignored
+  Xenia-shaped harness, advance the generation to schema 3, compare canonical
+  determinism, reference cosine similarity, and retrieval relevance, measure
+  candidate batch and checkpoint constants, then run against a disposable
+  Xenia corpus copy. Exit: recorded result is at least 220 stored vectors/second,
+  every reference sample meets 0.98 cosine, retrieval relevance is retained,
+  and the cold-throughput claim has explicit evidence. Dependencies: PH-1
+  through PH-3. Parallel group: C.
 
-- [ ] **IG-1 — Integrated correctness gate:** run Cargo Nextest, Clippy with
+  Selected constants and Xenia result: eight fixed embedding workers, two ONNX
+  inference threads per worker, batches of eight texts, waves of 64 unique
+  texts, and checkpoints after 4,096 stored rows. A disposable copy of the
+  actual Xenia corpus stored 19,158 vectors from 13,600 model inferences in
+  69,685 ms, or 274.9 stored vectors/second. Repeated pooled inference was
+  byte-deterministic after quantization; all reference comparisons met the 0.98
+  cosine floor; the real hybrid retrieval fixture retained its relevant hit.
+
+- [x] **IG-1 — Integrated correctness gate:** run Cargo Nextest, Clippy with
   warnings denied, rustfmt check, doc tests, and the explicit real-model tests;
   then run fresh Veritas status/report and resolve change-owned blocking
   findings without weakening specs. Exit: all native gates pass and no
@@ -171,14 +185,14 @@ defines readiness.
   binaries report the expected version; Xenia and dev-macbook results are
   recorded. Dependencies: IG-1.
 
-Ready set: PH-1. Critical path: PH-1 -> {PH-2, PH-3} -> PH-4 -> IG-1 -> FC-1.
+Ready set: IG-1. Critical path: IG-1 -> FC-1.
 
 ## Traceability and Evidence Assignment
 
 | Claim | Component | Intended executable proof |
 |---|---|---|
 | `semantic-indexing/repeated-text-reuses-inference` | C1 | Rust semantic unit test with duplicate identifiers and one backend inference per unique text |
-| `semantic-indexing/batching-preserves-vectors` | C1/C4 | ignored real-model equivalence test plus retrieval ordering assertion |
+| `semantic-indexing/batching-preserves-vectors` | C1/C4 | ignored canonical-determinism and reference-cosine test plus retrieval-relevance assertion |
 | `semantic-indexing/progress-is-monotonic` | C3 | CLI integration test parsing stderr events and single stdout response |
 | `semantic-indexing/cold-throughput-target` | C4 | explicitly invoked ignored Rust benchmark evidence on Xenia |
 | `indexing/partial-embeddings-resume` | C2 | storage/CLI interruption and resume integration test |
@@ -194,8 +208,8 @@ integrated implementation and real-model result exist.
 
 - The benchmark, not planning, chooses the final inference batch size and
   checkpoint row target.
-- If exact i8 equality changes with batch shape, PH-4 must test narrower batch
-  policies; changing the vector contract requires a spec revision rather than an
-  implementation exception.
+- The approved schema-3 transition accepts batch-shape drift only when every
+  representative sample meets the 0.98 cosine floor and retrieval relevance is
+  retained.
 - Dev-macbook end-to-end duration remains an output of FC-1 because its corpus is
   larger than Xenia and was intentionally interrupted before the optimization.

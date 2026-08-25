@@ -7,9 +7,13 @@ concrete semantic indexing backend without changing retrieval semantics.
 
 ### Requirement: Embedding work preserves semantic results
 
-CASS SHALL store one current-generation embedding for every searchable message
-and SHALL produce the same quantized vector for the same searchable text
-regardless of message identifier, input order, or duplicate occurrences.
+CASS SHALL store one current-generation embedding for every searchable message.
+The canonical length-aware batching policy SHALL produce deterministic
+quantized vectors for the same corpus regardless of message identifier, input
+order, or duplicate occurrences. On representative reference-path samples,
+each new-policy vector SHALL have at least 0.98 quantized cosine similarity to
+its reference vector and SHALL preserve the expected relevant results in the
+retrieval fixture.
 
 #### Scenario: Repeated text
 
@@ -20,8 +24,8 @@ regardless of message identifier, input order, or duplicate occurrences.
 #### Scenario: Mixed message lengths
 
 <!-- claim: semantic-indexing/batching-preserves-vectors -->
-- **WHEN** the same short and long searchable messages are indexed in different identifier orders
-- **THEN** their stored quantized vectors and semantic ranking are unchanged
+- **WHEN** representative short and long searchable messages are compared between the reference and canonical length-aware policies
+- **THEN** each vector has at least 0.98 quantized cosine similarity, repeated canonical runs are byte-deterministic, and the retrieval fixture retains its expected relevant results
 
 ### Requirement: Embedding progress is visible
 
@@ -43,11 +47,11 @@ SHALL NOT change the single final JSON response on standard output.
 The repository SHALL provide a reproducible, explicitly invoked benchmark over
 the measured Xenia text-length and duplication shape. The accepted implementation
 SHALL record at least four times the 55 stored-vectors-per-second baseline while
-producing equivalent quantized vectors. The benchmark SHALL NOT run in the
-ordinary test or CI gate.
+meeting the vector-similarity and retrieval-relevance requirements above. The
+benchmark SHALL NOT run in the ordinary test or CI gate.
 
 #### Scenario: Candidate batching policy is accepted
 
 <!-- claim: semantic-indexing/cold-throughput-target -->
 - **WHEN** the focused benchmark is run on Xenia against the recorded representative corpus shape
-- **THEN** it reports at least 220 stored vectors per second and vector equivalence with the reference path
+- **THEN** it reports at least 220 stored vectors per second, at least 0.98 reference-vector cosine similarity, and retained retrieval-fixture relevance

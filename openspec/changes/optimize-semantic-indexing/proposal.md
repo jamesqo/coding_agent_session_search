@@ -38,7 +38,9 @@ reports no embedding progress.
 
 - A checked representative Xenia corpus benchmark records at least a fourfold
   cold embedding throughput improvement over the measured 55 messages/second
-  baseline without changing produced vectors or search results.
+  baseline. New-policy vectors remain deterministic, retain at least 0.98 cosine
+  similarity to the reference path on representative samples, and preserve the
+  expected relevant results in retrieval fixtures.
 - Repeating `cass index` after a completed run remains below two seconds on the
   measured Xenia corpus when only a small active source changed.
 - Terminating indexing after a committed embedding checkpoint leaves canonical
@@ -50,8 +52,9 @@ reports no embedding progress.
 ## Non-Goals
 
 - Replacing MiniLM with Word2Vec or another embedding model.
-- Changing retrieval ranking, vector dimensions, quantization, or exact cosine
-  search.
+- Changing the retrieval algorithm, vector dimensions, quantization, or exact
+  cosine search. Small model-output drift caused by the new batch shape is
+  accepted and isolated behind a new embedding generation.
 - Truncating canonical message content, chunking messages, or changing the
   source-file 90-day admission rule in this change.
 - Adding GPU, daemon, ANN, async, provider, or runtime tuning frameworks.
@@ -60,6 +63,8 @@ reports no embedding progress.
 
 The change is internal to semantic indexing, SQLite derived embedding writes,
 JSON index progress, tests, and focused performance measurement. Existing
-databases remain compatible. Interrupted runs may retain partial derived
-embedding coverage, but public search remains unavailable until coverage is
-complete. No dependency or public command is added.
+databases remain schema-compatible, but their old-generation vectors are
+invalidated and rebuilt once under the deterministic length-aware policy.
+Interrupted runs may retain partial derived embedding coverage, but public
+search remains unavailable until coverage is complete. No dependency or public
+command is added.

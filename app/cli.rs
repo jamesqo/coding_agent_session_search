@@ -131,6 +131,8 @@ pub(super) struct IndexResponse {
     processed_bytes: u64,
     full: bool,
     embeddings: u64,
+    model_inferences: u64,
+    reused_embeddings: u64,
     realized_mode: &'static str,
     model_load_milliseconds: u64,
     storage_setup_milliseconds: u64,
@@ -339,7 +341,7 @@ fn index(
     let total_started = Instant::now();
     let models = Models::new(models_dir.to_path_buf());
     let model_started = Instant::now();
-    let mut backend = models.load()?.ok_or_else(|| {
+    let mut embedding_pool = models.load_indexer()?.ok_or_else(|| {
         AppError::model("semantic models are not installed; run `cass models install`")
     })?;
     let model_load_milliseconds = elapsed_milliseconds(model_started);
@@ -361,10 +363,12 @@ fn index(
         storage.rebuild_derived_search_state()?;
     }
     let search_refresh_milliseconds = elapsed_milliseconds(search_started);
+    storage.checkpoint_writer()?;
     emit_index_phase("semantic-embeddings", &summary);
     let embedding_started = Instant::now();
     storage.invalidate_embedding_generation(semantic::embedding_generation())?;
-    let embeddings = semantic::rebuild_embeddings(&mut storage, &mut backend)?;
+    let embeddings =
+        semantic::rebuild_embeddings(&mut storage, &mut embedding_pool, emit_embedding_progress)?;
     let embedding_milliseconds = elapsed_milliseconds(embedding_started);
     let counts = storage.counts()?;
     if !storage.semantic_coverage_is_complete(semantic::embedding_generation())? {
@@ -390,7 +394,9 @@ fn index(
         discovered_bytes: summary.discovered_bytes,
         processed_bytes: summary.processed_bytes,
         full,
-        embeddings,
+        embeddings: embeddings.stored_vectors,
+        model_inferences: embeddings.model_inferences,
+        reused_embeddings: embeddings.reused_vectors,
         realized_mode: "hybrid",
         model_load_milliseconds,
         storage_setup_milliseconds,
@@ -421,6 +427,32 @@ fn emit_index_phase(phase: &'static str, summary: &ingestion::IndexSummary) {
     if serde_json::to_writer(&mut stderr, &event).is_ok() {
         let _ = writeln!(stderr);
     }
+}
+
+fn emit_embedding_progress(progress: semantic::EmbeddingProgress) {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let _ = write_embedding_progress(&mut stderr, &progress);
+}
+
+fn write_embedding_progress(
+    writer: &mut dyn Write,
+    progress: &semantic::EmbeddingProgress,
+) -> Result<(), AppError> {
+    let event = serde_json::json!({
+        "event": "index-progress",
+        "phase": "semantic-embeddings",
+        "stored_vectors": progress.stored_vectors,
+        "total_vectors": progress.total_vectors,
+        "model_inferences": progress.model_inferences,
+        "reused_vectors": progress.reused_vectors,
+        "elapsed_milliseconds": progress.elapsed_milliseconds,
+        "stored_vectors_per_second": progress.stored_vectors_per_second,
+    });
+    serde_json::to_writer(&mut *writer, &event)
+        .map_err(|error| AppError::internal(format!("failed to serialize progress: {error}")))?;
+    writeln!(writer)
+        .map_err(|error| AppError::internal(format!("failed to write progress: {error}")))
 }
 
 fn search(
@@ -710,6 +742,51 @@ fn default_models_path() -> PathBuf {
 mod tests {
     use super::*;
     use veritas_test_macros as veritas;
+
+    #[veritas::claims("semantic-indexing/progress-is-monotonic")]
+    #[test]
+    fn embedding_progress_is_a_monotonic_newline_delimited_json_stream() {
+        let first = semantic::EmbeddingProgress {
+            stored_vectors: 32,
+            total_vectors: 128,
+            model_inferences: 24,
+            reused_vectors: 8,
+            elapsed_milliseconds: 1_000,
+            stored_vectors_per_second: 32.0,
+        };
+        let second = semantic::EmbeddingProgress {
+            stored_vectors: 64,
+            total_vectors: 128,
+            model_inferences: 48,
+            reused_vectors: 16,
+            elapsed_milliseconds: 2_000,
+            stored_vectors_per_second: 32.0,
+        };
+        let mut output = Vec::new();
+
+        write_embedding_progress(&mut output, &first).expect("first progress JSON");
+        write_embedding_progress(&mut output, &second).expect("second progress JSON");
+
+        assert_eq!(output.last(), Some(&b'\n'));
+        let values = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<serde_json::Value>(line).expect("progress JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert!(values[0]["stored_vectors"].as_u64() < values[1]["stored_vectors"].as_u64());
+        assert!(values[0]["model_inferences"].as_u64() < values[1]["model_inferences"].as_u64());
+        assert_eq!(values[0]["total_vectors"], values[1]["total_vectors"]);
+        let value = &values[1];
+        assert_eq!(value["event"], "index-progress");
+        assert_eq!(value["phase"], "semantic-embeddings");
+        assert_eq!(value["stored_vectors"], 64);
+        assert_eq!(value["total_vectors"], 128);
+        assert_eq!(value["model_inferences"], 48);
+        assert_eq!(value["reused_vectors"], 16);
+        assert_eq!(value["elapsed_milliseconds"], 2_000);
+        assert_eq!(value["stored_vectors_per_second"], 32.0);
+    }
 
     fn test_configuration(
         claude_enabled: bool,

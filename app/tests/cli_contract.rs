@@ -96,8 +96,9 @@ fn current_embedding_generation() -> String {
     blake3::hash(
         concat!(
             "fastembed=6.0.1;model=AllMiniLML6V2Q;",
+            "batch=8;workers=8;threads=2;",
             "vector=i8-per-vector-symmetric;",
-            "cosine=quantized-flat-exact;schema=2"
+            "cosine=quantized-flat-exact;schema=3"
         )
         .as_bytes(),
     )
@@ -1067,6 +1068,7 @@ fn maintained_repository_is_independent_and_minimal() {
 
 #[veritas::claims(
     "semantic/hybrid-reranks-with-models",
+    "semantic-indexing/batching-preserves-vectors",
     "search/fts-contributes-to-hybrid",
     "search/tool-results-are-not-searchable",
     "search/mixed-message-excludes-tool-result-text"
@@ -1146,4 +1148,74 @@ fn real_models_index_and_run_hybrid_search() {
     assert!(found["results"][0]["lexical_score"].is_number());
     assert!(found["results"][0]["semantic_score"].is_number());
     assert!(found["results"][0]["rerank_score"].is_number());
+    assert!(found["results"].as_array().is_some_and(|results| {
+        results.iter().any(|result| {
+            result["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("authentication credentials"))
+        })
+    }));
+}
+
+#[veritas::claims("semantic-indexing/cold-throughput-target")]
+#[test]
+#[ignore = "requires explicit CASS_BENCHMARK_DB, CASS_BENCHMARK_CONFIG, and CASS_TEST_MODELS_DIR"]
+fn benchmark_real_corpus_semantic_generation() {
+    let source = std::env::var_os("CASS_BENCHMARK_DB")
+        .map(std::path::PathBuf::from)
+        .expect("explicit benchmark source database");
+    let config = std::env::var_os("CASS_BENCHMARK_CONFIG")
+        .map(std::path::PathBuf::from)
+        .expect("explicit benchmark configuration");
+    let models = std::env::var_os("CASS_TEST_MODELS_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("explicit model directory");
+    let directory = tempfile::tempdir().expect("temporary benchmark directory");
+    let database = directory.path().join("benchmark.sqlite3");
+    let source_connection =
+        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open benchmark source");
+    source_connection
+        .execute("VACUUM INTO ?1", [database.to_string_lossy().as_ref()])
+        .expect("snapshot benchmark database");
+    drop(source_connection);
+    let connection = Connection::open(&database).expect("open benchmark snapshot");
+    connection
+        .execute("DELETE FROM message_embeddings", [])
+        .expect("clear derived embeddings");
+    drop(connection);
+
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--db",
+            database.to_str().unwrap(),
+            "--models-dir",
+            models.to_str().unwrap(),
+            "index",
+        ])
+        .output()
+        .expect("benchmark semantic index");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&output.stdout).expect("benchmark index JSON");
+    let stored = indexed["embeddings"].as_u64().expect("stored embeddings");
+    let inferred = indexed["model_inferences"]
+        .as_u64()
+        .expect("model inference count");
+    let elapsed = indexed["embedding_milliseconds"]
+        .as_u64()
+        .expect("embedding elapsed time");
+    assert!(inferred <= stored);
+    #[allow(clippy::cast_precision_loss)]
+    let rate = stored as f64 / (elapsed.max(1) as f64 / 1_000.0);
+    eprintln!(
+        "semantic benchmark stored={stored} inferred={inferred} elapsed_ms={elapsed} rate={rate:.1}"
+    );
+    assert!(rate >= 220.0, "semantic generation rate was {rate:.1}/s");
 }

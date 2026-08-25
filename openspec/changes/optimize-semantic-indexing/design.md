@@ -25,8 +25,8 @@ creation of those vectors, not their format or retrieval.
   derived-vector progress resumable through bounded checkpoints.
 - Make actual inference work and stored-vector progress visible as JSON on
   standard error.
-- Select constants from an explicit Xenia benchmark while preserving vector and
-  ranking behavior.
+- Select constants from an explicit Xenia benchmark while bounding model-output
+  drift and preserving retrieval relevance.
 
 **Non-Goals:**
 
@@ -48,8 +48,9 @@ creation of those vectors, not their format or retrieval.
   sink to semantic indexing.
 - The FastEmbed backend remains the only model implementation. Semantic code
   depends directly on it; storage never depends on model types.
-- Retrieval consumes the same generation string and persisted i8 rows as before
-  and does not know how inference work was scheduled.
+- Retrieval consumes persisted i8 rows without knowing how inference work was
+  scheduled. The generation string advances once so old and new batching-policy
+  vectors cannot coexist.
 
 ## Decisions
 
@@ -80,13 +81,22 @@ benchmark. It is not exposed as configuration. Candidates include the current
 32 and larger batches; the chosen value must meet throughput and equivalence
 criteria on Xenia rather than being assumed in advance.
 
-### Preserve the established quantized vector contract
+### Preserve the quantized format and version the batching policy
 
 Every inferred f32 vector continues through the existing per-vector symmetric
 i8 quantizer and norm calculation. Identical text uses the single resulting
-quantized vector for all occurrences. The generation string and database row
-format do not change. Reference-path tests compare quantized bytes and norms,
-and a focused retrieval test compares result ordering.
+quantized vector for all occurrences. The database row format does not change,
+but the generation specification advances from schema 2 to schema 3 because
+FastEmbed's quantized ONNX output varies slightly with batch shape. This forces
+a one-time clean regeneration and prevents mixing old identifier-order vectors
+with new length-aware vectors.
+
+Canonical-policy reruns over the same corpus compare quantized bytes and norms
+for determinism. Reference-path comparison requires quantized cosine similarity
+of at least 0.98 rather than byte identity; the first observed mixed-batch sample
+measured 0.9886. A focused retrieval fixture asserts that expected relevant
+results remain present instead of requiring every near-tie to retain its exact
+rank.
 
 ### Separate durable canonical state from checkpointed derived state
 
@@ -122,10 +132,11 @@ write failures remain non-fatal, matching existing ingestion progress behavior.
 An ignored real-model benchmark test uses `CASS_TEST_MODELS_DIR` and a checked,
 deterministic manifest that reproduces the measured Xenia length buckets and
 duplicate multiplicities without committing private session text. It compares
-the reference identifier-order path to candidate length-aware batching,
-records stored and inferred throughput, and checks quantized-vector and ranking
-equivalence. The repository records the command, machine, corpus-shape manifest,
-batch size, and result in the change plan when the implementation is accepted.
+the reference identifier-order path to candidate length-aware batching, records
+stored and inferred throughput, checks the 0.98 cosine floor and canonical
+determinism, and verifies retrieval-fixture relevance. The repository records
+the command, machine, corpus-shape manifest, batch size, and result in the change
+plan when the implementation is accepted.
 
 ## Tooling Compatibility
 
@@ -139,10 +150,9 @@ batch size, and result in the change plan when the implementation is accepted.
 
 ## Risks / Trade-offs
 
-- Transformer floating-point results can theoretically vary with batch shape.
-  Quantized-vector equivalence tests prevent accepting a faster policy that
-  changes persisted results; if FastEmbed cannot meet that invariant, batching
-  changes must be narrowed rather than relaxing the requirement silently.
+- Transformer output varies slightly with batch shape. A generation bump
+  prevents mixed-policy state, while a measured cosine floor and retrieval
+  fixture bound acceptable drift without treating byte identity as relevance.
 - Grouping retains all missing searchable text plus grouping metadata in memory,
   as the current implementation already retains all missing messages. The
   additional map is bounded by unique missing texts and avoids text copies where
@@ -157,8 +167,9 @@ batch size, and result in the change plan when the implementation is accepted.
 
 ## Migration / Rollback
 
-No database migration is needed because generation strings and vector rows are
-unchanged. Existing complete databases remain complete; incomplete databases
-resume by selecting missing rows. Rollback to the previous binary remains safe:
-it can read all committed vectors and will regenerate any missing ones, though
-it loses resumability during its own single transaction.
+No schema migration is needed because vector rows are unchanged. The generation
+string advances to schema 3, so the first index invalidates schema-2 vectors and
+rebuilds complete schema-3 coverage. Interrupted schema-3 runs resume from their
+committed checkpoints. Rolling back to the previous binary remains data-safe
+but causes another generation replacement because that binary recognizes only
+schema 2.
