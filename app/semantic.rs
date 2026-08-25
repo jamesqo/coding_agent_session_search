@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::AppError;
-use crate::storage::{EmbeddingWrite, SearchHit, SemanticVectors, Storage};
+use crate::storage::{EmbeddingWrite, SearchHit, SemanticChunks, Storage};
 
 const EMBEDDING_MODEL: EmbeddingModel = EmbeddingModel::AllMiniLML6V2Q;
 const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
@@ -674,16 +674,16 @@ pub(crate) fn hybrid_search(
         .pop()
         .ok_or_else(|| AppError::model("embedding model returned no query vector"))?;
     let query_vector = quantize_vector(&query_vector);
-    let semantic = storage.semantic_vectors(embedding_generation(), provider, days)?;
+    let semantic = storage.semantic_chunks(embedding_generation(), provider, days)?;
     let ranked = rank_quantized(&query_vector, &semantic, CANDIDATE_LIMIT);
     if ranked.is_empty() {
         return Ok(lexical.into_iter().take(limit).collect());
     }
-    let message_ids: Vec<&str> = ranked
+    let message_rowids = ranked
         .iter()
-        .map(|(index, _)| semantic.message_ids[*index].as_str())
-        .collect();
-    let mut semantic_hits = storage.search_hits(&message_ids)?;
+        .map(|(message_rowid, _)| *message_rowid)
+        .collect::<Vec<_>>();
+    let mut semantic_hits = storage.search_hits(&message_rowids)?;
     for (hit, (_, score)) in semantic_hits.iter_mut().zip(&ranked) {
         hit.semantic_score = Some(*score);
     }
@@ -817,29 +817,35 @@ fn exactly_representable_f32(value: i32) -> f32 {
 
 fn rank_quantized(
     query: &QuantizedVector,
-    vectors: &SemanticVectors,
+    vectors: &SemanticChunks,
     limit: usize,
-) -> Vec<(usize, f32)> {
-    if limit == 0
-        || vectors.dimensions == 0
-        || query.values.len() != vectors.dimensions
-        || vectors.norms.len() != vectors.message_ids.len()
-        || vectors.values.len() != vectors.message_ids.len().saturating_mul(vectors.dimensions)
-    {
+) -> Vec<(i64, f32)> {
+    if limit == 0 || vectors.dimensions == 0 || query.values.len() != vectors.dimensions {
         return Vec::new();
     }
-    let mut ranked: Vec<(usize, f32)> = vectors
-        .values
-        .chunks_exact(vectors.dimensions)
-        .zip(&vectors.norms)
-        .enumerate()
-        .map(|(index, (vector, norm))| (index, quantized_cosine(query, vector, *norm)))
-        .collect();
-    let compare = |left: &(usize, f32), right: &(usize, f32)| {
+    let mut ranked = Vec::new();
+    for chunk in &vectors.chunks {
+        if chunk.dimensions != vectors.dimensions
+            || chunk.norms.len() != chunk.message_rowids.len()
+            || chunk.eligible.len() != chunk.message_rowids.len()
+            || chunk.values.len() != chunk.message_rowids.len().saturating_mul(chunk.dimensions)
+        {
+            return Vec::new();
+        }
+        for (index, vector) in chunk.values.chunks_exact(chunk.dimensions).enumerate() {
+            if chunk.eligible[index] {
+                ranked.push((
+                    chunk.message_rowids[index],
+                    quantized_cosine(query, vector, chunk.norms[index]),
+                ));
+            }
+        }
+    }
+    let compare = |left: &(i64, f32), right: &(i64, f32)| {
         right
             .1
             .total_cmp(&left.1)
-            .then_with(|| vectors.message_ids[left.0].cmp(&vectors.message_ids[right.0]))
+            .then_with(|| left.0.cmp(&right.0))
     };
     if ranked.len() > limit {
         ranked.select_nth_unstable_by(limit, compare);
@@ -1038,17 +1044,21 @@ mod tests {
         let first = quantize_vector(&[1.0, 0.0]);
         let second = quantize_vector(&[0.8, 0.2]);
         let third = quantize_vector(&[-1.0, 0.0]);
-        let vectors = SemanticVectors {
-            message_ids: vec!["b".to_owned(), "a".to_owned(), "c".to_owned()],
-            values: [first.values, second.values, third.values].concat(),
-            norms: vec![first.norm, second.norm, third.norm],
+        let vectors = SemanticChunks {
+            chunks: vec![crate::storage::SemanticChunk {
+                message_rowids: vec![10, 20, 30],
+                values: [first.values, second.values, third.values].concat(),
+                norms: vec![first.norm, second.norm, third.norm],
+                eligible: vec![true; 3],
+                dimensions: 2,
+            }],
             dimensions: 2,
         };
 
         let ranked = rank_quantized(&query, &vectors, 2);
         assert_eq!(
             ranked.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-            [0, 1]
+            [10, 20]
         );
         assert!(ranked[0].1 > ranked[1].1);
     }

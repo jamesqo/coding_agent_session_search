@@ -99,6 +99,12 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
                 message_id TEXT PRIMARY KEY, generation TEXT NOT NULL,
                 dimensions INTEGER NOT NULL, norm REAL NOT NULL, vector BLOB NOT NULL
              );
+             CREATE TABLE semantic_chunks (
+                chunk_id INTEGER PRIMARY KEY, generation TEXT NOT NULL,
+                dimensions INTEGER NOT NULL, vector_count INTEGER NOT NULL,
+                message_rowids BLOB NOT NULL, norms BLOB NOT NULL,
+                providers BLOB NOT NULL, created_ats BLOB NOT NULL, vectors BLOB NOT NULL
+             );
              CREATE TABLE derived_state (
                 singleton INTEGER PRIMARY KEY, search_dirty INTEGER NOT NULL,
                 semantic_ready_generation TEXT
@@ -106,7 +112,7 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
              INSERT INTO derived_state VALUES (1, 0, NULL);
              INSERT INTO conversations(id, provider, source_path)
                 VALUES ('session', 'codex', '/tmp/session.jsonl');
-             PRAGMA user_version = 10;",
+             PRAGMA user_version = 11;",
         )
         .expect("readiness schema");
     connection
@@ -763,6 +769,20 @@ fn status_uses_model_then_database_then_embedding_readiness() {
             [&generation],
         )
         .expect("current embedding");
+    ready_connection
+        .execute(
+            "INSERT INTO semantic_chunks(
+                chunk_id, generation, dimensions, vector_count, message_rowids,
+                norms, providers, created_ats, vectors
+             ) VALUES (0, ?1, 1, 1, ?2, ?3, X'02', ?4, X'7F')",
+            rusqlite::params![
+                generation,
+                1_i64.to_le_bytes().to_vec(),
+                127.0_f32.to_le_bytes().to_vec(),
+                i64::MIN.to_le_bytes().to_vec()
+            ],
+        )
+        .expect("packed semantic chunk");
     ready_connection
         .execute(
             "UPDATE derived_state SET semantic_ready_generation = ?1 WHERE singleton = 1",

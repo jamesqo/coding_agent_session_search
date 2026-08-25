@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const FTS_BULK_REBUILD_PERCENT: u64 = 90;
+const SEMANTIC_CHUNK_ROWS: i64 = 4_096;
+const MISSING_CREATED_AT: i64 = i64::MIN;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
@@ -26,7 +28,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     source_fingerprint TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
+    storage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,
     role TEXT NOT NULL,
@@ -42,6 +45,17 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     dimensions INTEGER NOT NULL,
     norm REAL NOT NULL,
     vector BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS semantic_chunks (
+    chunk_id INTEGER PRIMARY KEY CHECK (chunk_id >= 0),
+    generation TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    vector_count INTEGER NOT NULL CHECK (vector_count > 0 AND vector_count <= 4096),
+    message_rowids BLOB NOT NULL,
+    norms BLOB NOT NULL,
+    providers BLOB NOT NULL,
+    created_ats BLOB NOT NULL,
+    vectors BLOB NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
     content,
@@ -139,11 +153,27 @@ pub(crate) struct EmbeddingWrite<'a> {
     pub(crate) norm: f32,
 }
 
-pub(crate) struct SemanticVectors {
-    pub(crate) message_ids: Vec<String>,
+pub(crate) struct SemanticChunk {
+    pub(crate) message_rowids: Vec<i64>,
     pub(crate) values: Vec<u8>,
     pub(crate) norms: Vec<f32>,
+    pub(crate) eligible: Vec<bool>,
     pub(crate) dimensions: usize,
+}
+
+pub(crate) struct SemanticChunks {
+    pub(crate) chunks: Vec<SemanticChunk>,
+    pub(crate) dimensions: usize,
+}
+
+struct PackedSemanticChunk {
+    dimensions: i64,
+    vector_count: i64,
+    message_rowids: Vec<u8>,
+    norms: Vec<u8>,
+    providers: Vec<u8>,
+    created_ats: Vec<u8>,
+    vectors: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -165,6 +195,10 @@ impl Storage {
             .execute_batch(
                 "CREATE TEMP TABLE IF NOT EXISTS pending_fts_messages (
                     message_id TEXT PRIMARY KEY
+                 ) WITHOUT ROWID;
+                 CREATE TEMP TABLE IF NOT EXISTS dirty_semantic_chunks (
+                    chunk_id INTEGER PRIMARY KEY,
+                    generation TEXT
                  ) WITHOUT ROWID;",
             )
             .map_err(AppError::database)?;
@@ -195,6 +229,7 @@ impl Storage {
         if self.writer_active {
             let threshold = self.measured_fts_bulk_threshold()?;
             self.finalize_pending_fts_updates(threshold)?;
+            self.finalize_semantic_chunks()?;
             self.connection
                 .execute_batch("COMMIT")
                 .map_err(AppError::database)?;
@@ -210,6 +245,7 @@ impl Storage {
         self.require_writer()?;
         let threshold = self.measured_fts_bulk_threshold()?;
         self.finalize_pending_fts_updates(threshold)?;
+        self.finalize_semantic_chunks()?;
         self.connection
             .execute_batch("COMMIT")
             .map_err(AppError::database)?;
@@ -298,6 +334,65 @@ impl Storage {
             FtsRefreshStrategy::Incremental
         };
         Ok(strategy)
+    }
+
+    fn stage_semantic_message(
+        &self,
+        message_id: &str,
+        generation: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.connection
+            .execute(
+                "INSERT INTO dirty_semantic_chunks(chunk_id, generation)
+                 SELECT (m.rowid - 1) / ?2, COALESCE(?3, e.generation)
+                   FROM messages m
+                   LEFT JOIN message_embeddings e ON e.message_id = m.id
+                  WHERE m.id = ?1
+                 ON CONFLICT(chunk_id) DO UPDATE SET
+                    generation = COALESCE(excluded.generation, generation)",
+                params![message_id, SEMANTIC_CHUNK_ROWS, generation],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
+    }
+
+    fn stage_semantic_conversation(&self, conversation_id: &str) -> Result<(), AppError> {
+        self.connection
+            .execute(
+                "INSERT INTO dirty_semantic_chunks(chunk_id, generation)
+                 SELECT (m.rowid - 1) / ?2, min(e.generation)
+                   FROM messages m
+                   LEFT JOIN message_embeddings e ON e.message_id = m.id
+                  WHERE m.conversation_id = ?1
+                  GROUP BY (m.rowid - 1) / ?2
+                 ON CONFLICT(chunk_id) DO UPDATE SET
+                    generation = COALESCE(excluded.generation, generation)",
+                params![conversation_id, SEMANTIC_CHUNK_ROWS],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
+    }
+
+    fn finalize_semantic_chunks(&self) -> Result<(), AppError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT chunk_id, generation FROM dirty_semantic_chunks ORDER BY chunk_id")
+            .map_err(AppError::database)?;
+        let dirty = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)?;
+        drop(statement);
+        for (chunk_id, generation) in dirty {
+            rebuild_semantic_chunk(&self.connection, chunk_id, generation.as_deref())?;
+        }
+        self.connection
+            .execute("DELETE FROM dirty_semantic_chunks", [])
+            .map_err(AppError::database)?;
+        Ok(())
     }
 
     pub(crate) fn defer_search_updates(&mut self) -> Result<(), AppError> {
@@ -466,7 +561,18 @@ impl Storage {
             )
             .map_err(AppError::database)?;
         if ready_generation.as_deref() == Some(generation) {
-            return Ok(true);
+            return self
+                .connection
+                .query_row(
+                    "SELECT
+                        (SELECT count(*) FROM messages
+                          WHERE COALESCE(search_projection, content) <> '') =
+                        (SELECT COALESCE(sum(vector_count), 0)
+                           FROM semantic_chunks WHERE generation = ?1)",
+                    [generation],
+                    |row| row.get(0),
+                )
+                .map_err(AppError::database);
         }
         self.connection
             .query_row(
@@ -482,11 +588,35 @@ impl Storage {
             .map_err(AppError::database)
     }
 
-    pub(crate) fn mark_semantic_index_ready(&self, generation: &str) -> Result<(), AppError> {
+    pub(crate) fn mark_semantic_index_ready(&mut self, generation: &str) -> Result<(), AppError> {
         self.require_writer()?;
         if !self.semantic_coverage_is_complete(generation)? {
             return Err(AppError::search_not_ready(
                 "semantic embedding coverage is incomplete",
+            ));
+        }
+        self.finalize_semantic_chunks()?;
+        let expected: i64 = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM messages
+                  WHERE COALESCE(search_projection, content) <> ''",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)?;
+        let packed: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(sum(vector_count), 0)
+                   FROM semantic_chunks WHERE generation = ?1",
+                [generation],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)?;
+        if packed != expected {
+            return Err(AppError::search_not_ready(
+                "packed semantic index coverage is incomplete",
             ));
         }
         self.connection
@@ -550,6 +680,10 @@ impl Storage {
                 unchanged: true,
                 ..ConversationChange::default()
             });
+        }
+        if existing_source_fingerprint.is_some() && !self.defer_search_updates {
+            self.stage_semantic_conversation(&conversation.id)?;
+            self.mark_semantic_index_incomplete()?;
         }
 
         let existing_messages = self.message_fingerprints(&conversation.id)?;
@@ -683,6 +817,7 @@ impl Storage {
         for id in &removed {
             if !self.defer_search_updates {
                 stage_fts.execute([id]).map_err(AppError::database)?;
+                self.stage_semantic_message(id, None)?;
             }
             delete_message.execute([id]).map_err(AppError::database)?;
         }
@@ -691,6 +826,9 @@ impl Storage {
             let fingerprint = message_fingerprint(message);
             if existing_messages.get(&message.id) == Some(&fingerprint) {
                 continue;
+            }
+            if !self.defer_search_updates {
+                self.stage_semantic_message(&message.id, None)?;
             }
             upsert_message
                 .execute(params![
@@ -711,6 +849,7 @@ impl Storage {
                 delete_embedding
                     .execute([&message.id])
                     .map_err(AppError::database)?;
+                self.stage_semantic_message(&message.id, None)?;
             }
             changed.push(message.id.clone());
         }
@@ -724,6 +863,8 @@ impl Storage {
         self.connection
             .execute_batch(
                 "DELETE FROM message_embeddings;
+                 DELETE FROM semantic_chunks;
+                 DELETE FROM dirty_semantic_chunks;
                  UPDATE derived_state
                     SET search_dirty = 0,
                         semantic_ready_generation = NULL
@@ -803,6 +944,8 @@ impl Storage {
             }
             if !self.defer_search_updates {
                 self.stage_conversation_fts(&id)?;
+                self.stage_semantic_conversation(&id)?;
+                self.mark_semantic_index_incomplete()?;
             }
             self.connection
                 .execute("DELETE FROM conversations WHERE id = ?1", [&id])
@@ -868,6 +1011,8 @@ impl Storage {
         };
         if !self.defer_search_updates {
             self.stage_conversation_fts(&id)?;
+            self.stage_semantic_conversation(&id)?;
+            self.mark_semantic_index_incomplete()?;
         }
         if self.defer_search_updates {
             self.mark_derived_search_dirty()?;
@@ -984,6 +1129,14 @@ impl Storage {
                     vector = excluded.vector",
             )
             .map_err(AppError::database)?;
+        let mut stage_chunk = self
+            .connection
+            .prepare_cached(
+                "INSERT INTO dirty_semantic_chunks(chunk_id, generation)
+                 SELECT (rowid - 1) / ?2, ?3 FROM messages WHERE id = ?1
+                 ON CONFLICT(chunk_id) DO UPDATE SET generation = excluded.generation",
+            )
+            .map_err(AppError::database)?;
         for embedding in embeddings {
             let dimensions = i64::try_from(embedding.vector.len())
                 .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
@@ -996,48 +1149,84 @@ impl Storage {
                     embedding.vector,
                 ])
                 .map_err(AppError::database)?;
+            stage_chunk
+                .execute(params![
+                    embedding.message_id,
+                    SEMANTIC_CHUNK_ROWS,
+                    generation
+                ])
+                .map_err(AppError::database)?;
         }
         Ok(())
     }
 
-    pub(crate) fn semantic_vectors(
+    pub(crate) fn semantic_chunks(
         &self,
         generation: &str,
         provider: Option<&str>,
         days: Option<u32>,
-    ) -> Result<SemanticVectors, AppError> {
+    ) -> Result<SemanticChunks, AppError> {
         let cutoff = cutoff_timestamp(days)?;
+        let requested_provider = provider.map(provider_code).transpose()?;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT m.id, e.dimensions, e.norm, e.vector
-                   FROM message_embeddings e
-                   JOIN messages m ON m.id = e.message_id
-                   JOIN conversations c ON c.id = m.conversation_id
-                  WHERE e.generation = ?1
-                    AND (?2 IS NULL OR c.provider = ?2)
-                    AND (?3 IS NULL OR m.created_at >= ?3)
-                    AND COALESCE(m.search_projection, m.content) <> ''
-                  ORDER BY m.id",
+                "SELECT dimensions, vector_count, message_rowids, norms,
+                        providers, created_ats, vectors
+                   FROM semantic_chunks
+                  WHERE generation = ?1
+                  ORDER BY chunk_id",
             )
             .map_err(AppError::database)?;
-        let mut rows = statement
-            .query(params![generation, provider, cutoff])
-            .map_err(AppError::database)?;
-        let mut result = SemanticVectors {
-            message_ids: Vec::new(),
-            values: Vec::new(),
-            norms: Vec::new(),
+        let mut rows = statement.query([generation]).map_err(AppError::database)?;
+        let mut result = SemanticChunks {
+            chunks: Vec::new(),
             dimensions: 0,
         };
         while let Some(row) = rows.next().map_err(AppError::database)? {
-            let dimensions: i64 = row.get(1).map_err(AppError::database)?;
+            let dimensions: i64 = row.get(0).map_err(AppError::database)?;
             let dimensions = usize::try_from(dimensions)
                 .map_err(|_| AppError::database_data("negative embedding dimensions"))?;
-            let norm: f32 = row.get(2).map_err(AppError::database)?;
-            let vector: Vec<u8> = row.get(3).map_err(AppError::database)?;
-            validate_quantized_vector(dimensions, norm, &vector)
-                .map_err(AppError::database_data)?;
+            let vector_count: i64 = row.get(1).map_err(AppError::database)?;
+            let vector_count = usize::try_from(vector_count)
+                .map_err(|_| AppError::database_data("negative semantic chunk size"))?;
+            let message_rowids = decode_i64_blob(
+                &row.get::<_, Vec<u8>>(2).map_err(AppError::database)?,
+                vector_count,
+                "semantic chunk rowid",
+            )?;
+            let norms = decode_f32_blob(
+                &row.get::<_, Vec<u8>>(3).map_err(AppError::database)?,
+                vector_count,
+                "semantic chunk norm",
+            )?;
+            if norms.iter().any(|norm| !norm.is_finite() || *norm < 0.0) {
+                return Err(AppError::database_data(
+                    "semantic chunk contains an invalid norm",
+                ));
+            }
+            let providers: Vec<u8> = row.get(4).map_err(AppError::database)?;
+            if providers.len() != vector_count
+                || providers.iter().any(|code| !matches!(code, 1 | 2))
+            {
+                return Err(AppError::database_data(
+                    "semantic chunk contains invalid provider metadata",
+                ));
+            }
+            let created_ats = decode_i64_blob(
+                &row.get::<_, Vec<u8>>(5).map_err(AppError::database)?,
+                vector_count,
+                "semantic chunk timestamp",
+            )?;
+            let values: Vec<u8> = row.get(6).map_err(AppError::database)?;
+            let expected_values = vector_count
+                .checked_mul(dimensions)
+                .ok_or_else(|| AppError::database_data("semantic chunk size overflows"))?;
+            if values.len() != expected_values {
+                return Err(AppError::database_data(
+                    "semantic chunk vector bytes do not match its dimensions",
+                ));
+            }
             if result.dimensions == 0 {
                 result.dimensions = dimensions;
             } else if result.dimensions != dimensions {
@@ -1045,29 +1234,41 @@ impl Storage {
                     "embedding rows have inconsistent dimensions",
                 ));
             }
-            result
-                .message_ids
-                .push(row.get(0).map_err(AppError::database)?);
-            result.norms.push(norm);
-            result.values.extend(vector);
+            let eligible = providers
+                .iter()
+                .zip(&created_ats)
+                .map(|(stored_provider, created_at)| {
+                    requested_provider.is_none_or(|wanted| wanted == *stored_provider)
+                        && cutoff.is_none_or(|minimum| {
+                            *created_at != MISSING_CREATED_AT && *created_at >= minimum
+                        })
+                })
+                .collect();
+            result.chunks.push(SemanticChunk {
+                message_rowids,
+                values,
+                norms,
+                eligible,
+                dimensions,
+            });
         }
         Ok(result)
     }
 
-    pub(crate) fn search_hits(&self, message_ids: &[&str]) -> Result<Vec<SearchHit>, AppError> {
+    pub(crate) fn search_hits(&self, message_rowids: &[i64]) -> Result<Vec<SearchHit>, AppError> {
         let mut statement = self
             .connection
             .prepare_cached(
                 "SELECT m.id, m.conversation_id, c.provider, m.role, m.content
                    FROM messages m
                    JOIN conversations c ON c.id = m.conversation_id
-                  WHERE m.id = ?1",
+                  WHERE m.rowid = ?1",
             )
             .map_err(AppError::database)?;
-        let mut hits = Vec::with_capacity(message_ids.len());
-        for message_id in message_ids {
+        let mut hits = Vec::with_capacity(message_rowids.len());
+        for message_rowid in message_rowids {
             let hit = statement
-                .query_row([message_id], |row| {
+                .query_row([message_rowid], |row| {
                     Ok(SearchHit {
                         id: row.get(0)?,
                         conversation_id: row.get(1)?,
@@ -1117,6 +1318,12 @@ impl Storage {
     ) -> Result<u64, AppError> {
         self.require_writer()?;
         self.mark_semantic_index_incomplete()?;
+        self.connection
+            .execute_batch(
+                "DELETE FROM semantic_chunks;
+                 DELETE FROM dirty_semantic_chunks;",
+            )
+            .map_err(AppError::database)?;
         let removed = self
             .connection
             .execute(
@@ -1192,6 +1399,25 @@ impl Storage {
             transaction.commit().map_err(AppError::database)?;
             return Ok(false);
         };
+        let semantic_generation = transaction
+            .query_row(
+                "SELECT semantic_ready_generation FROM derived_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(AppError::database)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT DISTINCT (rowid - 1) / ?2
+                   FROM messages WHERE conversation_id = ?1 ORDER BY 1",
+            )
+            .map_err(AppError::database)?;
+        let semantic_chunk_ids = statement
+            .query_map(params![id, SEMANTIC_CHUNK_ROWS], |row| row.get(0))
+            .map_err(AppError::database)?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(AppError::database)?;
+        drop(statement);
         transaction
             .execute(
                 "INSERT INTO tombstones(provider, conversation_id, forgotten_at)
@@ -1206,6 +1432,9 @@ impl Storage {
         let removed = transaction
             .execute("DELETE FROM conversations WHERE id = ?1", [id])
             .map_err(AppError::database)?;
+        for chunk_id in semantic_chunk_ids {
+            rebuild_semantic_chunk(&transaction, chunk_id, semantic_generation.as_deref())?;
+        }
         transaction.commit().map_err(AppError::database)?;
         Ok(removed > 0)
     }
@@ -1336,7 +1565,7 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
         "TEXT",
     )?;
     purge_unsupported_providers(&transaction)?;
-    if !provider_schema_is_current(&transaction)? {
+    if version < 11 || !provider_schema_is_current(&transaction)? {
         rebuild_provider_schema(&transaction)?;
     }
     if version < 8 {
@@ -1351,6 +1580,9 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
     }
     if version < 10 {
         backfill_semantic_readiness(&transaction)?;
+    }
+    if version < 11 {
+        rebuild_all_semantic_chunks(&transaction)?;
     }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1417,7 +1649,8 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
                 source_fingerprint TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE messages_next (
-                id TEXT PRIMARY KEY,
+                storage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
                 conversation_id TEXT NOT NULL REFERENCES conversations_next(id) ON DELETE CASCADE,
                 ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
                 search_projection TEXT, created_at INTEGER,
@@ -1433,7 +1666,7 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
                 SELECT id, provider, source_path, title, created_at, updated_at, source_fingerprint
                 FROM conversations;
              INSERT INTO messages_next
-                SELECT id, conversation_id, ordinal, role, content, search_projection,
+                SELECT rowid, id, conversation_id, ordinal, role, content, search_projection,
                        created_at, fingerprint
                 FROM messages;
              INSERT INTO message_embeddings_next(
@@ -1557,6 +1790,258 @@ fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> 
               WHERE provider NOT IN ('claude-code', 'codex');",
         )
         .map_err(AppError::database)
+}
+
+fn rebuild_all_semantic_chunks(connection: &Connection) -> Result<(), AppError> {
+    connection
+        .execute("DELETE FROM semantic_chunks", [])
+        .map_err(AppError::database)?;
+    let generation = connection
+        .query_row(
+            "SELECT semantic_ready_generation FROM derived_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map_err(AppError::database)?;
+    let Some(generation) = generation else {
+        return Ok(());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT (m.rowid - 1) / ?2
+               FROM message_embeddings e
+               JOIN messages m ON m.id = e.message_id
+              WHERE e.generation = ?1
+                AND COALESCE(m.search_projection, m.content) <> ''
+              ORDER BY 1",
+        )
+        .map_err(AppError::database)?;
+    let chunk_ids = statement
+        .query_map(params![generation, SEMANTIC_CHUNK_ROWS], |row| row.get(0))
+        .map_err(AppError::database)?
+        .collect::<Result<Vec<i64>, _>>()
+        .map_err(AppError::database)?;
+    drop(statement);
+    for chunk_id in chunk_ids {
+        rebuild_semantic_chunk(connection, chunk_id, Some(&generation))?;
+    }
+    Ok(())
+}
+
+fn rebuild_semantic_chunk(
+    connection: &Connection,
+    chunk_id: i64,
+    requested_generation: Option<&str>,
+) -> Result<(), AppError> {
+    let (first_rowid, last_rowid) = semantic_chunk_rowid_range(chunk_id)?;
+    let generation = match requested_generation {
+        Some(generation) => Some(generation.to_owned()),
+        None => connection
+            .query_row(
+                "SELECT e.generation
+                   FROM message_embeddings e
+                   JOIN messages m ON m.id = e.message_id
+                  WHERE m.rowid BETWEEN ?1 AND ?2
+                  ORDER BY m.rowid
+                  LIMIT 1",
+                params![first_rowid, last_rowid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AppError::database)?,
+    };
+    let packed = match generation.as_deref() {
+        Some(generation) => pack_semantic_chunk(connection, first_rowid, last_rowid, generation)?,
+        None => None,
+    };
+    let Some(packed) = packed else {
+        return delete_semantic_chunk(connection, chunk_id);
+    };
+    let generation = generation.ok_or_else(|| {
+        AppError::internal("packed semantic chunk is missing its embedding generation")
+    })?;
+    write_semantic_chunk(connection, chunk_id, &generation, &packed)
+}
+
+fn semantic_chunk_rowid_range(chunk_id: i64) -> Result<(i64, i64), AppError> {
+    if chunk_id < 0 {
+        return Err(AppError::database_data(
+            "negative semantic chunk identifier",
+        ));
+    }
+    let first = chunk_id
+        .checked_mul(SEMANTIC_CHUNK_ROWS)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| AppError::database_data("semantic chunk rowid range overflows"))?;
+    let last = first
+        .checked_add(SEMANTIC_CHUNK_ROWS - 1)
+        .ok_or_else(|| AppError::database_data("semantic chunk rowid range overflows"))?;
+    Ok((first, last))
+}
+
+fn pack_semantic_chunk(
+    connection: &Connection,
+    first_rowid: i64,
+    last_rowid: i64,
+    generation: &str,
+) -> Result<Option<PackedSemanticChunk>, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT m.rowid, e.dimensions, e.norm, e.vector, c.provider, m.created_at
+               FROM message_embeddings e
+               JOIN messages m ON m.id = e.message_id
+               JOIN conversations c ON c.id = m.conversation_id
+              WHERE m.rowid BETWEEN ?1 AND ?2
+                AND e.generation = ?3
+                AND COALESCE(m.search_projection, m.content) <> ''
+              ORDER BY m.rowid",
+        )
+        .map_err(AppError::database)?;
+    let mut rows = statement
+        .query(params![first_rowid, last_rowid, generation])
+        .map_err(AppError::database)?;
+    let mut dimensions = 0_usize;
+    let mut vector_count = 0_usize;
+    let mut message_rowids = Vec::new();
+    let mut norms = Vec::new();
+    let mut providers = Vec::new();
+    let mut created_ats = Vec::new();
+    let mut vectors = Vec::new();
+    while let Some(row) = rows.next().map_err(AppError::database)? {
+        let rowid: i64 = row.get(0).map_err(AppError::database)?;
+        let row_dimensions: i64 = row.get(1).map_err(AppError::database)?;
+        let row_dimensions = usize::try_from(row_dimensions)
+            .map_err(|_| AppError::database_data("negative embedding dimensions"))?;
+        let norm: f32 = row.get(2).map_err(AppError::database)?;
+        let vector: Vec<u8> = row.get(3).map_err(AppError::database)?;
+        validate_quantized_vector(row_dimensions, norm, &vector)
+            .map_err(AppError::database_data)?;
+        if dimensions == 0 {
+            dimensions = row_dimensions;
+        } else if dimensions != row_dimensions {
+            return Err(AppError::database_data(
+                "embedding rows have inconsistent dimensions",
+            ));
+        }
+        let provider: String = row.get(4).map_err(AppError::database)?;
+        let provider = match provider.as_str() {
+            "claude-code" => 1_u8,
+            "codex" => 2_u8,
+            _ => {
+                return Err(AppError::database_data(
+                    "unsupported provider in semantic index",
+                ));
+            }
+        };
+        let created_at: Option<i64> = row.get(5).map_err(AppError::database)?;
+        message_rowids.extend_from_slice(&rowid.to_le_bytes());
+        norms.extend_from_slice(&norm.to_le_bytes());
+        providers.push(provider);
+        created_ats.extend_from_slice(&created_at.unwrap_or(MISSING_CREATED_AT).to_le_bytes());
+        vectors.extend_from_slice(&vector);
+        vector_count += 1;
+    }
+    if vector_count == 0 {
+        return Ok(None);
+    }
+    let dimensions = i64::try_from(dimensions)
+        .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
+    let vector_count = i64::try_from(vector_count)
+        .map_err(|_| AppError::internal("semantic chunk has too many vectors"))?;
+    Ok(Some(PackedSemanticChunk {
+        dimensions,
+        vector_count,
+        message_rowids,
+        norms,
+        providers,
+        created_ats,
+        vectors,
+    }))
+}
+
+fn write_semantic_chunk(
+    connection: &Connection,
+    chunk_id: i64,
+    generation: &str,
+    packed: &PackedSemanticChunk,
+) -> Result<(), AppError> {
+    connection
+        .execute(
+            "INSERT INTO semantic_chunks(
+                chunk_id, generation, dimensions, vector_count, message_rowids,
+                norms, providers, created_ats, vectors
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(chunk_id) DO UPDATE SET
+                generation = excluded.generation,
+                dimensions = excluded.dimensions,
+                vector_count = excluded.vector_count,
+                message_rowids = excluded.message_rowids,
+                norms = excluded.norms,
+                providers = excluded.providers,
+                created_ats = excluded.created_ats,
+                vectors = excluded.vectors",
+            params![
+                chunk_id,
+                generation,
+                packed.dimensions,
+                packed.vector_count,
+                packed.message_rowids,
+                packed.norms,
+                packed.providers,
+                packed.created_ats,
+                packed.vectors
+            ],
+        )
+        .map_err(AppError::database)?;
+    Ok(())
+}
+
+fn delete_semantic_chunk(connection: &Connection, chunk_id: i64) -> Result<(), AppError> {
+    connection
+        .execute(
+            "DELETE FROM semantic_chunks WHERE chunk_id = ?1",
+            [chunk_id],
+        )
+        .map_err(AppError::database)?;
+    Ok(())
+}
+
+fn decode_i64_blob(bytes: &[u8], count: usize, label: &str) -> Result<Vec<i64>, AppError> {
+    if bytes.len() != count.saturating_mul(8) {
+        return Err(AppError::database_data(format!(
+            "{label} bytes do not match semantic chunk size"
+        )));
+    }
+    Ok(bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|bytes| i64::from_le_bytes(*bytes))
+        .collect())
+}
+
+fn decode_f32_blob(bytes: &[u8], count: usize, label: &str) -> Result<Vec<f32>, AppError> {
+    if bytes.len() != count.saturating_mul(4) {
+        return Err(AppError::database_data(format!(
+            "{label} bytes do not match semantic chunk size"
+        )));
+    }
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect())
+}
+
+fn provider_code(provider: &str) -> Result<u8, AppError> {
+    match provider {
+        "claude-code" => Ok(1),
+        "codex" => Ok(2),
+        _ => Err(AppError::usage(format!(
+            "unsupported provider filter: {provider}"
+        ))),
+    }
 }
 
 fn validate_quantized_vector(
@@ -2065,12 +2550,10 @@ mod tests {
         assert_eq!(storage.search("ordinary", 10, None, None).unwrap().len(), 1);
 
         let vectors = storage
-            .semantic_vectors("generation", None, None)
+            .semantic_chunks("generation", None, None)
             .expect("semantic vectors");
-        assert_eq!(
-            vectors.message_ids,
-            vec!["mixed".to_owned(), "ordinary".to_owned()]
-        );
+        assert_eq!(vectors.chunks.len(), 1);
+        assert_eq!(vectors.chunks[0].message_rowids, [2, 3]);
         storage
             .connection
             .execute(
@@ -2417,6 +2900,173 @@ mod tests {
         assert_eq!(validate_quantized_vector(3, 181.0, &vector), Ok(()));
         assert!(validate_quantized_vector(2, 181.0, &vector).is_err());
         assert!(validate_quantized_vector(3, f32::NAN, &vector).is_err());
+    }
+
+    #[test]
+    fn malformed_semantic_chunk_metadata_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("packed vector"))
+            .expect("seed message");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127, 0],
+                    norm: 127.0,
+                }],
+            )
+            .expect("seed embedding");
+        writer
+            .mark_semantic_index_ready("generation")
+            .expect("publish semantic chunk");
+        writer.commit_writer().expect("commit semantic chunk");
+        writer
+            .connection
+            .execute("UPDATE semantic_chunks SET norms = X'00'", [])
+            .expect("corrupt norm bytes");
+
+        assert!(writer.semantic_chunks("generation", None, None).is_err());
+    }
+
+    #[test]
+    fn semantic_chunks_bound_incremental_rewrites_to_affected_rowid_ranges() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("first chunk"))
+            .expect("seed first message");
+        writer
+            .connection
+            .execute(
+                "INSERT INTO messages(
+                    rowid, id, conversation_id, ordinal, role, content,
+                    search_projection, created_at, fingerprint
+                 ) VALUES (4097, 'message-4097', 'session-1', 4097, 'assistant',
+                           'second chunk', NULL, 123, 'fingerprint')",
+                [],
+            )
+            .expect("seed second chunk message");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[
+                    EmbeddingWrite {
+                        message_id: "message-1",
+                        vector: &[127, 0],
+                        norm: 127.0,
+                    },
+                    EmbeddingWrite {
+                        message_id: "message-4097",
+                        vector: &[0, 127],
+                        norm: 127.0,
+                    },
+                ],
+            )
+            .expect("seed embeddings");
+        writer
+            .mark_semantic_index_ready("generation")
+            .expect("publish semantic chunks");
+        writer.commit_writer().expect("commit chunks");
+
+        let chunk_count: i64 = writer
+            .connection
+            .query_row("SELECT count(*) FROM semantic_chunks", [], |row| row.get(0))
+            .expect("count chunks");
+        assert_eq!(chunk_count, 2);
+        let untouched_before: Vec<u8> = writer
+            .connection
+            .query_row(
+                "SELECT vectors FROM semantic_chunks WHERE chunk_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second chunk before update");
+
+        let mut writer = Storage::open_writer(&path).expect("update writer");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[0, 126],
+                    norm: 126.0,
+                }],
+            )
+            .expect("update first chunk embedding");
+        writer
+            .mark_semantic_index_ready("generation")
+            .expect("republish semantic chunks");
+        writer
+            .commit_writer()
+            .expect("commit incremental chunk update");
+
+        let untouched_after: Vec<u8> = writer
+            .connection
+            .query_row(
+                "SELECT vectors FROM semantic_chunks WHERE chunk_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second chunk after update");
+        assert_eq!(untouched_after, untouched_before);
+        let updated: Vec<u8> = writer
+            .connection
+            .query_row(
+                "SELECT vectors FROM semantic_chunks WHERE chunk_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("updated first chunk");
+        assert_eq!(updated, [0, 126]);
+    }
+
+    #[test]
+    fn explicit_semantic_storage_identifiers_survive_vacuum() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("stable identifier"))
+            .expect("seed message");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127, 0],
+                    norm: 127.0,
+                }],
+            )
+            .expect("seed embedding");
+        writer
+            .mark_semantic_index_ready("generation")
+            .expect("publish semantic chunk");
+        writer.commit_writer().expect("commit semantic chunk");
+        drop(writer);
+        let maintenance = Connection::open(&path).expect("maintenance connection");
+        maintenance
+            .execute_batch("VACUUM")
+            .expect("vacuum database");
+        drop(maintenance);
+        let storage = Storage::open_existing(&path).expect("open vacuumed database");
+        let chunks = storage
+            .semantic_chunks("generation", None, None)
+            .expect("read chunks after vacuum");
+        assert_eq!(chunks.chunks[0].message_rowids, [1]);
+        assert_eq!(
+            storage
+                .search_hits(&[1])
+                .expect("hydrate stable storage identifiers")
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-1"]
+        );
     }
 
     const VERSION_SEVEN_SCHEMA_FIXTURE: &str = "CREATE TABLE conversations (
@@ -2838,9 +3488,9 @@ mod tests {
         assert_eq!(storage.embedding_count("new-generation").expect("count"), 0);
         assert_eq!(
             storage
-                .semantic_vectors("new-generation", None, None)
+                .semantic_chunks("new-generation", None, None)
                 .expect("semantic documents")
-                .message_ids
+                .chunks
                 .len(),
             0
         );
@@ -2875,17 +3525,15 @@ mod tests {
         writer.commit_writer().expect("commit new generation");
         assert_eq!(writer.embedding_count("new-generation").expect("count"), 1);
         let vectors = writer
-            .semantic_vectors("new-generation", None, None)
+            .semantic_chunks("new-generation", None, None)
             .expect("stored quantized vectors");
-        assert_eq!(vectors.message_ids, ["message-1"]);
-        assert_eq!(vectors.values, [0, 127]);
-        assert_eq!(vectors.norms, [127.0]);
+        assert_eq!(vectors.chunks.len(), 1);
+        assert_eq!(vectors.chunks[0].message_rowids, [1]);
+        assert_eq!(vectors.chunks[0].values, [0, 127]);
+        assert_eq!(vectors.chunks[0].norms, [127.0]);
         assert_eq!(vectors.dimensions, 2);
         assert_eq!(
-            writer
-                .search_hits(&["message-1"])
-                .expect("hydrate semantic hit")[0]
-                .content,
+            writer.search_hits(&[1]).expect("hydrate semantic hit")[0].content,
             "generation proof"
         );
     }
