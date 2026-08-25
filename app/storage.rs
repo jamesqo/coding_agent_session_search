@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const FTS_BULK_REBUILD_PERCENT: u64 = 90;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS source_checkpoints (
 );
 CREATE TABLE IF NOT EXISTS derived_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    search_dirty INTEGER NOT NULL CHECK (search_dirty IN (0, 1))
+    search_dirty INTEGER NOT NULL CHECK (search_dirty IN (0, 1)),
+    semantic_ready_generation TEXT
 );
 INSERT OR IGNORE INTO derived_state(singleton, search_dirty) VALUES (1, 1);
 ";
@@ -370,8 +371,16 @@ impl Storage {
             counts: storage.counts()?,
             current_embeddings: storage.embedding_count(generation)?,
             derived_clean: !storage.derived_search_is_dirty()?,
-            exact_semantic_coverage: storage.semantic_coverage_is_complete(generation)?,
+            exact_semantic_coverage: storage.semantic_index_is_ready(generation)?,
         })
+    }
+
+    pub(crate) fn has_messages(&self) -> Result<bool, AppError> {
+        self.connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM messages LIMIT 1)", [], |row| {
+                row.get(0)
+            })
+            .map_err(AppError::database)
     }
 
     pub(crate) fn counts(&self) -> Result<Counts, AppError> {
@@ -445,6 +454,65 @@ impl Storage {
             .map_err(AppError::database)
     }
 
+    pub(crate) fn semantic_index_is_ready(&self, generation: &str) -> Result<bool, AppError> {
+        let ready_generation = self
+            .connection
+            .query_row(
+                "SELECT semantic_ready_generation
+                   FROM derived_state
+                  WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(AppError::database)?;
+        if ready_generation.as_deref() == Some(generation) {
+            return Ok(true);
+        }
+        self.connection
+            .query_row(
+                "SELECT NOT EXISTS (
+                    SELECT 1
+                      FROM messages
+                     WHERE COALESCE(search_projection, content) <> ''
+                     LIMIT 1
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)
+    }
+
+    pub(crate) fn mark_semantic_index_ready(&self, generation: &str) -> Result<(), AppError> {
+        self.require_writer()?;
+        if !self.semantic_coverage_is_complete(generation)? {
+            return Err(AppError::search_not_ready(
+                "semantic embedding coverage is incomplete",
+            ));
+        }
+        self.connection
+            .execute(
+                "UPDATE derived_state
+                    SET semantic_ready_generation = ?1
+                  WHERE singleton = 1",
+                [generation],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
+    }
+
+    fn mark_semantic_index_incomplete(&self) -> Result<(), AppError> {
+        self.require_writer()?;
+        self.connection
+            .execute(
+                "UPDATE derived_state
+                    SET semantic_ready_generation = NULL
+                  WHERE singleton = 1",
+                [],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
+    }
+
     pub(crate) fn replace_conversation(
         &mut self,
         conversation: &Conversation,
@@ -511,6 +579,9 @@ impl Storage {
 
         let (changed_message_ids, removed_messages) =
             self.reconcile_messages(conversation, &existing_messages)?;
+        if !changed_message_ids.is_empty() {
+            self.mark_semantic_index_incomplete()?;
+        }
         if self.defer_search_updates && (!changed_message_ids.is_empty() || removed_messages != 0) {
             self.mark_derived_search_dirty()?;
         }
@@ -653,7 +724,10 @@ impl Storage {
         self.connection
             .execute_batch(
                 "DELETE FROM message_embeddings;
-                 UPDATE derived_state SET search_dirty = 0 WHERE singleton = 1;",
+                 UPDATE derived_state
+                    SET search_dirty = 0,
+                        semantic_ready_generation = NULL
+                  WHERE singleton = 1;",
             )
             .map_err(AppError::database)?;
         self.defer_search_updates = false;
@@ -1042,6 +1116,7 @@ impl Storage {
         generation: &str,
     ) -> Result<u64, AppError> {
         self.require_writer()?;
+        self.mark_semantic_index_incomplete()?;
         let removed = self
             .connection
             .execute(
@@ -1254,6 +1329,12 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
         "norm",
         "REAL NOT NULL DEFAULT 0",
     )?;
+    add_column_if_missing(
+        &transaction,
+        "derived_state",
+        "semantic_ready_generation",
+        "TEXT",
+    )?;
     purge_unsupported_providers(&transaction)?;
     if !provider_schema_is_current(&transaction)? {
         rebuild_provider_schema(&transaction)?;
@@ -1268,12 +1349,42 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
             )
             .map_err(AppError::database)?;
     }
+    if version < 10 {
+        backfill_semantic_readiness(&transaction)?;
+    }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(AppError::database)?;
     transaction.commit().map_err(AppError::database)?;
     connection
         .pragma_update(None, "foreign_keys", true)
+        .map_err(AppError::database)
+}
+
+fn backfill_semantic_readiness(connection: &Connection) -> Result<(), AppError> {
+    connection
+        .execute_batch(
+            "UPDATE derived_state
+                SET semantic_ready_generation = CASE
+                    WHEN (SELECT count(DISTINCT generation)
+                            FROM message_embeddings) = 1
+                     AND NOT EXISTS (
+                        SELECT 1
+                          FROM messages m
+                          LEFT JOIN message_embeddings e ON e.message_id = m.id
+                         WHERE COALESCE(m.search_projection, m.content) <> ''
+                           AND e.message_id IS NULL
+                        UNION ALL
+                        SELECT 1
+                          FROM message_embeddings e
+                          JOIN messages m ON m.id = e.message_id
+                         WHERE COALESCE(m.search_projection, m.content) = ''
+                     )
+                    THEN (SELECT min(generation) FROM message_embeddings)
+                    ELSE NULL
+                END
+              WHERE singleton = 1;",
+        )
         .map_err(AppError::database)
 }
 
@@ -1571,6 +1682,76 @@ mod tests {
             storage
                 .source_checkpoint_matches("codex", "/tmp/session-1.jsonl", 100, 200)
                 .expect("read checkpoint")
+        );
+    }
+
+    #[test]
+    fn semantic_readiness_changes_atomically_with_canonical_messages() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("original text"))
+            .expect("seed conversation");
+        writer
+            .replace_embeddings(
+                "generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127],
+                    norm: 127.0,
+                }],
+            )
+            .expect("seed embedding");
+        writer
+            .mark_semantic_index_ready("generation")
+            .expect("mark initial index ready");
+        writer.commit_writer().expect("commit ready index");
+
+        let storage = Storage::open_existing(&path).expect("open ready database");
+        assert!(
+            storage
+                .semantic_index_is_ready("generation")
+                .expect("read initial readiness")
+        );
+        drop(storage);
+
+        let mut rolled_back = Storage::open_writer(&path).expect("rollback writer");
+        rolled_back
+            .replace_conversation(&conversation("rolled back change"))
+            .expect("change canonical message");
+        assert!(
+            !rolled_back
+                .semantic_index_is_ready("generation")
+                .expect("read transactional invalidation")
+        );
+        drop(rolled_back);
+
+        let storage = Storage::open_existing(&path).expect("reopen after rollback");
+        assert!(
+            storage
+                .semantic_index_is_ready("generation")
+                .expect("read readiness after rollback")
+        );
+        drop(storage);
+
+        let mut committed = Storage::open_writer(&path).expect("commit writer");
+        committed
+            .replace_conversation(&conversation("committed change"))
+            .expect("change canonical message");
+        committed.checkpoint_writer().expect("commit invalidation");
+        assert!(
+            !committed
+                .semantic_index_is_ready("generation")
+                .expect("read committed invalidation")
+        );
+        committed.commit_writer().expect("finish writer");
+
+        let storage = Storage::open_existing(&path).expect("reopen incomplete database");
+        assert!(
+            !storage
+                .semantic_index_is_ready("generation")
+                .expect("read incomplete readiness")
         );
     }
 
@@ -2435,6 +2616,11 @@ mod tests {
         assert_eq!(storage.counts().expect("counts").conversations, 1);
         assert_eq!(storage.counts().expect("counts").messages, 1);
         assert_eq!(storage.counts().expect("counts").embeddings, 1);
+        assert!(
+            storage
+                .semantic_index_is_ready("old-generation")
+                .expect("backfilled semantic readiness")
+        );
         assert_eq!(
             storage
                 .connection

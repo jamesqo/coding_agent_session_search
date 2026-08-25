@@ -21,7 +21,7 @@ const MARKER_NAME: &str = "installed.json";
 const EMBEDDING_REPOSITORY: &str = "models--Xenova--all-MiniLM-L6-v2";
 const RERANKER_REPOSITORY: &str = "models--jinaai--jina-reranker-v1-turbo-en";
 const CANDIDATE_LIMIT: usize = 50;
-const RERANK_LIMIT: usize = 20;
+const RERANK_LIMIT: usize = 10;
 const EMBEDDING_BATCH_SIZE: usize = 8;
 const EMBEDDING_WORKERS: usize = 8;
 const EMBEDDING_THREADS_PER_WORKER: usize = 2;
@@ -711,6 +711,11 @@ mod tests {
     use super::*;
     use crate::storage::SearchableMessage;
     use veritas_test_macros as veritas;
+
+    #[test]
+    fn reranking_is_bounded_to_ten_documents() {
+        assert_eq!(RERANK_LIMIT, 10);
+    }
 
     #[veritas::claims("semantic-indexing/repeated-text-reuses-inference")]
     #[test]

@@ -371,11 +371,7 @@ fn index(
         semantic::rebuild_embeddings(&mut storage, &mut embedding_pool, emit_embedding_progress)?;
     let embedding_milliseconds = elapsed_milliseconds(embedding_started);
     let counts = storage.counts()?;
-    if !storage.semantic_coverage_is_complete(semantic::embedding_generation())? {
-        return Err(AppError::search_not_ready(
-            "semantic embedding coverage is incomplete",
-        ));
-    }
+    storage.mark_semantic_index_ready(semantic::embedding_generation())?;
     storage.commit_writer()?;
     emit_index_phase("complete", &summary);
     Ok(Response::Index(IndexResponse {
@@ -510,10 +506,9 @@ fn local_search(
     let models = Models::new(models_dir.to_path_buf());
     models.require_installed()?;
     let storage = Storage::open_existing(database_path)?;
-    let counts = storage.counts()?;
     if storage.derived_search_is_dirty()?
-        || counts.messages == 0
-        || !storage.semantic_coverage_is_complete(semantic::embedding_generation())?
+        || !storage.has_messages()?
+        || !storage.semantic_index_is_ready(semantic::embedding_generation())?
     {
         return Err(AppError::search_not_ready(
             "semantic index is incomplete; run `cass index`",

@@ -18,8 +18,8 @@ checkpoints, compatible-generation rollover, and node-local coverage reporting
 without changing CASS's models, vector format, exact search, fusion, reranking,
 providers, commands, or explicit model-install boundary.
 
-The change evolves the version-9 single-generation vector schema into a
-version-10 serving/target schema. It does not add lexical fallback, a daemon,
+The change evolves the version-10 single-generation vector schema into a
+version-11 serving/target schema. It does not add lexical fallback, a daemon,
 background work, ANN indexing, provider abstractions, configuration knobs, or
 dependencies. Superseded vectors are temporary migration state, not retained
 release history.
@@ -60,7 +60,7 @@ the repository-wide baseline.
 | ID | Decision | Rationale | Consequence |
 |---|---|---|---|
 | PC-1 | Preserve mandatory hybrid retrieval and typed failure; evolve only its readiness boundary | Partial coverage must remain semantic and must not reintroduce the removed lexical mode | FTS, vectors, RRF, and reranking all use one serving-generation subset |
-| PC-2 | Replace one-row-per-message vector storage with transient multi-generation storage | A complete compatible generation must remain searchable while its replacement builds | Schema 10 keys vectors by message and generation and stores serving/target state |
+| PC-2 | Replace one-row-per-message vector storage with transient multi-generation storage | A complete compatible generation must remain searchable while its replacement builds | Schema 11 keys vectors by message and generation and stores serving/target state |
 | PC-3 | Preserve exact i8 cosine search, FastEmbed models, text projection, FTS5, RRF, rerank limits, and model installation | These are measured foundations and explicitly outside the change | No relevance algorithm, model asset, or dependency change is permitted |
 | PC-4 | Evolve federation protocol 2 to protocol 3 | An old response cannot prove covered-subset semantics or provide node coverage | Rolling deployment exposes typed incompatible-node outcomes until all binaries match |
 | PC-5 | Preserve canonical ingestion, tombstones, provider-scan safety, JSON-only output, and the six-command CLI | Progressive readiness is derived-state behavior | No parser, config, command, or canonical identity redesign is included |
@@ -74,7 +74,7 @@ app/semantic.rs
   recency checkpoint-window planner
   length-aware FastEmbed batches
                  ↓
-app/storage.rs (schema 10)
+app/storage.rs (schema 11)
   embedding_generations + semantic_state
   serving/target coverage snapshot
   generation-filtered FTS + exact vectors
@@ -95,7 +95,7 @@ introduced.
 
 ### C-1 — Semantic generation storage
 
-- Outcome: schema 10 can hold one steady-state generation or two compatible
+- Outcome: schema 11 can hold one steady-state generation or two compatible
   rollover generations and compute a consistent coverage snapshot.
 - Foundation: schema migrations, writer checkpoints, cascading message
   deletion, quantized-vector validation, and read-only status snapshots in
@@ -200,9 +200,9 @@ delivery value.
   no live/lock drift for scoped claims; baseline compile/harness/infrastructure
   is green; any unrelated repository Veritas findings are explicitly unchanged.
 
-- [ ] **PH-1 — Schema 10 and generation-state foundation.** Depends on PH-0.
+- [ ] **PH-1 — Schema 11 and generation-state foundation.** Depends on PH-0.
   Implement C-1 exclusively in `app/storage.rs` and its module tests. Preserve
-  complete exact-current version-9 databases on migration, reject malformed
+  complete exact-current version-10 databases on migration, reject malformed
   state, and prove target preparation, partial promotion, compatible retention,
   atomic switch/cleanup, canonical deletion, and rollback. Run the focused
   storage migration/state tests immediately; any failure blocks. Exit: the

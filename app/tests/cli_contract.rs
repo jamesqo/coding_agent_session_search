@@ -24,7 +24,15 @@ fn run_json(arguments: &[&str]) -> Value {
 }
 
 fn error_kind(output: &std::process::Output) -> Value {
-    serde_json::from_slice::<Value>(&output.stderr).expect("typed error")["error"]["kind"].clone()
+    serde_json::from_slice::<Value>(&output.stderr).unwrap_or_else(|error| {
+        panic!(
+            "typed error: {error}; status={:?}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })["error"]["kind"]
+        .clone()
 }
 
 fn sorted_lines(path: &Path) -> Vec<String> {
@@ -35,6 +43,23 @@ fn sorted_lines(path: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     lines.sort();
     lines
+}
+
+#[cfg(unix)]
+fn run_search_with_legacy_node_environment(
+    path: &std::ffi::OsStr,
+    root: &Path,
+    log: &Path,
+) -> std::process::Output {
+    Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("PATH", path)
+        .envs([("XDG_CONFIG_HOME", root), ("XDG_DATA_HOME", root)])
+        .env("CASS_FAKE_SSH_LOG", log)
+        .env("CASS_SEARCH_NODES", "dev-macbook")
+        .args(["search", "query"])
+        .output()
+        .expect("local-only search")
 }
 
 fn create_valid_model_marker(root: &Path) {
@@ -74,12 +99,13 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
                 dimensions INTEGER NOT NULL, norm REAL NOT NULL, vector BLOB NOT NULL
              );
              CREATE TABLE derived_state (
-                singleton INTEGER PRIMARY KEY, search_dirty INTEGER NOT NULL
+                singleton INTEGER PRIMARY KEY, search_dirty INTEGER NOT NULL,
+                semantic_ready_generation TEXT
              );
-             INSERT INTO derived_state VALUES (1, 0);
+             INSERT INTO derived_state VALUES (1, 0, NULL);
              INSERT INTO conversations(id, provider, source_path)
                 VALUES ('session', 'codex', '/tmp/session.jsonl');
-             PRAGMA user_version = 9;",
+             PRAGMA user_version = 10;",
         )
         .expect("readiness schema");
     connection
@@ -722,14 +748,21 @@ fn status_uses_model_then_database_then_embedding_readiness() {
 
     let ready_database = directory.path().join("ready.sqlite3");
     seed_readiness_database(&ready_database, None);
-    Connection::open(&ready_database)
-        .expect("ready database")
+    let ready_connection = Connection::open(&ready_database).expect("ready database");
+    let generation = current_embedding_generation();
+    ready_connection
         .execute(
             "INSERT INTO message_embeddings(message_id, generation, dimensions, norm, vector)
              VALUES ('message', ?1, 1, 127.0, X'7F')",
-            [current_embedding_generation()],
+            [&generation],
         )
         .expect("current embedding");
+    ready_connection
+        .execute(
+            "UPDATE derived_state SET semantic_ready_generation = ?1 WHERE singleton = 1",
+            [&generation],
+        )
+        .expect("semantic readiness");
     let ready = run_json(&[
         "--db",
         ready_database.to_str().unwrap(),
@@ -927,7 +960,6 @@ fn configured_federation_uses_inventory_destinations_and_logical_names() {
         sorted_lines(&log),
         ["backup-tail search", "dev-tail search"]
     );
-
     std::fs::write(&log, "").expect("clear log");
     let explicit = run_search(&["personal-macbook", "personal-macbook"]);
     assert_eq!(error_kind(&explicit), "model");
@@ -935,7 +967,6 @@ fn configured_federation_uses_inventory_destinations_and_logical_names() {
         std::fs::read_to_string(&log).unwrap(),
         "personal-tail search\n"
     );
-
     for invalid in ["xenia", "unknown"] {
         std::fs::write(&log, "").expect("clear log");
         let output = run_search(&[invalid]);
@@ -961,14 +992,7 @@ fn configured_federation_uses_inventory_destinations_and_logical_names() {
     );
 
     std::fs::write(&log, "").expect("clear log");
-    let ignored = Command::cargo_bin("cass")
-        .expect("cass binary")
-        .env("PATH", path)
-        .env("CASS_FAKE_SSH_LOG", &log)
-        .env("CASS_SEARCH_NODES", "dev-macbook")
-        .args(["search", "query"])
-        .output()
-        .expect("local-only search");
+    let ignored = run_search_with_legacy_node_environment(&path, directory.path(), &log);
     assert_eq!(error_kind(&ignored), "model");
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
 }
@@ -1004,6 +1028,10 @@ fn explicit_remote_nodes_require_configuration_before_local_work_or_ssh() {
         let output = Command::cargo_bin("cass")
             .expect("cass binary")
             .env("PATH", &path)
+            .envs([
+                ("XDG_CONFIG_HOME", directory.path()),
+                ("XDG_DATA_HOME", directory.path()),
+            ])
             .env("CASS_FAKE_SSH_LOG", &log)
             .args(arguments)
             .output()

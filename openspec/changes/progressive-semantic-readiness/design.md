@@ -42,7 +42,7 @@ so readiness and coverage are necessarily node-local.
 
 ## Ownership and Boundaries
 
-`app/storage.rs` owns schema version 10, generation metadata, the singleton
+`app/storage.rs` owns schema version 11, generation metadata, the singleton
 serving/target state, coverage snapshots, newest-first missing-row selection,
 generation-constrained FTS and vector reads, checkpoint promotion, and obsolete
 generation cleanup. It receives concrete generation and embedding-space
@@ -219,12 +219,12 @@ prove the covered-subset contract.
 - Protocol version 3 creates a temporary compatibility failure during rolling
   deployment. Existing federation already exposes per-node incompatibility and
   preserves healthy results.
-- Schema version 10 is not readable by the previous binary. Deployment backups
+- Schema version 11 is not readable by the previous binary. Deployment backups
   remain the rollback boundary.
 
 ## Migration / Rollback
 
-Schema migration 9 to 10 rebuilds `message_embeddings` with the composite key,
+Schema migration 10 to 11 rebuilds `message_embeddings` with the composite key,
 copies valid rows, creates generation metadata/state, and advances
 `user_version` in one transaction. If the copied rows belong to the build's
 exact current generation and cover the searchable corpus, that generation is
@@ -232,15 +232,15 @@ recognized as both serving and target without re-embedding. Unknown or
 incomplete legacy generation rows remain non-serving and may be removed when
 the current target is prepared.
 
-Before fleet deployment, back up each database. Deploy protocol version 3 to
+Before fleet deployment, back up each version-10 database. Deploy protocol version 3 to
 all three machines, verify that previously complete databases report complete
 coverage, then exercise an interrupted disposable backfill to confirm partial
 search and resume before indexing production databases. During a compatible
 future rollover, allow temporary vector growth and verify that the old serving
 generation remains named until the atomic switch.
 
-Rollback before migration is a binary redeploy. After schema 10 opens, restore
-the version-9 backup before redeploying the prior binary. Source histories and
+Rollback before migration is a binary redeploy. After schema 11 opens, restore
+the version-10 backup before redeploying the prior binary. Source histories and
 model assets remain unchanged, so a database rebuild is the fallback if no
 backup is available.
 
