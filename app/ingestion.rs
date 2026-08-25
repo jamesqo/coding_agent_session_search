@@ -58,6 +58,9 @@ pub(crate) struct NormalizedMessage {
     pub(crate) ordinal: i64,
     pub(crate) role: String,
     pub(crate) content: String,
+    /// `None` searches canonical content, an empty string makes the message
+    /// context-only, and a nonempty value searches that filtered projection.
+    pub(crate) search_projection: Option<String>,
     pub(crate) created_at: Option<i64>,
 }
 
@@ -103,7 +106,14 @@ struct ProgressEvent<'a> {
     bytes_per_second: u64,
 }
 
-type ExtractedMessage = (Option<String>, String, String, Option<i64>, Option<String>);
+struct ExtractedMessage {
+    source_id: Option<String>,
+    role: String,
+    content: String,
+    search_projection: Option<String>,
+    created_at: Option<i64>,
+    session_id: Option<String>,
+}
 
 impl ProviderRoots {
     pub(crate) fn new() -> Self {
@@ -568,6 +578,7 @@ fn parse_opencode(path: &Path) -> Result<ParsedDatabase, AppError> {
                 ordinal,
                 role,
                 content,
+                search_projection: None,
                 created_at: message_created_at,
             });
         }
@@ -654,13 +665,14 @@ fn parse_copilot(path: &Path) -> Result<ParsedFile, AppError> {
             .or_else(|| payload.get("message"))
             .or_else(|| payload.get("text"))
             .and_then(flatten_content)?;
-        Some((
-            raw.get("id").and_then(Value::as_str).map(str::to_owned),
-            role.to_owned(),
+        Some(ExtractedMessage {
+            source_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            role: role.to_owned(),
             content,
-            parse_timestamp(raw.get("timestamp")),
-            None,
-        ))
+            search_projection: None,
+            created_at: parse_timestamp(raw.get("timestamp")),
+            session_id: None,
+        })
     })?;
     if let Some(conversation) = &mut parsed.conversation
         && let Some(session_id) = path
@@ -743,6 +755,7 @@ fn parse_hermes(path: &Path) -> Result<ParsedDatabase, AppError> {
                 ordinal,
                 role,
                 content,
+                search_projection: None,
                 created_at: message_created_at,
             });
         }
@@ -775,16 +788,18 @@ fn parse_claude(path: &Path) -> Result<ParsedFile, AppError> {
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or(entry_type);
-        let content = flatten_content(message.get("content")?)?;
-        Some((
-            raw.get("uuid").and_then(Value::as_str).map(str::to_owned),
-            role.to_owned(),
+        let (content, search_projection) = claude_content(message.get("content")?)?;
+        Some(ExtractedMessage {
+            source_id: raw.get("uuid").and_then(Value::as_str).map(str::to_owned),
+            role: role.to_owned(),
             content,
-            parse_timestamp(raw.get("timestamp")),
-            raw.get("sessionId")
+            search_projection,
+            created_at: parse_timestamp(raw.get("timestamp")),
+            session_id: raw
+                .get("sessionId")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-        ))
+        })
     })
 }
 
@@ -813,20 +828,21 @@ fn parse_pi(path: &Path) -> Result<ParsedFile, AppError> {
         if role == "tool" {
             content = truncate_chars(&content, MAX_TOOL_OUTPUT_CHARS);
         }
-        Some((
-            raw.get("id").and_then(Value::as_str).map(str::to_owned),
-            role.to_owned(),
+        Some(ExtractedMessage {
+            source_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            role: role.to_owned(),
             content,
-            parse_timestamp(raw.get("timestamp")),
-            None,
-        ))
+            search_projection: None,
+            created_at: parse_timestamp(raw.get("timestamp")),
+            session_id: None,
+        })
     })
 }
 
 fn extract_codex_response_item(raw: &Value) -> Option<ExtractedMessage> {
     let payload = raw.get("payload")?;
     let payload_type = payload.get("type").and_then(Value::as_str)?;
-    let (role, content) = match payload_type {
+    let (role, content, search_projection) = match payload_type {
         "message" => (
             payload
                 .get("role")
@@ -834,6 +850,7 @@ fn extract_codex_response_item(raw: &Value) -> Option<ExtractedMessage> {
                 .unwrap_or("assistant")
                 .to_owned(),
             flatten_content(payload.get("content")?)?,
+            None,
         ),
         "function_call" | "custom_tool_call" => {
             let name = payload
@@ -845,28 +862,36 @@ fn extract_codex_response_item(raw: &Value) -> Option<ExtractedMessage> {
                 .or_else(|| payload.get("input"))
                 .map(stringify_value)
                 .unwrap_or_default();
-            ("assistant".to_owned(), format!("Tool {name}: {arguments}"))
+            (
+                "assistant".to_owned(),
+                format!("Tool {name}: {arguments}"),
+                None,
+            )
         }
         "function_call_output" | "custom_tool_call_output" => {
             let output = payload.get("output").map(stringify_value)?;
-            (
-                "tool".to_owned(),
-                truncate_chars(&output, MAX_TOOL_OUTPUT_CHARS),
-            )
+            let content = truncate_chars(&output, MAX_TOOL_OUTPUT_CHARS);
+            ("tool".to_owned(), content, Some(String::new()))
         }
         _ => return None,
     };
-    Some((
-        payload
+    Some(ExtractedMessage {
+        source_id: payload
             .get("id")
-            .or_else(|| payload.get("call_id"))
             .and_then(Value::as_str)
-            .map(str::to_owned),
+            .map(str::to_owned)
+            .or_else(|| {
+                payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(|call_id| format!("{payload_type}:{call_id}"))
+            }),
         role,
         content,
-        parse_timestamp(raw.get("timestamp")),
-        None,
-    ))
+        search_projection,
+        created_at: parse_timestamp(raw.get("timestamp")),
+        session_id: None,
+    })
 }
 
 fn parse_jsonl(
@@ -901,27 +926,28 @@ fn parse_jsonl(
         } else if provider == "pi" && raw.get("type").and_then(Value::as_str) == Some("session") {
             session_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
         }
-        let Some((source_id, role, content, created_at, message_session_id)) = extract(&raw) else {
+        let Some(extracted) = extract(&raw) else {
             continue;
         };
-        if content.trim().is_empty() {
+        if extracted.content.trim().is_empty() {
             continue;
         }
         if session_id.is_none() {
-            session_id = message_session_id;
+            session_id = extracted.session_id;
         }
         let ordinal = i64::try_from(messages.len())
             .map_err(|_| AppError::internal("conversation contains too many messages"))?;
-        let message_key = source_id.unwrap_or_else(|| ordinal.to_string());
+        let message_key = extracted.source_id.unwrap_or_else(|| ordinal.to_string());
         messages.push(NormalizedMessage {
             id: stable_id(
                 "message",
                 &[provider, &path.to_string_lossy(), &message_key],
             ),
             ordinal,
-            role,
-            content,
-            created_at,
+            role: extracted.role,
+            content: extracted.content,
+            search_projection: extracted.search_projection,
+            created_at: extracted.created_at,
         });
     }
     if messages.is_empty() {
@@ -968,6 +994,31 @@ fn flatten_content(value: &Value) -> Option<String> {
         Value::Object(_) => flatten_block(value),
         _ => None,
     }
+}
+
+fn claude_content(value: &Value) -> Option<(String, Option<String>)> {
+    let content = flatten_content(value)?;
+    if is_tool_result(value) {
+        return Some((content, Some(String::new())));
+    }
+    let Value::Array(blocks) = value else {
+        return Some((content, None));
+    };
+    let contains_tool_result = blocks.iter().any(is_tool_result);
+    if !contains_tool_result {
+        return Some((content, None));
+    }
+    let projection = blocks
+        .iter()
+        .filter(|block| !is_tool_result(block))
+        .filter_map(flatten_block)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((content, Some(projection)))
+}
+
+fn is_tool_result(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("tool_result")
 }
 
 fn flatten_block(block: &Value) -> Option<String> {
@@ -1063,6 +1114,42 @@ mod tests {
         assert_eq!(conversation.messages[1].content, "world");
     }
 
+    #[veritas::claims(
+        "search/tool-results-are-not-searchable",
+        "search/mixed-message-excludes-tool-result-text",
+        "view/tool-results-remain-visible"
+    )]
+    #[test]
+    fn claude_parser_separates_tool_results_from_searchable_text() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
+        writeln!(file, r#"{{"type":"user","sessionId":"s1","uuid":"mixed","message":{{"role":"user","content":[{{"type":"text","text":"keep this request"}},{{"type":"tool_result","content":"private tool payload"}}]}}}}"#).expect("mixed line");
+        writeln!(file, r#"{{"type":"user","sessionId":"s1","uuid":"tool-only","message":{{"role":"user","content":[{{"type":"tool_result","content":"only tool payload"}}]}}}}"#).expect("tool-result line");
+
+        let parsed = parse_claude(file.path()).expect("parse Claude history");
+        let messages = parsed.conversation.expect("conversation").messages;
+        assert_eq!(
+            messages[0].content,
+            "keep this request\nprivate tool payload"
+        );
+        assert_eq!(
+            messages[0].search_projection.as_deref(),
+            Some("keep this request")
+        );
+        assert_eq!(messages[1].content, "only tool payload");
+        assert_eq!(messages[1].search_projection.as_deref(), Some(""));
+
+        let mut object_file = tempfile::NamedTempFile::new().expect("temporary JSONL");
+        writeln!(object_file, r#"{{"type":"user","sessionId":"s2","uuid":"object","message":{{"role":"user","content":{{"type":"tool_result","content":"object tool payload"}}}}}}"#).expect("object tool-result line");
+        let object = parse_claude(object_file.path())
+            .expect("parse object tool result")
+            .conversation
+            .expect("object conversation")
+            .messages
+            .remove(0);
+        assert_eq!(object.content, "object tool payload");
+        assert_eq!(object.search_projection.as_deref(), Some(""));
+    }
+
     #[veritas::claims("ingestion/provider-boundary")]
     #[test]
     fn codex_parser_keeps_messages_and_tool_calls() {
@@ -1146,6 +1233,10 @@ mod tests {
         );
         assert_eq!(conversation.messages[1].role, "tool");
         assert_eq!(conversation.messages[1].content, "created diagram.png");
+        assert_eq!(
+            conversation.messages[1].search_projection.as_deref(),
+            Some("")
+        );
     }
 
     #[veritas::claims(
@@ -1174,6 +1265,7 @@ mod tests {
                     ordinal: 0,
                     role: "user".to_owned(),
                     content: "preserve until complete".to_owned(),
+                    search_projection: None,
                     created_at: None,
                 }],
             })

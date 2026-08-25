@@ -12,7 +12,7 @@ use crate::AppError;
 use crate::cli::{SearchResponse, ViewResponse};
 use crate::storage::SearchHit;
 
-const PROTOCOL_VERSION: u8 = 1;
+const PROTOCOL_VERSION: u8 = 2;
 const MAX_NODES: usize = 16;
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
@@ -141,6 +141,17 @@ struct MergedHit {
     score: f64,
 }
 
+#[derive(Deserialize)]
+struct RemoteErrorEnvelope {
+    error: RemoteErrorBody,
+}
+
+#[derive(Deserialize)]
+struct RemoteErrorBody {
+    kind: String,
+    message: String,
+}
+
 pub(crate) fn select_nodes(explicit: &[String]) -> Result<Vec<String>, AppError> {
     let candidates = if explicit.is_empty() {
         std::env::var("CASS_SEARCH_NODES")
@@ -227,8 +238,6 @@ pub(crate) fn merge_search(
     SearchResponse {
         query: local.query,
         realized_mode: "federated".to_owned(),
-        fallback_mode: None,
-        fallback_reason: local.fallback_reason,
         results,
         nodes: Some(outcomes),
     }
@@ -268,15 +277,40 @@ fn merge_ranked_results(
 }
 
 pub(crate) fn remote_search(node: String, request: &SearchRequest) -> RemoteResult<SearchResponse> {
-    remote_call(
-        OsStr::new("ssh"),
+    remote_search_with(OsStr::new("ssh"), node, request, REMOTE_TIMEOUT)
+}
+
+fn remote_search_with(
+    ssh: &OsStr,
+    node: String,
+    request: &SearchRequest,
+    timeout: Duration,
+) -> RemoteResult<SearchResponse> {
+    let mut result = remote_call(
+        ssh,
         node,
         "search",
         request,
-        REMOTE_TIMEOUT,
+        timeout,
         "search",
         |envelope: SearchEnvelope| envelope.response,
-    )
+    );
+    if result
+        .response
+        .as_ref()
+        .is_some_and(|response| response.realized_mode != "hybrid")
+    {
+        return remote_error(
+            result.outcome.node,
+            result.outcome.elapsed_ms,
+            "incompatible-response",
+            "remote search did not report hybrid realization".to_owned(),
+        );
+    }
+    if result.response.is_some() {
+        result.outcome.realized_mode = Some("hybrid".to_owned());
+    }
+    result
 }
 
 pub(crate) fn remote_view(node: String, request: &ViewRequest) -> RemoteResult<ViewResponse> {
@@ -343,6 +377,14 @@ where
     }
     if !process.status.success() {
         let diagnostic = bounded_diagnostic(&process.stderr.bytes);
+        if let Some(remote) = parse_remote_error(&process.stderr.bytes) {
+            return remote_error(
+                node,
+                process.elapsed_ms,
+                remote.error.kind,
+                remote.error.message,
+            );
+        }
         return remote_error(
             node,
             process.elapsed_ms,
@@ -418,7 +460,7 @@ impl EnvelopeMetadata for ViewEnvelope {
 fn remote_error<T>(
     node: String,
     elapsed_ms: u64,
-    error_kind: &'static str,
+    error_kind: impl Into<String>,
     error: String,
 ) -> RemoteResult<T> {
     RemoteResult {
@@ -428,7 +470,7 @@ fn remote_error<T>(
             status: "error".to_owned(),
             elapsed_ms,
             realized_mode: None,
-            error_kind: Some(error_kind.to_owned()),
+            error_kind: Some(error_kind.into()),
             error: Some(error),
         },
     }
@@ -544,6 +586,14 @@ fn bounded_diagnostic(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
+fn parse_remote_error(bytes: &[u8]) -> Option<RemoteErrorEnvelope> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .and_then(|line| serde_json::from_slice(line).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -551,6 +601,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use veritas_test_macros as veritas;
 
     #[test]
     fn node_alias_validation_covers_boundaries() {
@@ -643,6 +694,53 @@ mod tests {
         );
     }
 
+    #[veritas::claims(
+        "federated-search/semantic-unready-node-is-partial-failure",
+        "federated-search/successful-nodes-are-hybrid"
+    )]
+    #[test]
+    fn remote_search_accepts_only_v2_hybrid_successes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request = SearchRequest::new("query".to_owned(), 1, None, None);
+        for (name, body, expected) in [
+            (
+                "v1",
+                "cat >/dev/null; printf '%s\\n' '{\"protocol\":1,\"kind\":\"search\",\"response\":{\"query\":\"query\",\"realized_mode\":\"hybrid\",\"results\":[]}}'\n",
+                Some("incompatible-response"),
+            ),
+            (
+                "lexical-v2",
+                "cat >/dev/null; printf '%s\\n' '{\"protocol\":2,\"kind\":\"search\",\"response\":{\"query\":\"query\",\"realized_mode\":\"lexical\",\"results\":[]}}'\n",
+                Some("incompatible-response"),
+            ),
+            (
+                "unready-v2",
+                "cat >/dev/null; printf 'SSH host banner\\n%s\\n' '{\"error\":{\"kind\":\"search-not-ready\",\"message\":\"run index\"}}' >&2; exit 8\n",
+                Some("search-not-ready"),
+            ),
+            (
+                "hybrid-v2",
+                "cat >/dev/null; printf '%s\\n' '{\"protocol\":2,\"kind\":\"search\",\"response\":{\"query\":\"query\",\"realized_mode\":\"hybrid\",\"results\":[]}}'\n",
+                None,
+            ),
+        ] {
+            let executable = fake_executable(directory.path(), name, body);
+            let result = remote_search_with(
+                executable.as_os_str(),
+                name.to_owned(),
+                &request,
+                Duration::from_secs(1),
+            );
+            assert_eq!(result.outcome.error_kind.as_deref(), expected, "{name}");
+            if expected.is_none() {
+                assert!(result.response.is_some());
+                assert_eq!(result.outcome.realized_mode.as_deref(), Some("hybrid"));
+            } else {
+                assert!(result.response.is_none());
+            }
+        }
+    }
+
     #[test]
     fn rank_merge_deduplicates_by_identity_without_score_inflation() {
         let local = response(vec![hit("shared", "conversation", "local copy")]);
@@ -690,12 +788,47 @@ mod tests {
         assert_eq!(merged.results[1].provider, "zeta");
     }
 
+    #[test]
+    fn rank_merge_preserves_ready_results_and_unready_node_outcomes() {
+        let ready = RemoteResult {
+            response: Some(response(vec![hit(
+                "remote",
+                "remote-conversation",
+                "ready",
+            )])),
+            outcome: NodeOutcome {
+                node: "ready-node".to_owned(),
+                status: "ok".to_owned(),
+                elapsed_ms: 1,
+                realized_mode: Some("hybrid".to_owned()),
+                error_kind: None,
+                error: None,
+            },
+        };
+        let unready = remote_error(
+            "unready-node".to_owned(),
+            2,
+            "search-not-ready",
+            "run index".to_owned(),
+        );
+
+        let merged = merge_search(
+            response(vec![hit("local", "local-conversation", "local")]),
+            vec![ready, unready],
+            10,
+        );
+        assert_eq!(merged.realized_mode, "federated");
+        assert_eq!(merged.results.len(), 2);
+        let outcomes = merged.nodes.expect("node outcomes");
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].realized_mode.as_deref(), Some("hybrid"));
+        assert_eq!(outcomes[1].error_kind.as_deref(), Some("search-not-ready"));
+    }
+
     fn response(results: Vec<SearchHit>) -> SearchResponse {
         SearchResponse {
             query: "query".to_owned(),
-            realized_mode: "lexical".to_owned(),
-            fallback_mode: Some("lexical".to_owned()),
-            fallback_reason: None,
+            realized_mode: "hybrid".to_owned(),
             results,
             nodes: None,
         }

@@ -3,13 +3,14 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+const FTS_BULK_REBUILD_PERCENT: u64 = 90;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ordinal INTEGER NOT NULL,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
+    search_projection TEXT,
     created_at INTEGER,
     fingerprint TEXT NOT NULL DEFAULT '',
     UNIQUE (conversation_id, ordinal)
@@ -64,19 +66,36 @@ CREATE TABLE IF NOT EXISTS derived_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     search_dirty INTEGER NOT NULL CHECK (search_dirty IN (0, 1))
 );
-INSERT OR IGNORE INTO derived_state(singleton, search_dirty) VALUES (1, 0);
+INSERT OR IGNORE INTO derived_state(singleton, search_dirty) VALUES (1, 1);
 ";
 
 pub(crate) struct Storage {
     connection: Connection,
     writer_active: bool,
     defer_search_updates: bool,
+    transaction_base_messages: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FtsRefreshStrategy {
+    None,
+    Incremental,
+    Bulk,
+    Deferred,
 }
 
 pub(crate) struct Counts {
     pub(crate) conversations: u64,
     pub(crate) messages: u64,
+    pub(crate) searchable_messages: u64,
     pub(crate) embeddings: u64,
+}
+
+pub(crate) struct StatusSnapshot {
+    pub(crate) counts: Counts,
+    pub(crate) current_embeddings: u64,
+    pub(crate) derived_clean: bool,
+    pub(crate) exact_semantic_coverage: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -108,20 +127,17 @@ pub(crate) struct Message {
     created_at: Option<i64>,
 }
 
-#[cfg(feature = "semantic")]
 pub(crate) struct SearchableMessage {
     pub(crate) id: String,
     pub(crate) content: String,
 }
 
-#[cfg(feature = "semantic")]
 pub(crate) struct EmbeddingWrite<'a> {
     pub(crate) message_id: &'a str,
     pub(crate) vector: &'a [u8],
     pub(crate) norm: f32,
 }
 
-#[cfg(feature = "semantic")]
 pub(crate) struct SemanticVectors {
     pub(crate) message_ids: Vec<String>,
     pub(crate) values: Vec<u8>,
@@ -144,10 +160,18 @@ impl Storage {
         }
         let connection = Connection::open(path).map_err(AppError::database)?;
         initialize(&connection)?;
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS pending_fts_messages (
+                    message_id TEXT PRIMARY KEY
+                 ) WITHOUT ROWID;",
+            )
+            .map_err(AppError::database)?;
         Ok(Self {
             connection,
             writer_active: false,
             defer_search_updates: false,
+            transaction_base_messages: 0,
         })
     }
 
@@ -162,11 +186,14 @@ impl Storage {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(AppError::database)?;
         storage.writer_active = true;
+        storage.transaction_base_messages = storage.message_count()?;
         Ok(storage)
     }
 
     pub(crate) fn commit_writer(&mut self) -> Result<(), AppError> {
         if self.writer_active {
+            let threshold = self.measured_fts_bulk_threshold()?;
+            self.finalize_pending_fts_updates(threshold)?;
             self.connection
                 .execute_batch("COMMIT")
                 .map_err(AppError::database)?;
@@ -180,6 +207,8 @@ impl Storage {
 
     pub(crate) fn checkpoint_writer(&mut self) -> Result<(), AppError> {
         self.require_writer()?;
+        let threshold = self.measured_fts_bulk_threshold()?;
+        self.finalize_pending_fts_updates(threshold)?;
         self.connection
             .execute_batch("COMMIT")
             .map_err(AppError::database)?;
@@ -188,7 +217,64 @@ impl Storage {
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE); BEGIN IMMEDIATE")
             .map_err(AppError::database)?;
         self.writer_active = true;
+        self.transaction_base_messages = self.message_count()?;
         Ok(())
+    }
+
+    fn measured_fts_bulk_threshold(&self) -> Result<u64, AppError> {
+        let messages = self.message_count()?.max(self.transaction_base_messages);
+        Ok(messages
+            .saturating_mul(FTS_BULK_REBUILD_PERCENT)
+            .saturating_add(99)
+            / 100)
+    }
+
+    fn message_count(&self) -> Result<u64, AppError> {
+        let messages: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .map_err(AppError::database)?;
+        u64::try_from(messages).map_err(|_| AppError::internal("negative message count"))
+    }
+
+    fn finalize_pending_fts_updates(
+        &mut self,
+        bulk_rebuild_threshold: u64,
+    ) -> Result<FtsRefreshStrategy, AppError> {
+        self.require_writer()?;
+        if self.defer_search_updates {
+            return Ok(FtsRefreshStrategy::Deferred);
+        }
+        let changed: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM pending_fts_messages", [], |row| {
+                row.get(0)
+            })
+            .map_err(AppError::database)?;
+        let changed = u64::try_from(changed)
+            .map_err(|_| AppError::internal("negative pending FTS message count"))?;
+        if changed == 0 {
+            return Ok(FtsRefreshStrategy::None);
+        }
+        let strategy = if changed >= bulk_rebuild_threshold.max(1) {
+            self.rebuild_fts(false)?;
+            FtsRefreshStrategy::Bulk
+        } else {
+            self.connection
+                .execute_batch(
+                    "DELETE FROM message_fts
+                      WHERE message_id IN (SELECT message_id FROM pending_fts_messages);
+                     INSERT INTO message_fts(content, message_id, conversation_id)
+                     SELECT COALESCE(search_projection, content), id, conversation_id
+                       FROM messages
+                      WHERE id IN (SELECT message_id FROM pending_fts_messages)
+                        AND COALESCE(search_projection, content) <> '';
+                     DELETE FROM pending_fts_messages;",
+                )
+                .map_err(AppError::database)?;
+            FtsRefreshStrategy::Incremental
+        };
+        Ok(strategy)
     }
 
     pub(crate) fn defer_search_updates(&mut self) -> Result<(), AppError> {
@@ -225,6 +311,47 @@ impl Storage {
         Self::open(path)
     }
 
+    pub(crate) fn status_snapshot(
+        path: &Path,
+        generation: &str,
+    ) -> Result<StatusSnapshot, AppError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(AppError::database)?;
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(AppError::database)?;
+        if version > SCHEMA_VERSION {
+            return Err(AppError::schema(format!(
+                "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+            )));
+        }
+        if version < SCHEMA_VERSION {
+            return Ok(StatusSnapshot {
+                counts: Counts {
+                    conversations: readonly_table_count(&connection, "conversations")?,
+                    messages: readonly_table_count(&connection, "messages")?,
+                    searchable_messages: readonly_table_count(&connection, "messages")?,
+                    embeddings: readonly_table_count(&connection, "message_embeddings")?,
+                },
+                current_embeddings: 0,
+                derived_clean: false,
+                exact_semantic_coverage: false,
+            });
+        }
+        let storage = Self {
+            connection,
+            writer_active: false,
+            defer_search_updates: false,
+            transaction_base_messages: 0,
+        };
+        Ok(StatusSnapshot {
+            counts: storage.counts()?,
+            current_embeddings: storage.embedding_count(generation)?,
+            derived_clean: !storage.derived_search_is_dirty()?,
+            exact_semantic_coverage: storage.semantic_coverage_is_complete(generation)?,
+        })
+    }
+
     pub(crate) fn counts(&self) -> Result<Counts, AppError> {
         let conversations: i64 = self
             .connection
@@ -240,17 +367,27 @@ impl Storage {
                 row.get(0)
             })
             .map_err(AppError::database)?;
+        let searchable_messages: i64 = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM messages
+                  WHERE COALESCE(search_projection, content) <> ''",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)?;
         Ok(Counts {
             conversations: u64::try_from(conversations)
                 .map_err(|_| AppError::internal("negative conversation count"))?,
             messages: u64::try_from(messages)
                 .map_err(|_| AppError::internal("negative message count"))?,
+            searchable_messages: u64::try_from(searchable_messages)
+                .map_err(|_| AppError::internal("negative searchable message count"))?,
             embeddings: u64::try_from(embeddings)
                 .map_err(|_| AppError::internal("negative embedding count"))?,
         })
     }
 
-    #[cfg(feature = "semantic")]
     pub(crate) fn embedding_count(&self, generation: &str) -> Result<u64, AppError> {
         let count: i64 = self
             .connection
@@ -261,6 +398,29 @@ impl Storage {
             )
             .map_err(AppError::database)?;
         u64::try_from(count).map_err(|_| AppError::internal("negative embedding count"))
+    }
+
+    pub(crate) fn semantic_coverage_is_complete(&self, generation: &str) -> Result<bool, AppError> {
+        self.connection
+            .query_row(
+                "SELECT NOT EXISTS (
+                    SELECT 1
+                      FROM messages m
+                      LEFT JOIN message_embeddings e
+                        ON e.message_id = m.id AND e.generation = ?1
+                     WHERE COALESCE(m.search_projection, m.content) <> ''
+                       AND e.message_id IS NULL
+                    UNION ALL
+                    SELECT 1
+                      FROM message_embeddings e
+                      JOIN messages m ON m.id = e.message_id
+                     WHERE e.generation = ?1
+                       AND COALESCE(m.search_projection, m.content) = ''
+                 )",
+                [generation],
+                |row| row.get(0),
+            )
+            .map_err(AppError::database)
     }
 
     pub(crate) fn replace_conversation(
@@ -391,27 +551,22 @@ impl Storage {
             .connection
             .prepare_cached(
                 "INSERT INTO messages(
-                    id, conversation_id, ordinal, role, content, created_at, fingerprint
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    id, conversation_id, ordinal, role, content, search_projection,
+                    created_at, fingerprint
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                     conversation_id = excluded.conversation_id,
                     ordinal = excluded.ordinal,
                     role = excluded.role,
                     content = excluded.content,
+                    search_projection = excluded.search_projection,
                     created_at = excluded.created_at,
                     fingerprint = excluded.fingerprint",
             )
             .map_err(AppError::database)?;
-        let mut delete_fts = self
+        let mut stage_fts = self
             .connection
-            .prepare_cached("DELETE FROM message_fts WHERE message_id = ?1")
-            .map_err(AppError::database)?;
-        let mut insert_fts = self
-            .connection
-            .prepare_cached(
-                "INSERT INTO message_fts(content, message_id, conversation_id)
-                 VALUES (?1, ?2, ?3)",
-            )
+            .prepare_cached("INSERT OR IGNORE INTO pending_fts_messages(message_id) VALUES (?1)")
             .map_err(AppError::database)?;
         let mut delete_embedding = self
             .connection
@@ -434,7 +589,7 @@ impl Storage {
             .collect();
         for id in &removed {
             if !self.defer_search_updates {
-                delete_fts.execute([id]).map_err(AppError::database)?;
+                stage_fts.execute([id]).map_err(AppError::database)?;
             }
             delete_message.execute([id]).map_err(AppError::database)?;
         }
@@ -451,16 +606,14 @@ impl Storage {
                     message.ordinal,
                     message.role,
                     message.content,
+                    message.search_projection,
                     message.created_at,
                     fingerprint,
                 ])
                 .map_err(AppError::database)?;
             if !self.defer_search_updates {
-                delete_fts
+                stage_fts
                     .execute([&message.id])
-                    .map_err(AppError::database)?;
-                insert_fts
-                    .execute(params![message.content, message.id, conversation.id])
                     .map_err(AppError::database)?;
                 delete_embedding
                     .execute([&message.id])
@@ -474,16 +627,36 @@ impl Storage {
     }
 
     pub(crate) fn rebuild_derived_search_state(&mut self) -> Result<(), AppError> {
+        self.rebuild_fts(true)?;
         self.connection
             .execute_batch(
-                "DELETE FROM message_fts;
-                 DELETE FROM message_embeddings;
-                 INSERT INTO message_fts(content, message_id, conversation_id)
-                 SELECT content, id, conversation_id FROM messages;
+                "DELETE FROM message_embeddings;
                  UPDATE derived_state SET search_dirty = 0 WHERE singleton = 1;",
             )
             .map_err(AppError::database)?;
         self.defer_search_updates = false;
+        Ok(())
+    }
+
+    fn rebuild_fts(&mut self, optimize: bool) -> Result<(), AppError> {
+        self.connection
+            .execute_batch(
+                "DELETE FROM message_fts;
+                 INSERT INTO message_fts(content, message_id, conversation_id)
+                 SELECT COALESCE(search_projection, content), id, conversation_id
+                   FROM messages
+                  WHERE COALESCE(search_projection, content) <> '';
+                 DELETE FROM pending_fts_messages;",
+            )
+            .map_err(AppError::database)?;
+        if optimize {
+            self.connection
+                .execute(
+                    "INSERT INTO message_fts(message_fts) VALUES ('optimize')",
+                    [],
+                )
+                .map_err(AppError::database)?;
+        }
         Ok(())
     }
 
@@ -511,15 +684,14 @@ impl Storage {
             if observed_paths.contains(&source_path) {
                 continue;
             }
+            if !self.defer_search_updates {
+                self.stage_conversation_fts(&id)?;
+            }
             self.connection
                 .execute("DELETE FROM conversations WHERE id = ?1", [&id])
                 .map_err(AppError::database)?;
             if self.defer_search_updates {
                 self.mark_derived_search_dirty()?;
-            } else {
-                self.connection
-                    .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
-                    .map_err(AppError::database)?;
             }
             removed += 1;
         }
@@ -565,17 +737,27 @@ impl Storage {
         let Some(id) = id else {
             return Ok(false);
         };
+        if !self.defer_search_updates {
+            self.stage_conversation_fts(&id)?;
+        }
         if self.defer_search_updates {
             self.mark_derived_search_dirty()?;
-        } else {
-            self.connection
-                .execute("DELETE FROM message_fts WHERE conversation_id = ?1", [&id])
-                .map_err(AppError::database)?;
         }
         self.connection
             .execute("DELETE FROM conversations WHERE id = ?1", [&id])
             .map_err(AppError::database)?;
         Ok(true)
+    }
+
+    fn stage_conversation_fts(&self, conversation_id: &str) -> Result<(), AppError> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO pending_fts_messages(message_id)
+                 SELECT id FROM messages WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .map_err(AppError::database)?;
+        Ok(())
     }
 
     pub(crate) fn search(
@@ -626,7 +808,6 @@ impl Storage {
             .map_err(AppError::database)
     }
 
-    #[cfg(feature = "semantic")]
     pub(crate) fn messages_needing_embeddings(
         &self,
         generation: &str,
@@ -634,12 +815,13 @@ impl Storage {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT messages.id, messages.content
+                "SELECT messages.id, COALESCE(messages.search_projection, messages.content)
                    FROM messages
                    LEFT JOIN message_embeddings
                      ON message_embeddings.message_id = messages.id
                     AND message_embeddings.generation = ?1
                   WHERE message_embeddings.message_id IS NULL
+                    AND COALESCE(messages.search_projection, messages.content) <> ''
                   ORDER BY messages.id",
             )
             .map_err(AppError::database)?;
@@ -655,7 +837,6 @@ impl Storage {
             .map_err(AppError::database)
     }
 
-    #[cfg(feature = "semantic")]
     pub(crate) fn replace_embeddings(
         &mut self,
         generation: &str,
@@ -690,7 +871,6 @@ impl Storage {
         Ok(())
     }
 
-    #[cfg(feature = "semantic")]
     pub(crate) fn semantic_vectors(
         &self,
         generation: &str,
@@ -708,6 +888,7 @@ impl Storage {
                   WHERE e.generation = ?1
                     AND (?2 IS NULL OR c.provider = ?2)
                     AND (?3 IS NULL OR m.created_at >= ?3)
+                    AND COALESCE(m.search_projection, m.content) <> ''
                   ORDER BY m.id",
             )
             .map_err(AppError::database)?;
@@ -744,7 +925,6 @@ impl Storage {
         Ok(result)
     }
 
-    #[cfg(feature = "semantic")]
     pub(crate) fn search_hits(&self, message_ids: &[&str]) -> Result<Vec<SearchHit>, AppError> {
         let mut statement = self
             .connection
@@ -783,7 +963,25 @@ impl Storage {
         Ok(hits)
     }
 
-    #[cfg(feature = "semantic")]
+    pub(crate) fn search_documents(&self, message_ids: &[&str]) -> Result<Vec<String>, AppError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT COALESCE(search_projection, content)
+                   FROM messages
+                  WHERE id = ?1",
+            )
+            .map_err(AppError::database)?;
+        message_ids
+            .iter()
+            .map(|message_id| {
+                statement
+                    .query_row([message_id], |row| row.get(0))
+                    .map_err(AppError::database)
+            })
+            .collect()
+    }
+
     pub(crate) fn invalidate_embedding_generation(
         &mut self,
         generation: &str,
@@ -792,7 +990,12 @@ impl Storage {
         let removed = self
             .connection
             .execute(
-                "DELETE FROM message_embeddings WHERE generation <> ?1",
+                "DELETE FROM message_embeddings
+                  WHERE generation <> ?1
+                     OR message_id IN (
+                        SELECT id FROM messages
+                         WHERE COALESCE(search_projection, content) = ''
+                     )",
                 [generation],
             )
             .map_err(AppError::database)?;
@@ -903,6 +1106,24 @@ impl Storage {
     }
 }
 
+fn readonly_table_count(connection: &Connection, table: &str) -> Result<u64, AppError> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(AppError::database)?;
+    if !exists {
+        return Ok(0);
+    }
+    let sql = format!("SELECT count(*) FROM {table}");
+    let count: i64 = connection
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(AppError::database)?;
+    u64::try_from(count).map_err(|_| AppError::internal("negative table count"))
+}
+
 impl Drop for Storage {
     fn drop(&mut self) {
         if self.writer_active {
@@ -949,6 +1170,7 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
         "fingerprint",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(&transaction, "messages", "search_projection", "TEXT")?;
     add_column_if_missing(
         &transaction,
         "message_embeddings",
@@ -964,6 +1186,16 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
     purge_unsupported_providers(&transaction)?;
     if !provider_schema_is_current(&transaction)? {
         rebuild_provider_schema(&transaction)?;
+    }
+    if version < 8 {
+        transaction
+            .execute_batch(
+                "DELETE FROM message_fts;
+                 DELETE FROM message_embeddings;
+                 DELETE FROM source_checkpoints;
+                 UPDATE derived_state SET search_dirty = 1 WHERE singleton = 1;",
+            )
+            .map_err(AppError::database)?;
     }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1001,7 +1233,8 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
                 id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL REFERENCES conversations_next(id) ON DELETE CASCADE,
                 ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-                created_at INTEGER, fingerprint TEXT NOT NULL DEFAULT '',
+                search_projection TEXT, created_at INTEGER,
+                fingerprint TEXT NOT NULL DEFAULT '',
                 UNIQUE(conversation_id, ordinal)
              );
              CREATE TABLE message_embeddings_next (
@@ -1013,7 +1246,8 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
                 SELECT id, provider, source_path, title, created_at, updated_at, source_fingerprint
                 FROM conversations;
              INSERT INTO messages_next
-                SELECT id, conversation_id, ordinal, role, content, created_at, fingerprint
+                SELECT id, conversation_id, ordinal, role, content, search_projection,
+                       created_at, fingerprint
                 FROM messages;
              INSERT INTO message_embeddings_next(
                 message_id, generation, dimensions, norm, vector
@@ -1030,7 +1264,9 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
                 tokenize = 'unicode61'
              );
              INSERT INTO message_fts(content, message_id, conversation_id)
-                SELECT content, id, conversation_id FROM messages;",
+                SELECT COALESCE(search_projection, content), id, conversation_id
+                  FROM messages
+                 WHERE COALESCE(search_projection, content) <> '';",
         )
         .map_err(AppError::database)
 }
@@ -1087,6 +1323,13 @@ fn message_fingerprint(message: &crate::ingestion::NormalizedMessage) -> String 
     update_hash(&mut hasher, &message.ordinal.to_string());
     update_hash(&mut hasher, &message.role);
     update_hash(&mut hasher, &message.content);
+    match &message.search_projection {
+        None => update_hash(&mut hasher, "canonical"),
+        Some(projection) => {
+            update_hash(&mut hasher, "projected");
+            update_hash(&mut hasher, projection);
+        }
+    }
     update_hash(
         &mut hasher,
         &message.created_at.unwrap_or_default().to_string(),
@@ -1133,7 +1376,6 @@ fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> 
         .map_err(AppError::database)
 }
 
-#[cfg(any(feature = "semantic", test))]
 fn validate_quantized_vector(
     dimensions: usize,
     norm: f32,
@@ -1183,9 +1425,31 @@ mod tests {
                 ordinal: 0,
                 role: "user".to_owned(),
                 content: content.to_owned(),
-                created_at: Some(1),
+                search_projection: None,
+                created_at: Some(i64::MAX / 2),
             }],
         }
+    }
+
+    fn conversation_with_messages(messages: &[(&str, &str)]) -> Conversation {
+        let mut value = conversation("");
+        value.messages = messages
+            .iter()
+            .enumerate()
+            .map(
+                |(ordinal, (id, content))| crate::ingestion::NormalizedMessage {
+                    id: (*id).to_owned(),
+                    ordinal: i64::try_from(ordinal).expect("test ordinal"),
+                    role: "user".to_owned(),
+                    content: (*content).to_owned(),
+                    search_projection: None,
+                    created_at: Some(i64::MAX / 2),
+                },
+            )
+            .collect();
+        value.created_at = Some(i64::MAX / 2);
+        value.updated_at = Some(i64::MAX / 2);
+        value
     }
 
     #[veritas::claims("storage/full-rebuild-is-idempotent")]
@@ -1236,6 +1500,505 @@ mod tests {
                 .source_checkpoint_matches("codex", "/tmp/session-1.jsonl", 100, 200)
                 .expect("read checkpoint")
         );
+    }
+
+    #[veritas::claims("indexing/canonical-and-fts-are-atomic")]
+    #[test]
+    fn incremental_fts_and_canonical_changes_roll_back_together() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("durable old term"))
+            .expect("seed conversation");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+
+        let mut writer = Storage::open_writer(&path).expect("replacement writer");
+        writer
+            .replace_conversation(&conversation("uncommitted new term"))
+            .expect("replace conversation");
+        assert_eq!(
+            writer
+                .finalize_pending_fts_updates(u64::MAX)
+                .expect("incremental FTS finalization"),
+            FtsRefreshStrategy::Incremental
+        );
+        assert_eq!(
+            writer.search("uncommitted", 10, None, None).unwrap().len(),
+            1
+        );
+        drop(writer);
+
+        let storage = Storage::open_existing(&path).expect("reopen database");
+        assert_eq!(storage.search("durable", 10, None, None).unwrap().len(), 1);
+        assert!(
+            storage
+                .search("uncommitted", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage.view("message-1", 0).unwrap()[0].content,
+            "durable old term"
+        );
+    }
+
+    #[veritas::claims("indexing/canonical-and-fts-are-atomic")]
+    #[test]
+    fn bulk_fts_and_canonical_changes_roll_back_together() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("durable bulk term"))
+            .expect("seed conversation");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+
+        let mut writer = Storage::open_writer(&path).expect("replacement writer");
+        writer
+            .replace_conversation(&conversation("uncommitted bulk replacement"))
+            .expect("replace conversation");
+        assert_eq!(
+            writer
+                .finalize_pending_fts_updates(1)
+                .expect("bulk FTS finalization"),
+            FtsRefreshStrategy::Bulk
+        );
+        assert_eq!(
+            writer.search("replacement", 10, None, None).unwrap().len(),
+            1
+        );
+        drop(writer);
+
+        let storage = Storage::open_existing(&path).expect("reopen database");
+        assert_eq!(storage.search("durable", 10, None, None).unwrap().len(), 1);
+        assert!(
+            storage
+                .search("replacement", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage.view("message-1", 0).unwrap()[0].content,
+            "durable bulk term"
+        );
+    }
+
+    #[test]
+    fn fts_strategy_switches_at_the_declared_boundary() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (changed, expected) in [
+            (8_usize, FtsRefreshStrategy::Incremental),
+            (9, FtsRefreshStrategy::Bulk),
+        ] {
+            let path = directory.path().join(format!("changed-{changed}.sqlite3"));
+            let original = (0..10)
+                .map(|index| (format!("message-{index}"), format!("original {index}")))
+                .collect::<Vec<_>>();
+            let original_refs = original
+                .iter()
+                .map(|(id, content)| (id.as_str(), content.as_str()))
+                .collect::<Vec<_>>();
+            let mut writer = Storage::open_writer(&path).expect("writer");
+            writer
+                .replace_conversation(&conversation_with_messages(&original_refs))
+                .expect("seed messages");
+            writer.commit_writer().expect("commit seed");
+            drop(writer);
+
+            let replacement = original
+                .iter()
+                .enumerate()
+                .map(|(index, (id, content))| {
+                    let content = if index < changed {
+                        format!("changed {index}")
+                    } else {
+                        content.clone()
+                    };
+                    (id.clone(), content)
+                })
+                .collect::<Vec<_>>();
+            let replacement_refs = replacement
+                .iter()
+                .map(|(id, content)| (id.as_str(), content.as_str()))
+                .collect::<Vec<_>>();
+            let mut writer = Storage::open_writer(&path).expect("replacement writer");
+            writer
+                .replace_conversation(&conversation_with_messages(&replacement_refs))
+                .expect("replace messages");
+            let threshold = writer.measured_fts_bulk_threshold().unwrap();
+            assert_eq!(threshold, 9);
+            assert_eq!(
+                writer.finalize_pending_fts_updates(threshold).unwrap(),
+                expected,
+                "changed messages: {changed}"
+            );
+        }
+
+        let deletion_path = directory.path().join("deletion.sqlite3");
+        let original = (0..10)
+            .map(|index| (format!("message-{index}"), format!("original {index}")))
+            .collect::<Vec<_>>();
+        let original_refs = original
+            .iter()
+            .map(|(id, content)| (id.as_str(), content.as_str()))
+            .collect::<Vec<_>>();
+        let mut writer = Storage::open_writer(&deletion_path).expect("deletion writer");
+        writer
+            .replace_conversation(&conversation_with_messages(&original_refs))
+            .expect("seed deletion corpus");
+        writer.commit_writer().expect("commit deletion corpus");
+        drop(writer);
+        let retained_refs = original_refs[..5].to_vec();
+        let mut writer = Storage::open_writer(&deletion_path).expect("deletion writer");
+        writer
+            .replace_conversation(&conversation_with_messages(&retained_refs))
+            .expect("delete half the messages");
+        let threshold = writer.measured_fts_bulk_threshold().unwrap();
+        assert_eq!(threshold, 9, "deletions use the pre-transaction corpus");
+        assert_eq!(
+            writer.finalize_pending_fts_updates(threshold).unwrap(),
+            FtsRefreshStrategy::Incremental
+        );
+    }
+
+    #[test]
+    fn incremental_and_bulk_fts_produce_equivalent_results() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let incremental_path = directory.path().join("incremental.sqlite3");
+        let bulk_path = directory.path().join("bulk.sqlite3");
+        for (path, cutoff) in [(&incremental_path, u64::MAX), (&bulk_path, 1)] {
+            let mut writer = Storage::open_writer(path).expect("writer");
+            writer
+                .replace_conversation(&conversation_with_messages(&[
+                    ("message-1", "alpha shared"),
+                    ("message-2", "beta shared"),
+                    ("message-3", "removed sentinel"),
+                ]))
+                .expect("seed messages");
+            writer
+                .finalize_pending_fts_updates(cutoff)
+                .expect("seed FTS");
+            writer
+                .replace_conversation(&conversation_with_messages(&[
+                    ("message-1", "gamma shared"),
+                    ("message-4", "delta shared"),
+                ]))
+                .expect("replace messages");
+            writer
+                .finalize_pending_fts_updates(cutoff)
+                .expect("refresh FTS");
+            writer.commit_writer().expect("commit corpus");
+        }
+
+        let incremental = Storage::open_existing(&incremental_path).unwrap();
+        let bulk = Storage::open_existing(&bulk_path).unwrap();
+        for (query, limit, provider, days) in [
+            ("shared", 10, None, None),
+            ("shared", 1, Some("codex"), None),
+            ("shared", 10, Some("codex"), Some(1)),
+            ("gamma", 10, Some("codex"), None),
+            ("removed", 10, None, None),
+        ] {
+            let ids = |storage: &Storage| {
+                storage
+                    .search(query, limit, provider, days)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect::<Vec<_>>()
+            };
+            let incremental_ids = ids(&incremental);
+            let bulk_ids = ids(&bulk);
+            assert_eq!(incremental_ids, bulk_ids, "query {query}");
+            if days.is_some() {
+                assert!(
+                    !incremental_ids.is_empty(),
+                    "recency-filter equivalence must exercise matching rows"
+                );
+            }
+        }
+        assert!(
+            incremental
+                .search("alpha", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            incremental
+                .search("beta", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            incremental
+                .search("removed", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[veritas::claims(
+        "search/tool-results-are-not-searchable",
+        "search/mixed-message-excludes-tool-result-text",
+        "view/tool-results-remain-visible"
+    )]
+    #[test]
+    fn search_projection_controls_fts_embeddings_and_rerank_text_not_view() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut corpus = conversation_with_messages(&[
+            ("tool-only", "private tool payload"),
+            ("mixed", "visible request\nprivate mixed payload"),
+            ("ordinary", "ordinary searchable text"),
+        ]);
+        corpus.messages[0].search_projection = Some(String::new());
+        corpus.messages[1].search_projection = Some("visible request".to_owned());
+
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&corpus)
+            .expect("store projected messages");
+        let pending = writer
+            .messages_needing_embeddings("generation")
+            .expect("embedding selection");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|message| (message.id.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("mixed", "visible request"),
+                ("ordinary", "ordinary searchable text")
+            ]
+        );
+        writer
+            .replace_embeddings(
+                "generation",
+                &[
+                    EmbeddingWrite {
+                        message_id: "tool-only",
+                        vector: &[127],
+                        norm: 127.0,
+                    },
+                    EmbeddingWrite {
+                        message_id: "mixed",
+                        vector: &[126],
+                        norm: 126.0,
+                    },
+                    EmbeddingWrite {
+                        message_id: "ordinary",
+                        vector: &[125],
+                        norm: 125.0,
+                    },
+                ],
+            )
+            .expect("seed semantic vectors");
+        writer.commit_writer().expect("commit projected messages");
+
+        let storage = Storage::open_existing(&path).expect("open projected corpus");
+        let counts = storage.counts().expect("counts");
+        assert_eq!(counts.messages, 3);
+        assert_eq!(counts.searchable_messages, 2);
+        assert!(
+            storage
+                .search("private", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(storage.search("visible", 10, None, None).unwrap().len(), 1);
+        assert_eq!(storage.search("ordinary", 10, None, None).unwrap().len(), 1);
+
+        let vectors = storage
+            .semantic_vectors("generation", None, None)
+            .expect("semantic vectors");
+        assert_eq!(
+            vectors.message_ids,
+            vec!["mixed".to_owned(), "ordinary".to_owned()]
+        );
+        storage
+            .connection
+            .execute(
+                "DELETE FROM message_embeddings WHERE message_id = 'ordinary'",
+                [],
+            )
+            .expect("remove one searchable vector");
+        assert_eq!(storage.embedding_count("generation").unwrap(), 2);
+        assert_eq!(counts.searchable_messages, 2);
+        assert!(
+            !storage
+                .semantic_coverage_is_complete("generation")
+                .expect("exact semantic coverage")
+        );
+        assert_eq!(
+            storage
+                .search_documents(&["ordinary", "mixed"])
+                .expect("rerank documents"),
+            vec![
+                "ordinary searchable text".to_owned(),
+                "visible request".to_owned()
+            ]
+        );
+        let context = storage.view("mixed", 1).expect("canonical view");
+        assert_eq!(context[0].content, "private tool payload");
+        assert_eq!(context[1].content, "visible request\nprivate mixed payload");
+    }
+
+    #[test]
+    fn bulk_fts_refresh_preserves_unchanged_embeddings() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation_with_messages(&[
+                ("message-1", "first"),
+                ("message-2", "second"),
+            ]))
+            .expect("seed messages");
+        writer
+            .replace_embeddings(
+                "generation-a",
+                &[
+                    EmbeddingWrite {
+                        message_id: "message-1",
+                        vector: &[127],
+                        norm: 127.0,
+                    },
+                    EmbeddingWrite {
+                        message_id: "message-2",
+                        vector: &[127],
+                        norm: 127.0,
+                    },
+                ],
+            )
+            .expect("seed embeddings");
+        writer
+            .finalize_pending_fts_updates(1)
+            .expect("seed bulk FTS");
+
+        writer
+            .replace_conversation(&conversation_with_messages(&[
+                ("message-1", "changed first"),
+                ("message-2", "second"),
+            ]))
+            .expect("change one message");
+        assert_eq!(
+            writer.finalize_pending_fts_updates(1).unwrap(),
+            FtsRefreshStrategy::Bulk
+        );
+        assert_eq!(writer.embedding_count("generation-a").unwrap(), 1);
+        assert_eq!(
+            writer
+                .messages_needing_embeddings("generation-a")
+                .unwrap()
+                .into_iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            ["message-1"]
+        );
+    }
+
+    #[ignore = "manual FTS crossover benchmark"]
+    #[test]
+    fn benchmark_fts_refresh_crossover() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let benchmark_path = directory.path().join("benchmark.sqlite3");
+        if let Some(source) = std::env::var_os("CASS_FTS_BENCH_DB") {
+            let source = Connection::open(PathBuf::from(source)).expect("open benchmark source");
+            source
+                .execute(
+                    "VACUUM INTO ?1",
+                    [benchmark_path.to_string_lossy().as_ref()],
+                )
+                .expect("copy benchmark database");
+        } else {
+            let mut writer = Storage::open_writer(&benchmark_path).expect("writer");
+            let messages = (0..25_000)
+                .map(|index| crate::ingestion::NormalizedMessage {
+                    id: format!("message-{index:05}"),
+                    ordinal: i64::from(index),
+                    role: "user".to_owned(),
+                    content: format!("representative searchable text number {index}"),
+                    search_projection: None,
+                    created_at: Some(1),
+                })
+                .collect();
+            let mut corpus = conversation("");
+            corpus.messages = messages;
+            writer
+                .replace_conversation(&corpus)
+                .expect("seed benchmark corpus");
+            writer.commit_writer().expect("commit benchmark corpus");
+        }
+
+        let reader = Storage::open_existing(&benchmark_path).expect("benchmark reader");
+        let total = reader.counts().expect("benchmark counts").messages;
+        drop(reader);
+        let mut deltas = vec![
+            1,
+            10,
+            100,
+            1_000,
+            10_000,
+            total / 10,
+            total / 2,
+            total.saturating_mul(75) / 100,
+            total.saturating_mul(85) / 100,
+            total.saturating_mul(90) / 100,
+            total.saturating_mul(95) / 100,
+            total,
+        ];
+        deltas.retain(|delta| *delta > 0 && *delta <= total);
+        deltas.sort_unstable();
+        deltas.dedup();
+
+        eprintln!("fts benchmark corpus_messages={total}");
+        for delta in deltas {
+            let mut incremental = Vec::new();
+            let mut bulk = Vec::new();
+            for repetition in 0..3 {
+                let order = if repetition % 2 == 0 {
+                    [(u64::MAX, &mut incremental), (1, &mut bulk)]
+                } else {
+                    [(1, &mut bulk), (u64::MAX, &mut incremental)]
+                };
+                for (cutoff, timings) in order {
+                    let mut writer =
+                        Storage::open_writer(&benchmark_path).expect("benchmark writer");
+                    writer
+                        .connection
+                        .execute(
+                            "INSERT INTO pending_fts_messages(message_id)
+                             SELECT id FROM messages ORDER BY id LIMIT ?1",
+                            [i64::try_from(delta).expect("delta")],
+                        )
+                        .expect("stage benchmark messages");
+                    writer
+                        .connection
+                        .execute(
+                            "UPDATE messages SET content = content || ' changed'
+                              WHERE id IN (SELECT message_id FROM pending_fts_messages)",
+                            [],
+                        )
+                        .expect("mutate benchmark messages");
+                    let started = std::time::Instant::now();
+                    writer
+                        .finalize_pending_fts_updates(cutoff)
+                        .expect("benchmark FTS finalization");
+                    timings.push(started.elapsed());
+                    drop(writer);
+                }
+            }
+            incremental.sort_unstable();
+            bulk.sort_unstable();
+            eprintln!(
+                "delta={delta} incremental_ms={:.3} bulk_ms={:.3}",
+                incremental[1].as_secs_f64() * 1_000.0,
+                bulk[1].as_secs_f64() * 1_000.0
+            );
+        }
     }
 
     #[test]
@@ -1322,48 +2085,111 @@ mod tests {
         assert!(validate_quantized_vector(3, f32::NAN, &vector).is_err());
     }
 
-    #[veritas::claims("storage/supported-schema-migrates")]
+    const VERSION_SEVEN_SCHEMA_FIXTURE: &str = "CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider IN (
+            'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+        )),
+        source_path TEXT NOT NULL UNIQUE, title TEXT, created_at INTEGER, updated_at INTEGER,
+        source_fingerprint TEXT NOT NULL DEFAULT ''
+     );
+     CREATE TABLE messages (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+        created_at INTEGER, fingerprint TEXT NOT NULL DEFAULT '',
+        UNIQUE(conversation_id, ordinal)
+     );
+     CREATE TABLE message_embeddings (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        generation TEXT NOT NULL DEFAULT '', dimensions INTEGER NOT NULL,
+        norm REAL NOT NULL, vector BLOB NOT NULL
+     );
+     CREATE VIRTUAL TABLE message_fts USING fts5(
+        content, message_id UNINDEXED, conversation_id UNINDEXED, tokenize = 'unicode61'
+     );
+     CREATE TABLE tombstones (
+        provider TEXT NOT NULL, conversation_id TEXT NOT NULL,
+        forgotten_at INTEGER NOT NULL, PRIMARY KEY(provider, conversation_id)
+     );
+     CREATE TABLE source_checkpoints (
+        provider TEXT NOT NULL, source_path TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
+        PRIMARY KEY(provider, source_path)
+     );
+     CREATE TABLE derived_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        search_dirty INTEGER NOT NULL CHECK(search_dirty IN (0, 1))
+     );
+     INSERT INTO derived_state VALUES (1, 0);
+     INSERT INTO conversations(id, provider, source_path, source_fingerprint)
+        VALUES ('session-1', 'codex', '/tmp/session-1.jsonl', 'old-source');
+     INSERT INTO messages(id, conversation_id, ordinal, role, content, fingerprint)
+        VALUES ('message-1', 'session-1', 0, 'user', 'preserved', 'old-message');
+     INSERT INTO message_fts(content, message_id, conversation_id)
+        VALUES ('preserved', 'message-1', 'session-1');
+     INSERT INTO message_embeddings(message_id, generation, dimensions, norm, vector)
+        VALUES ('message-1', 'old-generation', 1, 1.0, X'7F');
+     INSERT INTO source_checkpoints(provider, source_path, size_bytes, modified_ns)
+        VALUES ('codex', '/tmp/session-1.jsonl', 10, 20);
+     PRAGMA user_version = 7;";
+
+    #[veritas::claims(
+        "storage/supported-schema-migrates",
+        "storage/tool-search-projection-migrates"
+    )]
     #[test]
     fn supported_schema_migrates_once_and_preserves_rows() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("cass.sqlite3");
         let connection = Connection::open(&path).expect("seed database");
         connection
-            .execute_batch(
-                "CREATE TABLE conversations (
-                    id TEXT PRIMARY KEY, provider TEXT NOT NULL, source_path TEXT NOT NULL UNIQUE,
-                    title TEXT, created_at INTEGER, updated_at INTEGER
-                 );
-                 CREATE TABLE messages (
-                    id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                    ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-                    created_at INTEGER, UNIQUE(conversation_id, ordinal)
-                 );
-                 CREATE TABLE message_embeddings (
-                    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-                    dimensions INTEGER NOT NULL, vector BLOB NOT NULL
-                 );
-                 CREATE VIRTUAL TABLE message_fts USING fts5(
-                    content, message_id UNINDEXED, conversation_id UNINDEXED
-                 );
-                 INSERT INTO conversations(id, provider, source_path)
-                    VALUES ('session-1', 'codex', '/tmp/session-1.jsonl');
-                 INSERT INTO messages(id, conversation_id, ordinal, role, content)
-                    VALUES ('message-1', 'session-1', 0, 'user', 'preserved');
-                 INSERT INTO message_fts(content, message_id, conversation_id)
-                    VALUES ('preserved', 'message-1', 'session-1');
-                 INSERT INTO message_embeddings(message_id, dimensions, vector)
-                    VALUES ('message-1', 1, X'0000803F');
-                 PRAGMA user_version = 1;",
-            )
+            .execute_batch(VERSION_SEVEN_SCHEMA_FIXTURE)
             .expect("seed older schema");
         drop(connection);
 
         let storage = Storage::open(&path).expect("migrate database");
         let counts = storage.counts().expect("counts");
         assert_eq!(counts.messages, 1);
-        assert_eq!(counts.embeddings, 1);
+        assert_eq!(counts.embeddings, 0);
+        assert_eq!(counts.searchable_messages, 1);
+        assert!(
+            storage
+                .derived_search_is_dirty()
+                .expect("dirty derived state")
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row("SELECT count(*) FROM message_fts", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("cleared FTS"),
+            0
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT search_projection FROM messages WHERE id = 'message-1'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0)
+                )
+                .expect("projection column"),
+            None
+        );
+        assert_eq!(
+            storage.view("message-1", 0).expect("canonical view")[0].content,
+            "preserved"
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row("SELECT count(*) FROM source_checkpoints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("cleared checkpoints"),
+            0
+        );
         assert_eq!(
             storage
                 .connection
@@ -1372,7 +2198,9 @@ mod tests {
             SCHEMA_VERSION
         );
         drop(storage);
-        Storage::open(&path).expect("idempotent second open");
+        let reopened = Storage::open(&path).expect("idempotent second open");
+        assert_eq!(reopened.counts().expect("reopened counts").messages, 1);
+        assert!(reopened.derived_search_is_dirty().expect("still dirty"));
     }
 
     #[veritas::claims("storage/newer-schema-is-rejected")]
@@ -1424,7 +2252,6 @@ mod tests {
             .replace_conversation(&conversation("first"))
             .expect("initial insert");
         assert_eq!(first.changed_message_ids, ["message-1"]);
-        #[cfg(feature = "semantic")]
         storage
             .replace_embeddings(
                 "generation-a",
@@ -1440,7 +2267,6 @@ mod tests {
             .expect("unchanged refresh");
         assert!(unchanged.unchanged);
         assert_eq!(unchanged.changed_message_ids, Vec::<String>::new());
-        #[cfg(feature = "semantic")]
         assert!(
             storage
                 .messages_needing_embeddings("generation-a")
@@ -1451,7 +2277,6 @@ mod tests {
             .replace_conversation(&conversation("second"))
             .expect("changed refresh");
         assert_eq!(changed.changed_message_ids, ["message-1"]);
-        #[cfg(feature = "semantic")]
         assert_eq!(
             storage
                 .messages_needing_embeddings("generation-a")
@@ -1482,9 +2307,42 @@ mod tests {
         assert_eq!(change.changed_message_ids, ["message-2"]);
         assert_eq!(change.removed_messages, 1);
         assert_eq!(storage.counts().expect("counts").messages, 1);
+        storage.commit_writer().expect("commit replacement");
+        assert!(storage.search("first", 10, None, None).unwrap().is_empty());
+        assert_eq!(
+            storage.search("second", 10, None, None).unwrap()[0].id,
+            "message-2"
+        );
     }
 
-    #[cfg(feature = "semantic")]
+    #[test]
+    fn purging_a_conversation_removes_its_staged_fts_rows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&path).expect("writer");
+        writer
+            .replace_conversation(&conversation("disappearing sentinel"))
+            .expect("seed conversation");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+
+        let mut writer = Storage::open_writer(&path).expect("purge writer");
+        assert_eq!(
+            writer
+                .purge_missing_sources("codex", &BTreeSet::new())
+                .expect("purge missing source"),
+            1
+        );
+        writer.commit_writer().expect("commit purge");
+        assert!(
+            writer
+                .search("disappearing", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(writer.counts().unwrap().messages, 0);
+    }
+
     #[veritas::claims("semantic/stale-embedding-generation-invalidated")]
     #[test]
     fn stale_embedding_generation_is_excluded_and_replaced() {

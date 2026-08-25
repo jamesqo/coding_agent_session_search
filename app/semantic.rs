@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use fastembed::{
-    EmbeddingModel, RerankInitOptions, RerankerModel, TextEmbedding, TextInitOptions, TextRerank,
+    EmbeddingModel, InitOptionsUserDefined, RerankInitOptions, RerankInitOptionsUserDefined,
+    RerankerModel, TextEmbedding, TextInitOptions, TextRerank, TokenizerFiles,
+    UserDefinedEmbeddingModel, UserDefinedRerankingModel,
 };
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -15,6 +17,8 @@ use crate::storage::{EmbeddingWrite, SearchHit, SemanticVectors, Storage};
 const EMBEDDING_MODEL: EmbeddingModel = EmbeddingModel::AllMiniLML6V2Q;
 const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
 const MARKER_NAME: &str = "installed.json";
+const EMBEDDING_REPOSITORY: &str = "models--Xenova--all-MiniLM-L6-v2";
+const RERANKER_REPOSITORY: &str = "models--jinaai--jina-reranker-v1-turbo-en";
 const CANDIDATE_LIMIT: usize = 50;
 const RERANK_LIMIT: usize = 20;
 const EMBEDDING_BATCH_SIZE: usize = 32;
@@ -67,9 +71,18 @@ impl Models {
         self.read_valid_marker().is_ok()
     }
 
+    pub(crate) fn require_installed(&self) -> Result<(), AppError> {
+        if !self.root.join(MARKER_NAME).is_file() {
+            return Err(AppError::model(
+                "semantic models are not installed; run `cass models install`",
+            ));
+        }
+        self.read_valid_marker().map(|_| ())
+    }
+
     pub(crate) fn install(&self) -> Result<InstallSummary, AppError> {
         fs::create_dir_all(&self.root).map_err(AppError::io)?;
-        let mut backend = Backend::load(&self.root)?;
+        let mut backend = Backend::download_and_load(&self.root)?;
         let embeddings = backend.embed(&["semantic model installation check"])?;
         let embedding_dimensions = embeddings
             .first()
@@ -110,11 +123,13 @@ impl Models {
             return Ok(None);
         }
         self.read_valid_marker()?;
-        Backend::load(&self.root).map(Some)
+        Backend::load_local(&self.root).map(Some)
     }
 
     fn read_valid_marker(&self) -> Result<InstallMarker, AppError> {
-        let bytes = fs::read(self.root.join(MARKER_NAME)).map_err(AppError::io)?;
+        let bytes = fs::read(self.root.join(MARKER_NAME)).map_err(|error| {
+            AppError::model(format!("cannot read installed model marker: {error}"))
+        })?;
         let marker: InstallMarker = serde_json::from_slice(&bytes)
             .map_err(|error| AppError::model(format!("invalid model marker: {error}")))?;
         if marker.schema != 1
@@ -128,7 +143,9 @@ impl Models {
         }
         for file in &marker.files {
             let path = self.root.join(&file.path);
-            let metadata = fs::metadata(path).map_err(AppError::io)?;
+            let metadata = fs::metadata(path).map_err(|error| {
+                AppError::model(format!("installed model asset is unavailable: {error}"))
+            })?;
             if !metadata.is_file() || metadata.len() != file.size {
                 return Err(AppError::model("installed model assets are incomplete"));
             }
@@ -138,7 +155,7 @@ impl Models {
 }
 
 impl Backend {
-    fn load(root: &Path) -> Result<Self, AppError> {
+    fn download_and_load(root: &Path) -> Result<Self, AppError> {
         let embedding = TextEmbedding::try_new(
             TextInitOptions::new(EMBEDDING_MODEL)
                 .with_cache_dir(root.to_path_buf())
@@ -149,6 +166,42 @@ impl Backend {
             RerankInitOptions::new(RERANKER_MODEL)
                 .with_cache_dir(root.to_path_buf())
                 .with_show_download_progress(false),
+        )
+        .map_err(|error| AppError::model(format!("failed to load reranking model: {error}")))?;
+        Ok(Self {
+            embedding,
+            reranker,
+        })
+    }
+
+    fn load_local(root: &Path) -> Result<Self, AppError> {
+        let embedding_snapshot = snapshot(root, EMBEDDING_REPOSITORY)?;
+        let embedding_info = TextEmbedding::get_model_info(&EMBEDDING_MODEL)
+            .map_err(|error| AppError::model(format!("unknown embedding model: {error}")))?;
+        let mut embedding_model = UserDefinedEmbeddingModel::new(
+            read_model_file(&embedding_snapshot.join(&embedding_info.model_file))?,
+            read_tokenizer_files(&embedding_snapshot)?,
+        )
+        .with_quantization(TextEmbedding::get_quantization_mode(&EMBEDDING_MODEL));
+        embedding_model.pooling = TextEmbedding::get_default_pooling_method(&EMBEDDING_MODEL);
+        embedding_model
+            .output_key
+            .clone_from(&embedding_info.output_key);
+        let embedding = TextEmbedding::try_new_from_user_defined(
+            embedding_model,
+            InitOptionsUserDefined::default(),
+        )
+        .map_err(|error| AppError::model(format!("failed to load embedding model: {error}")))?;
+
+        let reranker_snapshot = snapshot(root, RERANKER_REPOSITORY)?;
+        let reranker_info = TextRerank::get_model_info(&RERANKER_MODEL);
+        let reranker_model = UserDefinedRerankingModel::new(
+            reranker_snapshot.join(reranker_info.model_file),
+            read_tokenizer_files(&reranker_snapshot)?,
+        );
+        let reranker = TextRerank::try_new_from_user_defined(
+            reranker_model,
+            RerankInitOptionsUserDefined::default(),
         )
         .map_err(|error| AppError::model(format!("failed to load reranking model: {error}")))?;
         Ok(Self {
@@ -175,6 +228,35 @@ impl Backend {
             .rerank(query, documents, false, None)
             .map_err(|error| AppError::model(format!("reranking inference failed: {error}")))
     }
+}
+
+fn snapshot(root: &Path, repository: &str) -> Result<PathBuf, AppError> {
+    let revision =
+        fs::read_to_string(root.join(repository).join("refs/main")).map_err(|error| {
+            AppError::model(format!("cannot read installed model revision: {error}"))
+        })?;
+    let revision = revision.trim();
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::model("installed model revision is invalid"));
+    }
+    let snapshot = root.join(repository).join("snapshots").join(revision);
+    if !snapshot.is_dir() {
+        return Err(AppError::model("installed model snapshot is unavailable"));
+    }
+    Ok(snapshot)
+}
+
+fn read_model_file(path: &Path) -> Result<Vec<u8>, AppError> {
+    fs::read(path).map_err(|error| AppError::model(format!("cannot read installed model: {error}")))
+}
+
+fn read_tokenizer_files(snapshot: &Path) -> Result<TokenizerFiles, AppError> {
+    Ok(TokenizerFiles {
+        tokenizer_file: read_model_file(&snapshot.join("tokenizer.json"))?,
+        config_file: read_model_file(&snapshot.join("config.json"))?,
+        special_tokens_map_file: read_model_file(&snapshot.join("special_tokens_map.json"))?,
+        tokenizer_config_file: read_model_file(&snapshot.join("tokenizer_config.json"))?,
+    })
 }
 
 pub(crate) fn embedding_generation() -> &'static str {
@@ -260,11 +342,13 @@ pub(crate) fn hybrid_search(
     }
     let mut fused = fuse(lexical, semantic_hits);
     let rerank_count = fused.len().min(RERANK_LIMIT);
-    let documents: Vec<&str> = fused[..rerank_count]
+    let rerank_ids = fused[..rerank_count]
         .iter()
-        .map(|hit| hit.content.as_str())
-        .collect();
-    let reranked = backend.rerank(query, &documents)?;
+        .map(|hit| hit.id.as_str())
+        .collect::<Vec<_>>();
+    let documents = storage.search_documents(&rerank_ids)?;
+    let document_refs = documents.iter().map(String::as_str).collect::<Vec<_>>();
+    let reranked = backend.rerank(query, &document_refs)?;
     for result in reranked {
         if let Some(hit) = fused.get_mut(result.index) {
             hit.rerank_score = Some(result.score);

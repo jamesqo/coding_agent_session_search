@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[cfg(test)]
 use clap::CommandFactory;
@@ -98,6 +99,7 @@ pub(super) enum Response {
 pub(super) struct IndexResponse {
     indexed_conversations: u64,
     indexed_messages: u64,
+    searchable_messages: u64,
     scanned_files: u64,
     malformed_records: u64,
     changed_messages: u64,
@@ -112,15 +114,18 @@ pub(super) struct IndexResponse {
     full: bool,
     embeddings: u64,
     realized_mode: &'static str,
-    fallback_reason: Option<String>,
+    model_load_milliseconds: u64,
+    storage_setup_milliseconds: u64,
+    ingestion_milliseconds: u64,
+    search_refresh_milliseconds: u64,
+    embedding_milliseconds: u64,
+    total_milliseconds: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SearchResponse {
     pub(crate) query: String,
     pub(crate) realized_mode: String,
-    pub(crate) fallback_mode: Option<String>,
-    pub(crate) fallback_reason: Option<String>,
     pub(crate) results: Vec<crate::storage::SearchHit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) nodes: Option<Vec<federation::NodeOutcome>>,
@@ -138,6 +143,7 @@ pub(super) struct StatusResponse {
     database_path: PathBuf,
     conversations: u64,
     messages: u64,
+    searchable_messages: u64,
     embeddings: u64,
     stored_embeddings: u64,
     models_installed: bool,
@@ -249,38 +255,48 @@ fn index(
     full: bool,
     roots: &ProviderRoots,
 ) -> Result<Response, AppError> {
+    let total_started = Instant::now();
+    let models = Models::new(models_dir.to_path_buf());
+    let model_started = Instant::now();
+    let mut backend = models.load()?.ok_or_else(|| {
+        AppError::model("semantic models are not installed; run `cass models install`")
+    })?;
+    let model_load_milliseconds = elapsed_milliseconds(model_started);
+    let storage_started = Instant::now();
     let mut storage = Storage::open_writer(database_path)?;
-    storage.defer_search_updates()?;
+    if full || storage.derived_search_is_dirty()? {
+        storage.defer_search_updates()?;
+    }
     if full {
         storage.mark_derived_search_dirty()?;
     }
+    let storage_setup_milliseconds = elapsed_milliseconds(storage_started);
+    let ingestion_started = Instant::now();
     let summary = ingestion::index(&mut storage, roots)?;
+    let ingestion_milliseconds = elapsed_milliseconds(ingestion_started);
+    let search_started = Instant::now();
     if storage.derived_search_is_dirty()? {
         emit_index_phase("search-rebuild", &summary);
         storage.rebuild_derived_search_state()?;
     }
-    #[cfg(feature = "semantic")]
+    let search_refresh_milliseconds = elapsed_milliseconds(search_started);
+    emit_index_phase("semantic-embeddings", &summary);
+    let embedding_started = Instant::now();
     storage.invalidate_embedding_generation(semantic::embedding_generation())?;
-    let models = Models::new(models_dir.to_path_buf());
-    let (embeddings, fallback_reason) = match models.load() {
-        Ok(Some(mut backend)) => match semantic::rebuild_embeddings(&mut storage, &mut backend) {
-            Ok(count) => (count, None),
-            Err(error) => (0, Some(error.message().to_owned())),
-        },
-        Ok(None) => (0, semantic_unavailable_reason()),
-        Err(error) => (0, Some(error.message().to_owned())),
-    };
+    let embeddings = semantic::rebuild_embeddings(&mut storage, &mut backend)?;
+    let embedding_milliseconds = elapsed_milliseconds(embedding_started);
     let counts = storage.counts()?;
-    #[cfg(feature = "semantic")]
-    let current_embeddings = storage.embedding_count(semantic::embedding_generation())?;
-    #[cfg(not(feature = "semantic"))]
-    let current_embeddings = 0;
+    if !storage.semantic_coverage_is_complete(semantic::embedding_generation())? {
+        return Err(AppError::search_not_ready(
+            "semantic embedding coverage is incomplete",
+        ));
+    }
     storage.commit_writer()?;
     emit_index_phase("complete", &summary);
-    let hybrid_ready = counts.messages > 0 && current_embeddings == counts.messages;
     Ok(Response::Index(IndexResponse {
         indexed_conversations: counts.conversations,
         indexed_messages: counts.messages,
+        searchable_messages: counts.searchable_messages,
         scanned_files: summary.scanned_files,
         malformed_records: summary.malformed_records,
         changed_messages: summary.changed_messages,
@@ -294,9 +310,18 @@ fn index(
         processed_bytes: summary.processed_bytes,
         full,
         embeddings,
-        realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
-        fallback_reason,
+        realized_mode: "hybrid",
+        model_load_milliseconds,
+        storage_setup_milliseconds,
+        ingestion_milliseconds,
+        search_refresh_milliseconds,
+        embedding_milliseconds,
+        total_milliseconds: elapsed_milliseconds(total_started),
     }))
+}
+
+fn elapsed_milliseconds(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn emit_index_phase(phase: &'static str, summary: &ingestion::IndexSummary) {
@@ -368,47 +393,25 @@ fn local_search(
     days: Option<u32>,
 ) -> Result<SearchResponse, AppError> {
     let provider = normalize_provider_filter(provider)?;
-    let storage = Storage::open_existing(database_path)?;
-    #[cfg(feature = "semantic")]
-    let current_embeddings = storage.embedding_count(semantic::embedding_generation())?;
-    #[cfg(not(feature = "semantic"))]
-    let current_embeddings = 0;
     let models = Models::new(models_dir.to_path_buf());
-    let backend = if current_embeddings > 0 {
-        models.load()
-    } else {
-        Ok(None)
-    };
-    let (results, realized_mode, fallback_mode, fallback_reason) = match backend {
-        Ok(Some(mut backend)) => {
-            match semantic::hybrid_search(&storage, &mut backend, &query, limit, provider, days) {
-                Ok(results) => (results, "hybrid", None, None),
-                Err(error) => (
-                    storage.search(&query, limit, provider, days)?,
-                    "lexical",
-                    Some("lexical"),
-                    Some(error.message().to_owned()),
-                ),
-            }
-        }
-        Ok(None) => (
-            storage.search(&query, limit, provider, days)?,
-            "lexical",
-            Some("lexical"),
-            semantic_unavailable_reason(),
-        ),
-        Err(error) => (
-            storage.search(&query, limit, provider, days)?,
-            "lexical",
-            Some("lexical"),
-            Some(error.message().to_owned()),
-        ),
-    };
+    models.require_installed()?;
+    let storage = Storage::open_existing(database_path)?;
+    let counts = storage.counts()?;
+    if storage.derived_search_is_dirty()?
+        || counts.messages == 0
+        || !storage.semantic_coverage_is_complete(semantic::embedding_generation())?
+    {
+        return Err(AppError::search_not_ready(
+            "semantic index is incomplete; run `cass index`",
+        ));
+    }
+    let mut backend = models.load()?.ok_or_else(|| {
+        AppError::model("semantic models are not installed; run `cass models install`")
+    })?;
+    let results = semantic::hybrid_search(&storage, &mut backend, &query, limit, provider, days)?;
     Ok(SearchResponse {
         query,
-        realized_mode: realized_mode.to_owned(),
-        fallback_mode: fallback_mode.map(ToOwned::to_owned),
-        fallback_reason,
+        realized_mode: "hybrid".to_owned(),
         results,
         nodes: None,
     })
@@ -479,44 +482,50 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
             database_path: database_path.to_path_buf(),
             conversations: 0,
             messages: 0,
+            searchable_messages: 0,
             embeddings: 0,
             stored_embeddings: 0,
             models_installed,
-            semantic_support: cfg!(feature = "semantic"),
+            semantic_support: true,
             realized_mode: "unavailable",
-            recommended_action: Some("index"),
+            recommended_action: Some(if models_installed {
+                "index"
+            } else {
+                "models install"
+            }),
         }));
     }
 
-    let storage = Storage::open_existing(database_path)?;
-    let counts = storage.counts()?;
-    #[cfg(feature = "semantic")]
-    let current_embeddings = storage.embedding_count(semantic::embedding_generation())?;
-    #[cfg(not(feature = "semantic"))]
-    let current_embeddings = 0;
-    let hybrid_ready =
-        models_installed && counts.messages > 0 && current_embeddings == counts.messages;
+    let snapshot = Storage::status_snapshot(database_path, semantic::embedding_generation())?;
+    let counts = snapshot.counts;
+    let current_embeddings = snapshot.current_embeddings;
+    let hybrid_ready = models_installed
+        && snapshot.derived_clean
+        && counts.messages > 0
+        && snapshot.exact_semantic_coverage;
     Ok(Response::Status(StatusResponse {
-        ready: true,
+        ready: hybrid_ready,
         database_path: database_path.to_path_buf(),
         conversations: counts.conversations,
         messages: counts.messages,
+        searchable_messages: counts.searchable_messages,
         embeddings: current_embeddings,
         stored_embeddings: counts.embeddings,
         models_installed,
-        semantic_support: cfg!(feature = "semantic"),
-        realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
-        recommended_action: (models_installed && current_embeddings != counts.messages)
-            .then_some("index"),
+        semantic_support: true,
+        realized_mode: if hybrid_ready {
+            "hybrid"
+        } else {
+            "unavailable"
+        },
+        recommended_action: if !models_installed {
+            Some("models install")
+        } else if hybrid_ready {
+            None
+        } else {
+            Some("index")
+        },
     }))
-}
-
-fn semantic_unavailable_reason() -> Option<String> {
-    if cfg!(feature = "semantic") {
-        None
-    } else {
-        Some("semantic support is unavailable in this lexical-only build".to_owned())
-    }
 }
 
 fn install_models(models_dir: &Path) -> Result<Response, AppError> {

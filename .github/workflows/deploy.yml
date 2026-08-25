@@ -49,12 +49,14 @@ jobs:
           path: ${{ runner.temp }}/MacOSX26.1.sdk.tar.xz
           key: cass-macos-sdk-26.1-beee7212d265a6d2
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Test semantic build
         run: |
           set -euo pipefail
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
+          cargo nextest run --locked
           cargo test --locked --doc
 
       - name: Build Linux binary

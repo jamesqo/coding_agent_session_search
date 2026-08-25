@@ -1,12 +1,7 @@
 mod cli;
 mod federation;
 mod ingestion;
-#[cfg(feature = "semantic")]
 mod semantic;
-#[cfg(not(feature = "semantic"))]
-mod semantic_disabled;
-#[cfg(not(feature = "semantic"))]
-use semantic_disabled as semantic;
 mod storage;
 
 use std::ffi::OsString;
@@ -66,23 +61,22 @@ struct ErrorBody {
     kind: &'static str,
     message: String,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_action: Option<&'static str>,
 }
 
 impl AppError {
-    fn message(&self) -> &str {
-        &self.error.message
-    }
-
     fn usage(message: impl Into<String>) -> Self {
         Self::new(2, "usage", message, false)
     }
 
     fn missing_database(path: &std::path::Path) -> Self {
-        Self::new(
+        Self::with_action(
             3,
             "database-missing",
             format!("database does not exist: {}", path.display()),
             true,
+            "index",
         )
     }
 
@@ -102,7 +96,6 @@ impl AppError {
         Self::new(5, "database", message, true)
     }
 
-    #[cfg(feature = "semantic")]
     fn database_data(message: impl Into<String>) -> Self {
         Self::new(5, "database", message, false)
     }
@@ -118,7 +111,11 @@ impl AppError {
     }
 
     fn model(message: impl Into<String>) -> Self {
-        Self::new(4, "model", message, true)
+        Self::with_action(4, "model", message, true, "models install")
+    }
+
+    fn search_not_ready(message: impl Into<String>) -> Self {
+        Self::with_action(8, "search-not-ready", message, true, "index")
     }
 
     fn schema(message: impl Into<String>) -> Self {
@@ -131,8 +128,21 @@ impl AppError {
                 kind,
                 message: message.into(),
                 retryable,
+                recommended_action: None,
             },
             code,
         }
+    }
+
+    fn with_action(
+        code: i32,
+        kind: &'static str,
+        message: impl Into<String>,
+        retryable: bool,
+        recommended_action: &'static str,
+    ) -> Self {
+        let mut error = Self::new(code, kind, message, retryable);
+        error.error.recommended_action = Some(recommended_action);
+        error
     }
 }
