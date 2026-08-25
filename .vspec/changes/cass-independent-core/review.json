@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "change_id": "cass-independent-core",
-  "contract_hash": "sha256:4d41620e6bcb6625d9f013bf7466d4bd08927939f246caeb486f407a7cea256f",
-  "manifest_hash": "sha256:bca473467d3a952a79c91b2a18d4e2b354e98fdaaae298ae3f849cb25bd38e79",
-  "reviewed_at": "2026-08-25T01:40:06Z",
+  "contract_hash": "sha256:1687fc381efa5ceff9498f60419a011d661d8ddcce03644f25455be602609368",
+  "manifest_hash": "sha256:836c94af9d70f3ce0b4320e3a72167fc947bcc80a58c2fad8bcb6db665ebb849",
+  "reviewed_at": "2026-08-25T01:45:07Z",
   "history": [
     {
       "contract_hash": "sha256:2498a6dbd9bd2141b02a64dcdc88a54ceaac69fa34482cae791fc2d669776840",
@@ -19,6 +19,11 @@
       "contract_hash": "sha256:e806af3f80463a84a5d7c72ad0d6ab29020c26d62f7e0f9bcceb6dabfe0c13c4",
       "reviewed_at": "2026-08-25T01:27:32Z",
       "superseded_at": "2026-08-25T01:40:06Z"
+    },
+    {
+      "contract_hash": "sha256:4d41620e6bcb6625d9f013bf7466d4bd08927939f246caeb486f407a7cea256f",
+      "reviewed_at": "2026-08-25T01:40:06Z",
+      "superseded_at": "2026-08-25T01:45:07Z"
     }
   ]
 }

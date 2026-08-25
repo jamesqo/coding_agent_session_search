@@ -1,8 +1,8 @@
 # CASS Independent Core Delivery Plan
 
-Status: approved
+Status: implemented
 Spec: `specs/cass-independent-core/spec.md`
-Evidence: fresh Veritas diff/status/report; 16 stable claims, 8 discovered Rust tests, 16 uncovered-claim findings, no drift
+Evidence: 16 stable claims, 23 discovered Rust tests, 34 reviewed and approved links, zero findings or drift
 Delivery: phased
 Verification cadence: plan-final
 
@@ -19,10 +19,9 @@ deleted. No compatibility surface is preserved.
 ## Current Veritas Gate State
 
 Project-bound `vtas` CLI access succeeds. Claim and evidence locks have no
-drift. The Rust producer discovers eight tests, but no evidence links exist, so
-all 16 claims currently have blocking `UNCOVERED_CLAIM` findings. Native tests
-remain useful implementation feedback; the final consolidation unit owns
-evidence discovery, link review, approval, and terminal Veritas status/report.
+drift. The Rust producer discovers 23 focused tests; all 34 claim/evidence
+links were individually reviewed and approved. All 16 claims are covered with
+zero blocking or advisory findings.
 
 ## Preservation and Change Contract
 
@@ -142,7 +141,7 @@ shared schema are common ownership seams.
   `app/storage.rs`, focused fixtures/tests, and matching documentation. Exit:
   all four providers index, search, view, filter, reindex, and fail malformed input
   safely through focused Nextest scenarios.
-- [ ] **PH-6 — Integrated proof and consolidation.** Depends on PH-5. Consumes
+- [x] **PH-6 — Integrated proof and consolidation.** Depends on PH-5. Consumes
   the complete replacement and produces final formatting, strict Clippy,
   full Nextest, doctest, dependency scan, LOC accounting, evidence discovery,
   per-link semantic review, authorized approvals, and terminal Veritas
@@ -501,7 +500,7 @@ PH-6; no coverage exclusion was introduced. PH-6 is now ready.
 
 ### PH-6 Execution Contract: Integrated Proof and Consolidation
 
-Status: approved
+Status: implemented
 Depends on: PH-5
 Consumes: consolidated independent repository and all phase-owned tests
 Produces: reviewed evidence links, terminal gates, and an archive-ready change
@@ -516,7 +515,7 @@ Verification role: plan-final
 - **Outcome:** every locked claim is connected to semantically appropriate
   passing Rust evidence, final native/fresh-clone gates pass, no blocking
   Veritas finding remains, and all implemented phases become complete.
-- **Existing foundation:** 21 focused evidence declarations, 16 locked claims,
+- **Existing foundation:** 23 focused evidence declarations, 16 locked claims,
   clean claim/evidence drift, the Xenia/macOS real-model caches, and the minimal
   CI workflow remain.
 - **Net-new work:** vendor the exact released `veritas-test-macros` 0.1.0 crate
@@ -524,7 +523,7 @@ Verification role: plan-final
   approve each link, validate a fresh clone, and record terminal results.
 - **Not included:** product behavior, provider expansion, release publishing,
   migration compatibility, or Veritas implementation changes.
-- **Claims and findings:** all 16 claims and their current uncovered findings.
+- **Claims and findings:** all 16 claims and their reviewed evidence links.
 - **Constraints:** no claim is deleted or excluded; each link is reviewed
   individually; native test success and evidence approval remain distinct.
 
@@ -557,15 +556,24 @@ Verification role: plan-final
 
 #### Exit
 
-- [ ] Outcome demonstrated and all accumulated checks pass.
-- [ ] Every claim has current reviewed/approved runnable evidence.
-- [ ] No coverage exclusion or blocking Veritas finding remains.
-- [ ] Repository is archive-ready and no implementation work remains.
+- [x] Outcome demonstrated and all accumulated checks pass.
+- [x] Every claim has current reviewed/approved runnable evidence.
+- [x] No coverage exclusion or blocking Veritas finding remains.
+- [x] Repository is archive-ready and no implementation work remains.
 
 #### Completion record
 
-Pending. GitHub’s unauthenticated Actions API currently reports no workflow run
-for cutover commit `91aed620`; fresh-clone proof is therefore mandatory.
+Commit `613b7fec` was pushed to `main` and synchronized to `master`, then cloned
+from GitHub into an isolated directory. The fresh clone passed formatting,
+strict all-target Clippy, 22 parallel model-free Nextest tests, one doctest,
+and the separately enabled installed-model hybrid/reranking test. Canonical
+Xenia gates passed identically before the push.
+
+The maintained repository contains 35 tracked files, 2,106 production Rust
+lines, and 761 test Rust lines. Veritas reports 16 claims, 23 evidence items,
+34 reviewed/approved links, zero uncovered claims, zero drift, and zero
+findings. No coverage exclusion was introduced. Cursor and Aider remain
+unsupported by explicit user choice; no implementation residue was added.
 
 ## Traceability and Evidence Assignment
 
@@ -584,10 +592,9 @@ by themselves create Veritas evidence or approval.
 
 - Real provider formats may contain additional current record shapes; PH-2 must
   test representative local histories before declaring its boundary complete.
-- The semantic backend remains intentionally undecided until the portability
-  spike; selecting it is implementation work within the already-approved
-  concrete-backend decision, not permission to add a registry or daemon.
-- Veritas macro packaging is under upstream review. Native implementation may
-  continue, but PH-6 cannot close until citations can be linked and approved.
+- The selected FastEmbed backend has passed Linux amd64 and macOS arm64
+  load/inference proof; adding a registry or daemon remains outside scope.
+- The exact released Veritas macro source remains vendored as the documented
+  fallback until upstream packaging is deployed.
 - Legacy deletion is destructive but explicitly authorized by PC-1; git history
   remains the recovery mechanism.
