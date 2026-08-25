@@ -262,7 +262,11 @@ fn fuse(lexical: Vec<SearchHit>, semantic: Vec<SearchHit>) -> Vec<SearchHit> {
     for (rank, hit) in semantic.into_iter().enumerate() {
         let id = hit.id.clone();
         *scores.entry(id.clone()).or_default() += reciprocal_rank(rank);
-        hits.entry(id).or_insert(hit);
+        if let Some(existing) = hits.get_mut(&id) {
+            existing.semantic_score = hit.semantic_score;
+        } else {
+            hits.insert(id, hit);
+        }
     }
     let mut fused: Vec<SearchHit> = hits
         .into_iter()
@@ -281,7 +285,8 @@ fn fuse(lexical: Vec<SearchHit>, semantic: Vec<SearchHit>) -> Vec<SearchHit> {
 }
 
 fn reciprocal_rank(zero_based_rank: usize) -> f32 {
-    1.0 / (RRF_K + zero_based_rank as f32 + 1.0)
+    let rank = u16::try_from(zero_based_rank).unwrap_or(u16::MAX);
+    1.0 / (RRF_K + f32::from(rank) + 1.0)
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -374,13 +379,16 @@ mod tests {
             }
         }
 
-        let fused = fuse(vec![hit("a"), hit("b")], vec![hit("c"), hit("b")]);
+        let mut semantic_b = hit("b");
+        semantic_b.semantic_score = Some(0.8);
+        let fused = fuse(vec![hit("a"), hit("b")], vec![hit("c"), semantic_b]);
         let ids: Vec<&str> = fused
             .iter()
             .map(|candidate| candidate.id.as_str())
             .collect();
         assert_eq!(ids, ["b", "a", "c"]);
         assert!(fused[0].fusion_score > fused[1].fusion_score);
+        assert_eq!(fused[0].semantic_score, Some(0.8));
         assert_eq!(fused[1].fusion_score, fused[2].fusion_score);
     }
 }

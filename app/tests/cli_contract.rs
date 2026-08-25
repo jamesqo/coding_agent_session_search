@@ -312,3 +312,37 @@ fn hybrid_search_with_installed_models() {
             .is_some_and(|content| content.contains("credentials"))
     );
 }
+
+#[test]
+fn lexical_search_applies_recency_filter() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let claude_root = directory.path().join("claude");
+    let codex_root = directory.path().join("codex");
+    std::fs::create_dir_all(&claude_root).expect("Claude root");
+    std::fs::create_dir_all(&codex_root).expect("Codex root");
+    std::fs::write(
+        claude_root.join("session.jsonl"),
+        concat!(
+            "{\"type\":\"user\",\"sessionId\":\"recency\",\"uuid\":\"old\",\"timestamp\":\"2000-01-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"temporal old\"}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"recency\",\"uuid\":\"new\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":\"temporal new\"}}\n",
+        ),
+    )
+    .expect("Claude fixture");
+    let database = directory.path().join("cass.sqlite3");
+    let database = database.to_str().expect("UTF-8 database path");
+    run_json(&[
+        "--db",
+        database,
+        "index",
+        "--claude-root",
+        claude_root.to_str().expect("UTF-8 Claude path"),
+        "--codex-root",
+        codex_root.to_str().expect("UTF-8 Codex path"),
+    ]);
+
+    let all = run_json(&["--db", database, "search", "temporal"]);
+    assert_eq!(all["results"].as_array().map(Vec::len), Some(2));
+    let recent = run_json(&["--db", database, "search", "temporal", "--days", "30"]);
+    assert_eq!(recent["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(recent["results"][0]["content"], "temporal new");
+}

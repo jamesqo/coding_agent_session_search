@@ -402,7 +402,7 @@ impl Storage {
 }
 
 fn encode_vector(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len() * size_of::<f32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -414,8 +414,12 @@ fn decode_vector(dimensions: i64, bytes: &[u8]) -> Result<Vec<f32>, &'static str
     if bytes.len() != dimensions.saturating_mul(size_of::<f32>()) {
         return Err("embedding blob length does not match its dimensions");
     }
-    Ok(bytes
-        .chunks_exact(size_of::<f32>())
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err("embedding blob contains a partial value");
+    }
+    Ok(chunks
+        .iter()
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
 }

@@ -115,7 +115,7 @@ CLI contract, and shared schema are common ownership seams.
   diagnostics, and idempotent reindex coverage. Owns `app/ingestion.rs` and
   ingestion-focused tests. Exit: focused Nextest scenarios for every
   `ingestion/*` claim pass.
-- [ ] **PH-3 — Add semantic retrieval and explicit models.** Depends on PH-2.
+- [x] **PH-3 — Add semantic retrieval and explicit models.** Depends on PH-2.
   Consumes canonical messages and lexical results. Produces the portability
   spike record, one selected backend, model install/status state, embeddings,
   exact cosine search, RRF, bounded reranking, and truthful fallback metadata.
@@ -216,7 +216,7 @@ introduced. PH-3 is now ready.
 
 ### PH-3 Execution Contract: Semantic Retrieval and Explicit Models
 
-Status: approved
+Status: implemented
 Depends on: PH-2 (implemented)
 Consumes: canonical message rows, FTS5 candidates, and the JSON command boundary
 Produces: model assets/readiness, message embeddings, exact semantic search,
@@ -280,16 +280,29 @@ Verification role: intermediate
 
 #### Exit
 
-- [ ] Outcome demonstrated and assigned checks pass for cadence.
-- [ ] Runnable evidence freshly discovered; required links remain explicitly
+- [x] Outcome demonstrated and assigned checks pass for cadence.
+- [x] Runnable evidence freshly discovered; required links remain explicitly
   assigned to PH-5 review/approval.
-- [ ] No phase-owned coverage exclusion exists.
-- [ ] PH-3 outputs are available to PH-4 and remaining work retains an owner.
+- [x] No phase-owned coverage exclusion exists.
+- [x] PH-3 outputs are available to PH-4 and remaining work retains an owner.
 
 #### Completion record
 
-Pending. The selected backend is `fastembed` 6.0.1 using ONNX Runtime on CPU;
-the selection remains conditional on the two-target inference smoke.
+Implemented outcome: `fastembed` 6.0.1 on CPU is validated on Linux amd64 and
+macOS arm64. On both targets, explicit installation loaded quantized MiniLM and
+Jina turbo, produced a 384-dimensional embedding, reranked a smoke pair, and
+wrote a 32-file validated asset marker. The installed-model integration test
+passed on both targets. CASS now persists derived `f32` embeddings in Rusqlite,
+performs exact cosine retrieval, deterministic RRF, and bounded cross-encoder
+reranking, while absent/invalid markers remain lexical without creating model
+directories. Recency filtering now reaches both lexical and semantic paths.
+
+On Xenia, the model-free Nextest suite passed 16 tests with the model test
+skipped; the explicitly enabled real-model test passed separately. Strict
+all-target Clippy, formatting, and doctests passed. Veritas discovery now sees
+18 evidence declarations with no artifact drift. The 16 uncovered-claim
+findings remain assigned to PH-5 link review and approval. No exclusion was
+introduced. PH-4 is now ready.
 
 ## Traceability and Evidence Assignment
 
