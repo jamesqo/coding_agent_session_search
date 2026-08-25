@@ -637,7 +637,10 @@ fn parse_jsonl(
             malformed_records += 1;
             continue;
         };
-        if provider == "codex" && raw.get("type").and_then(Value::as_str) == Some("session_meta") {
+        if provider == "codex"
+            && session_id.is_none()
+            && raw.get("type").and_then(Value::as_str) == Some("session_meta")
+        {
             session_id = raw
                 .get("payload")
                 .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
@@ -821,6 +824,28 @@ mod tests {
         assert_eq!(conversation.id, "c1");
         assert_eq!(conversation.messages.len(), 2);
         assert!(conversation.messages[1].content.contains("Tool search"));
+    }
+
+    #[veritas::claims("ingestion/provider-boundary")]
+    #[test]
+    fn codex_parser_keeps_the_rollout_session_identity() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"rollout-session"}}}}"#
+        )
+        .expect("rollout metadata");
+        writeln!(file, r#"{{"type":"response_item","payload":{{"type":"message","id":"m1","role":"user","content":[{{"type":"input_text","text":"original turn"}}]}}}}"#)
+            .expect("message line");
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"nested-session"}}}}"#
+        )
+        .expect("nested metadata");
+
+        let parsed = parse_codex(file.path()).expect("parse Codex history");
+        let conversation = parsed.conversation.expect("conversation");
+        assert_eq!(conversation.id, "rollout-session");
     }
 
     #[veritas::claims("ingestion/provider-boundary", "ingestion/supported-jsonl-indexes")]

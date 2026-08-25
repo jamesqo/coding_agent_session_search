@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::AppError;
-use crate::storage::{SearchHit, Storage};
+use crate::storage::{EmbeddingWrite, SearchHit, SemanticVectors, Storage};
 
 const EMBEDDING_MODEL: EmbeddingModel = EmbeddingModel::AllMiniLML6V2Q;
 const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV1TurboEn;
@@ -28,6 +28,11 @@ pub(crate) struct Models {
 pub(crate) struct Backend {
     embedding: TextEmbedding,
     reranker: TextRerank,
+}
+
+struct QuantizedVector {
+    values: Vec<u8>,
+    norm: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,7 +181,7 @@ pub(crate) fn embedding_generation() -> &'static str {
     EMBEDDING_GENERATION.get_or_init(|| {
         let specification = format!(
             "fastembed=6.0.1;model={EMBEDDING_MODEL};\
-             vector=f32-little-endian;cosine=exact;schema=1"
+             vector=i8-per-vector-symmetric;cosine=quantized-flat-exact;schema=2"
         );
         blake3::hash(specification.as_bytes()).to_hex().to_string()
     })
@@ -191,7 +196,7 @@ pub(crate) fn rebuild_embeddings(
     if messages.is_empty() {
         return Ok(0);
     }
-    let mut vectors = Vec::with_capacity(messages.len());
+    let mut stored = 0_u64;
     for batch in messages.chunks(EMBEDDING_BATCH_SIZE) {
         let texts: Vec<&str> = batch
             .iter()
@@ -203,15 +208,27 @@ pub(crate) fn rebuild_embeddings(
                 "embedding model returned an unexpected result count",
             ));
         }
-        vectors.extend(batch_vectors);
+        let quantized: Vec<QuantizedVector> = batch_vectors
+            .iter()
+            .map(|vector| quantize_vector(vector))
+            .collect();
+        let rows: Vec<EmbeddingWrite<'_>> = batch
+            .iter()
+            .zip(&quantized)
+            .map(|(message, vector)| EmbeddingWrite {
+                message_id: &message.id,
+                vector: &vector.values,
+                norm: vector.norm,
+            })
+            .collect();
+        storage.replace_embeddings(generation, &rows)?;
+        stored = stored
+            .checked_add(
+                u64::try_from(rows.len()).map_err(|_| AppError::internal("too many embeddings"))?,
+            )
+            .ok_or_else(|| AppError::internal("too many embeddings"))?;
     }
-    let rows: Vec<_> = messages
-        .iter()
-        .zip(vectors.iter())
-        .map(|(message, vector)| (message.id.as_str(), vector.as_slice()))
-        .collect();
-    storage.replace_embeddings(generation, &rows)?;
-    u64::try_from(rows.len()).map_err(|_| AppError::internal("too many embeddings"))
+    Ok(stored)
 }
 
 pub(crate) fn hybrid_search(
@@ -227,24 +244,20 @@ pub(crate) fn hybrid_search(
         .embed(&[query])?
         .pop()
         .ok_or_else(|| AppError::model("embedding model returned no query vector"))?;
-    let mut semantic = storage.semantic_documents(embedding_generation(), provider, days)?;
-    for document in &mut semantic {
-        document.hit.semantic_score = Some(cosine_similarity(&query_vector, &document.vector));
-    }
-    semantic.sort_by(|left, right| {
-        right
-            .hit
-            .semantic_score
-            .unwrap_or(f32::NEG_INFINITY)
-            .total_cmp(&left.hit.semantic_score.unwrap_or(f32::NEG_INFINITY))
-            .then_with(|| left.hit.id.cmp(&right.hit.id))
-    });
-    semantic.truncate(CANDIDATE_LIMIT);
-    if semantic.is_empty() {
+    let query_vector = quantize_vector(&query_vector);
+    let semantic = storage.semantic_vectors(embedding_generation(), provider, days)?;
+    let ranked = rank_quantized(&query_vector, &semantic, CANDIDATE_LIMIT);
+    if ranked.is_empty() {
         return Ok(lexical.into_iter().take(limit).collect());
     }
-
-    let semantic_hits: Vec<SearchHit> = semantic.into_iter().map(|document| document.hit).collect();
+    let message_ids: Vec<&str> = ranked
+        .iter()
+        .map(|(index, _)| semantic.message_ids[*index].as_str())
+        .collect();
+    let mut semantic_hits = storage.search_hits(&message_ids)?;
+    for (hit, (_, score)) in semantic_hits.iter_mut().zip(&ranked) {
+        hit.semantic_score = Some(*score);
+    }
     let mut fused = fuse(lexical, semantic_hits);
     let rerank_count = fused.len().min(RERANK_LIMIT);
     let documents: Vec<&str> = fused[..rerank_count]
@@ -307,24 +320,102 @@ fn reciprocal_rank(zero_based_rank: usize) -> f32 {
     1.0 / (RRF_K + f32::from(rank) + 1.0)
 }
 
-fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
-    if left.len() != right.len() || left.is_empty() {
+fn quantize_vector(vector: &[f32]) -> QuantizedVector {
+    let max_abs = vector
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f32, f32::max);
+    if max_abs <= f32::EPSILON {
+        return QuantizedVector {
+            values: vec![0; vector.len()],
+            norm: 0.0,
+        };
+    }
+    let scale = 127.0 / max_abs;
+    let mut norm_squared = 0_i32;
+    let values = vector
+        .iter()
+        .map(|value| {
+            let quantized = quantize_component(*value, scale);
+            let quantized_i32 = i32::from(quantized);
+            norm_squared += quantized_i32 * quantized_i32;
+            quantized.cast_unsigned()
+        })
+        .collect();
+    QuantizedVector {
+        values,
+        norm: exactly_representable_f32(norm_squared).sqrt(),
+    }
+}
+
+fn quantized_cosine(left: &QuantizedVector, right: &[u8], right_norm: f32) -> f32 {
+    if left.values.len() != right.len() || left.values.is_empty() {
         return 0.0;
     }
-    let mut dot = 0.0;
-    let mut left_norm = 0.0;
-    let mut right_norm = 0.0;
-    for (&left_value, &right_value) in left.iter().zip(right) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
-    }
-    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    let denominator = left.norm * right_norm;
     if denominator <= f32::EPSILON {
-        0.0
-    } else {
-        (dot / denominator).clamp(-1.0, 1.0)
+        return 0.0;
     }
+    let product = left
+        .values
+        .iter()
+        .zip(right)
+        .map(|(&left, &right)| i32::from(left.cast_signed()) * i32::from(right.cast_signed()))
+        .sum::<i32>();
+    (exactly_representable_f32(product) / denominator).clamp(-1.0, 1.0)
+}
+
+fn quantize_component(value: f32, scale: f32) -> i8 {
+    let rounded = (value * scale).round().clamp(-127.0, 127.0);
+    debug_assert!((-127.0..=127.0).contains(&rounded));
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        rounded as i8
+    }
+}
+
+fn exactly_representable_f32(value: i32) -> f32 {
+    // A 384-dimensional signed-byte dot product is bounded by 6,193,536,
+    // below f32's exact-integer limit of 2^24.
+    debug_assert!(value.unsigned_abs() <= 1 << f32::MANTISSA_DIGITS);
+    #[allow(clippy::cast_precision_loss)]
+    {
+        value as f32
+    }
+}
+
+fn rank_quantized(
+    query: &QuantizedVector,
+    vectors: &SemanticVectors,
+    limit: usize,
+) -> Vec<(usize, f32)> {
+    if limit == 0
+        || vectors.dimensions == 0
+        || query.values.len() != vectors.dimensions
+        || vectors.norms.len() != vectors.message_ids.len()
+        || vectors.values.len() != vectors.message_ids.len().saturating_mul(vectors.dimensions)
+    {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, f32)> = vectors
+        .values
+        .chunks_exact(vectors.dimensions)
+        .zip(&vectors.norms)
+        .enumerate()
+        .map(|(index, (vector, norm))| (index, quantized_cosine(query, vector, *norm)))
+        .collect();
+    let compare = |left: &(usize, f32), right: &(usize, f32)| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| vectors.message_ids[left.0].cmp(&vectors.message_ids[right.0]))
+    };
+    if ranked.len() > limit {
+        ranked.select_nth_unstable_by(limit, compare);
+        ranked.truncate(limit);
+    }
+    ranked.sort_unstable_by(compare);
+    ranked
 }
 
 fn inventory(root: &Path) -> Result<Vec<InstalledFile>, AppError> {
@@ -365,11 +456,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cosine_similarity_handles_bounds_and_dimension_mismatch() {
-        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < f32::EPSILON);
-        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < f32::EPSILON);
-        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
-        assert_eq!(cosine_similarity(&[0.0], &[1.0]), 0.0);
+    fn quantized_cosine_handles_bounds_and_preserves_direction() {
+        let positive = quantize_vector(&[1.0, 0.0]);
+        let negative = quantize_vector(&[-1.0, 0.0]);
+        let zero = quantize_vector(&[0.0, 0.0]);
+        assert!(
+            (quantized_cosine(&positive, &positive.values, positive.norm) - 1.0).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (quantized_cosine(&positive, &negative.values, negative.norm) + 1.0).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(quantized_cosine(&positive, &[127], 127.0), 0.0);
+        assert_eq!(
+            quantized_cosine(&zero, &positive.values, positive.norm),
+            0.0
+        );
+    }
+
+    #[test]
+    fn quantized_ranking_selects_the_best_candidates_deterministically() {
+        let query = quantize_vector(&[1.0, 0.0]);
+        let first = quantize_vector(&[1.0, 0.0]);
+        let second = quantize_vector(&[0.8, 0.2]);
+        let third = quantize_vector(&[-1.0, 0.0]);
+        let vectors = SemanticVectors {
+            message_ids: vec!["b".to_owned(), "a".to_owned(), "c".to_owned()],
+            values: [first.values, second.values, third.values].concat(),
+            norms: vec![first.norm, second.norm, third.norm],
+            dimensions: 2,
+        };
+
+        let ranked = rank_quantized(&query, &vectors, 2);
+        assert_eq!(
+            ranked.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(ranked[0].1 > ranked[1].1);
     }
 
     #[test]

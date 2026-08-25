@@ -183,6 +183,9 @@ fn index(
     roots: &ProviderRoots,
 ) -> Result<Response, AppError> {
     let mut storage = Storage::open_writer(database_path)?;
+    if full {
+        storage.defer_search_updates()?;
+    }
     let summary = ingestion::index(&mut storage, roots)?;
     if full {
         storage.rebuild_derived_search_state()?;

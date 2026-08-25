@@ -101,6 +101,11 @@ impl AppError {
         Self::new(5, "database", message, true)
     }
 
+    #[cfg(feature = "semantic")]
+    fn database_data(message: impl Into<String>) -> Self {
+        Self::new(5, "database", message, false)
+    }
+
     fn io(error: io::Error) -> Self {
         let message = error.to_string();
         drop(error);

@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     generation TEXT NOT NULL DEFAULT '',
     dimensions INTEGER NOT NULL,
+    norm REAL NOT NULL,
     vector BLOB NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS tombstones (
 pub(crate) struct Storage {
     connection: Connection,
     writer_active: bool,
+    defer_search_updates: bool,
 }
 
 pub(crate) struct Counts {
@@ -97,9 +99,18 @@ pub(crate) struct SearchableMessage {
 }
 
 #[cfg(feature = "semantic")]
-pub(crate) struct SemanticDocument {
-    pub(crate) hit: SearchHit,
-    pub(crate) vector: Vec<f32>,
+pub(crate) struct EmbeddingWrite<'a> {
+    pub(crate) message_id: &'a str,
+    pub(crate) vector: &'a [u8],
+    pub(crate) norm: f32,
+}
+
+#[cfg(feature = "semantic")]
+pub(crate) struct SemanticVectors {
+    pub(crate) message_ids: Vec<String>,
+    pub(crate) values: Vec<u8>,
+    pub(crate) norms: Vec<f32>,
+    pub(crate) dimensions: usize,
 }
 
 #[derive(Default)]
@@ -120,6 +131,7 @@ impl Storage {
         Ok(Self {
             connection,
             writer_active: false,
+            defer_search_updates: false,
         })
     }
 
@@ -144,6 +156,12 @@ impl Storage {
                 .map_err(AppError::database)?;
             self.writer_active = false;
         }
+        Ok(())
+    }
+
+    pub(crate) fn defer_search_updates(&mut self) -> Result<(), AppError> {
+        self.require_writer()?;
+        self.defer_search_updates = true;
         Ok(())
     }
 
@@ -270,78 +288,94 @@ impl Storage {
         conversation: &Conversation,
         existing_messages: &BTreeMap<String, String>,
     ) -> Result<(Vec<String>, u64), AppError> {
-        let mut seen = BTreeSet::new();
         let mut changed = Vec::new();
+        let mut upsert_message = self
+            .connection
+            .prepare_cached(
+                "INSERT INTO messages(
+                    id, conversation_id, ordinal, role, content, created_at, fingerprint
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    conversation_id = excluded.conversation_id,
+                    ordinal = excluded.ordinal,
+                    role = excluded.role,
+                    content = excluded.content,
+                    created_at = excluded.created_at,
+                    fingerprint = excluded.fingerprint",
+            )
+            .map_err(AppError::database)?;
+        let mut delete_fts = self
+            .connection
+            .prepare_cached("DELETE FROM message_fts WHERE message_id = ?1")
+            .map_err(AppError::database)?;
+        let mut insert_fts = self
+            .connection
+            .prepare_cached(
+                "INSERT INTO message_fts(content, message_id, conversation_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(AppError::database)?;
+        let mut delete_embedding = self
+            .connection
+            .prepare_cached("DELETE FROM message_embeddings WHERE message_id = ?1")
+            .map_err(AppError::database)?;
+        let mut delete_message = self
+            .connection
+            .prepare_cached("DELETE FROM messages WHERE id = ?1")
+            .map_err(AppError::database)?;
+
+        let incoming_ids = conversation
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let removed: Vec<String> = existing_messages
+            .keys()
+            .filter(|id| !incoming_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in &removed {
+            if !self.defer_search_updates {
+                delete_fts.execute([id]).map_err(AppError::database)?;
+            }
+            delete_message.execute([id]).map_err(AppError::database)?;
+        }
+
         for message in &conversation.messages {
-            seen.insert(message.id.clone());
             let fingerprint = message_fingerprint(message);
             if existing_messages.get(&message.id) == Some(&fingerprint) {
                 continue;
             }
-            self.connection
-                .execute(
-                    "INSERT INTO messages(
-                        id, conversation_id, ordinal, role, content, created_at, fingerprint
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(id) DO UPDATE SET
-                        conversation_id = excluded.conversation_id,
-                        ordinal = excluded.ordinal,
-                        role = excluded.role,
-                        content = excluded.content,
-                        created_at = excluded.created_at,
-                        fingerprint = excluded.fingerprint",
-                    params![
-                        message.id,
-                        conversation.id,
-                        message.ordinal,
-                        message.role,
-                        message.content,
-                        message.created_at,
-                        fingerprint,
-                    ],
-                )
+            upsert_message
+                .execute(params![
+                    message.id,
+                    conversation.id,
+                    message.ordinal,
+                    message.role,
+                    message.content,
+                    message.created_at,
+                    fingerprint,
+                ])
                 .map_err(AppError::database)?;
-            self.connection
-                .execute(
-                    "DELETE FROM message_fts WHERE message_id = ?1",
-                    [&message.id],
-                )
-                .map_err(AppError::database)?;
-            self.connection
-                .execute(
-                    "INSERT INTO message_fts(content, message_id, conversation_id)
-                     VALUES (?1, ?2, ?3)",
-                    params![message.content, message.id, conversation.id],
-                )
-                .map_err(AppError::database)?;
-            self.connection
-                .execute(
-                    "DELETE FROM message_embeddings WHERE message_id = ?1",
-                    [&message.id],
-                )
-                .map_err(AppError::database)?;
+            if !self.defer_search_updates {
+                delete_fts
+                    .execute([&message.id])
+                    .map_err(AppError::database)?;
+                insert_fts
+                    .execute(params![message.content, message.id, conversation.id])
+                    .map_err(AppError::database)?;
+                delete_embedding
+                    .execute([&message.id])
+                    .map_err(AppError::database)?;
+            }
             changed.push(message.id.clone());
-        }
-
-        let removed: Vec<String> = existing_messages
-            .keys()
-            .filter(|id| !seen.contains(*id))
-            .cloned()
-            .collect();
-        for id in &removed {
-            self.connection
-                .execute("DELETE FROM message_fts WHERE message_id = ?1", [id])
-                .map_err(AppError::database)?;
-            self.connection
-                .execute("DELETE FROM messages WHERE id = ?1", [id])
-                .map_err(AppError::database)?;
         }
         let removed = u64::try_from(removed.len())
             .map_err(|_| AppError::internal("too many removed messages"))?;
         Ok((changed, removed))
     }
 
-    pub(crate) fn rebuild_derived_search_state(&self) -> Result<(), AppError> {
+    pub(crate) fn rebuild_derived_search_state(&mut self) -> Result<(), AppError> {
         self.connection
             .execute_batch(
                 "DELETE FROM message_fts;
@@ -349,7 +383,9 @@ impl Storage {
                  INSERT INTO message_fts(content, message_id, conversation_id)
                  SELECT content, id, conversation_id FROM messages;",
             )
-            .map_err(AppError::database)
+            .map_err(AppError::database)?;
+        self.defer_search_updates = false;
+        Ok(())
     }
 
     pub(crate) fn purge_missing_sources(
@@ -493,39 +529,49 @@ impl Storage {
     pub(crate) fn replace_embeddings(
         &mut self,
         generation: &str,
-        embeddings: &[(&str, &[f32])],
+        embeddings: &[EmbeddingWrite<'_>],
     ) -> Result<(), AppError> {
-        for (message_id, vector) in embeddings {
-            let dimensions = i64::try_from(vector.len())
+        let mut upsert = self
+            .connection
+            .prepare_cached(
+                "INSERT INTO message_embeddings(
+                    message_id, generation, dimensions, norm, vector
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    generation = excluded.generation,
+                    dimensions = excluded.dimensions,
+                    norm = excluded.norm,
+                    vector = excluded.vector",
+            )
+            .map_err(AppError::database)?;
+        for embedding in embeddings {
+            let dimensions = i64::try_from(embedding.vector.len())
                 .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
-            self.connection
-                .execute(
-                    "INSERT INTO message_embeddings(message_id, generation, dimensions, vector)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(message_id) DO UPDATE SET
-                        generation = excluded.generation,
-                        dimensions = excluded.dimensions,
-                        vector = excluded.vector",
-                    params![message_id, generation, dimensions, encode_vector(vector)],
-                )
+            upsert
+                .execute(params![
+                    embedding.message_id,
+                    generation,
+                    dimensions,
+                    embedding.norm,
+                    embedding.vector,
+                ])
                 .map_err(AppError::database)?;
         }
         Ok(())
     }
 
     #[cfg(feature = "semantic")]
-    pub(crate) fn semantic_documents(
+    pub(crate) fn semantic_vectors(
         &self,
         generation: &str,
         provider: Option<&str>,
         days: Option<u32>,
-    ) -> Result<Vec<SemanticDocument>, AppError> {
+    ) -> Result<SemanticVectors, AppError> {
         let cutoff = cutoff_timestamp(days)?;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT m.id, m.conversation_id, c.provider, m.role, m.content,
-                        e.dimensions, e.vector
+                "SELECT m.id, e.dimensions, e.norm, e.vector
                    FROM message_embeddings e
                    JOIN messages m ON m.id = e.message_id
                    JOIN conversations c ON c.id = m.conversation_id
@@ -535,22 +581,55 @@ impl Storage {
                   ORDER BY m.id",
             )
             .map_err(AppError::database)?;
-        let rows = statement
-            .query_map(params![generation, provider, cutoff], |row| {
-                let dimensions: i64 = row.get(5)?;
-                let bytes: Vec<u8> = row.get(6)?;
-                let vector = decode_vector(dimensions, &bytes).map_err(|message| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        bytes.len(),
-                        rusqlite::types::Type::Blob,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            message,
-                        )),
-                    )
-                })?;
-                Ok(SemanticDocument {
-                    hit: SearchHit {
+        let mut rows = statement
+            .query(params![generation, provider, cutoff])
+            .map_err(AppError::database)?;
+        let mut result = SemanticVectors {
+            message_ids: Vec::new(),
+            values: Vec::new(),
+            norms: Vec::new(),
+            dimensions: 0,
+        };
+        while let Some(row) = rows.next().map_err(AppError::database)? {
+            let dimensions: i64 = row.get(1).map_err(AppError::database)?;
+            let dimensions = usize::try_from(dimensions)
+                .map_err(|_| AppError::database_data("negative embedding dimensions"))?;
+            let norm: f32 = row.get(2).map_err(AppError::database)?;
+            let vector: Vec<u8> = row.get(3).map_err(AppError::database)?;
+            validate_quantized_vector(dimensions, norm, &vector)
+                .map_err(AppError::database_data)?;
+            if result.dimensions == 0 {
+                result.dimensions = dimensions;
+            } else if result.dimensions != dimensions {
+                return Err(AppError::database_data(
+                    "embedding rows have inconsistent dimensions",
+                ));
+            }
+            result
+                .message_ids
+                .push(row.get(0).map_err(AppError::database)?);
+            result.norms.push(norm);
+            result.values.extend(vector);
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "semantic")]
+    pub(crate) fn search_hits(&self, message_ids: &[&str]) -> Result<Vec<SearchHit>, AppError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT m.id, m.conversation_id, c.provider, m.role, m.content
+                   FROM messages m
+                   JOIN conversations c ON c.id = m.conversation_id
+                  WHERE m.id = ?1",
+            )
+            .map_err(AppError::database)?;
+        let mut hits = Vec::with_capacity(message_ids.len());
+        for message_id in message_ids {
+            let hit = statement
+                .query_row([message_id], |row| {
+                    Ok(SearchHit {
                         id: row.get(0)?,
                         conversation_id: row.get(1)?,
                         provider: row.get(2)?,
@@ -560,13 +639,16 @@ impl Storage {
                         semantic_score: None,
                         fusion_score: 0.0,
                         rerank_score: None,
-                    },
-                    vector,
+                    })
                 })
-            })
-            .map_err(AppError::database)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(AppError::database)
+                .optional()
+                .map_err(AppError::database)?;
+            let hit = hit.ok_or_else(|| {
+                AppError::database_data("semantic index references a missing message")
+            })?;
+            hits.push(hit);
+        }
+        Ok(hits)
     }
 
     #[cfg(feature = "semantic")]
@@ -741,6 +823,12 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
         "generation",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(
+        &transaction,
+        "message_embeddings",
+        "norm",
+        "REAL NOT NULL DEFAULT 0",
+    )?;
     purge_unsupported_providers(&transaction)?;
     if !provider_schema_is_current(&transaction)? {
         rebuild_provider_schema(&transaction)?;
@@ -787,7 +875,7 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
              CREATE TABLE message_embeddings_next (
                 message_id TEXT PRIMARY KEY REFERENCES messages_next(id) ON DELETE CASCADE,
                 generation TEXT NOT NULL DEFAULT '',
-                dimensions INTEGER NOT NULL, vector BLOB NOT NULL
+                dimensions INTEGER NOT NULL, norm REAL NOT NULL, vector BLOB NOT NULL
              );
              INSERT INTO conversations_next
                 SELECT id, provider, source_path, title, created_at, updated_at, source_fingerprint
@@ -795,8 +883,9 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
              INSERT INTO messages_next
                 SELECT id, conversation_id, ordinal, role, content, created_at, fingerprint
                 FROM messages;
-             INSERT INTO message_embeddings_next(message_id, generation, dimensions, vector)
-                SELECT message_id, generation, dimensions, vector FROM message_embeddings;
+             INSERT INTO message_embeddings_next(
+                message_id, generation, dimensions, norm, vector
+             ) SELECT message_id, generation, dimensions, norm, vector FROM message_embeddings;
              DROP TABLE message_fts;
              DROP TABLE message_embeddings;
              DROP TABLE messages;
@@ -913,28 +1002,18 @@ fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> 
 }
 
 #[cfg(any(feature = "semantic", test))]
-fn encode_vector(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
-    for value in vector {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
-}
-
-#[cfg(any(feature = "semantic", test))]
-fn decode_vector(dimensions: i64, bytes: &[u8]) -> Result<Vec<f32>, &'static str> {
-    let dimensions = usize::try_from(dimensions).map_err(|_| "negative embedding dimensions")?;
-    if bytes.len() != dimensions.saturating_mul(size_of::<f32>()) {
+fn validate_quantized_vector(
+    dimensions: usize,
+    norm: f32,
+    bytes: &[u8],
+) -> Result<(), &'static str> {
+    if bytes.len() != dimensions {
         return Err("embedding blob length does not match its dimensions");
     }
-    let (chunks, remainder) = bytes.as_chunks::<4>();
-    if !remainder.is_empty() {
-        return Err("embedding blob contains a partial value");
+    if !norm.is_finite() || norm < 0.0 {
+        return Err("embedding norm must be finite and nonnegative");
     }
-    Ok(chunks
-        .iter()
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+    Ok(())
 }
 
 fn cutoff_timestamp(days: Option<u32>) -> Result<Option<i64>, AppError> {
@@ -981,7 +1060,8 @@ mod tests {
     #[test]
     fn full_rebuild_is_idempotent() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let storage = Storage::open(&directory.path().join("cass.sqlite3")).expect("open database");
+        let mut storage =
+            Storage::open(&directory.path().join("cass.sqlite3")).expect("open database");
         storage
             .rebuild_derived_search_state()
             .expect("first rebuild");
@@ -995,11 +1075,43 @@ mod tests {
     }
 
     #[test]
-    fn embedding_blobs_round_trip() {
-        let vector = [-1.5, 0.0, 2.25];
-        let bytes = encode_vector(&vector);
-        assert_eq!(decode_vector(3, &bytes), Ok(vector.to_vec()));
-        assert!(decode_vector(2, &bytes).is_err());
+    fn full_rebuild_defers_per_message_search_writes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut storage = Storage::open_writer(&path).expect("writer");
+        storage
+            .defer_search_updates()
+            .expect("defer derived writes");
+        storage
+            .replace_conversation(&conversation("deferred needle"))
+            .expect("insert conversation");
+        assert_eq!(
+            storage
+                .connection
+                .query_row("SELECT count(*) FROM message_fts", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("FTS count before rebuild"),
+            0
+        );
+
+        storage
+            .rebuild_derived_search_state()
+            .expect("bulk rebuild");
+        assert_eq!(
+            storage
+                .search("needle", 10, None, None)
+                .expect("search rebuilt FTS")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quantized_embedding_blobs_are_validated() {
+        let vector = [129_u8, 0, 127];
+        assert_eq!(validate_quantized_vector(3, 181.0, &vector), Ok(()));
+        assert!(validate_quantized_vector(2, 181.0, &vector).is_err());
+        assert!(validate_quantized_vector(3, f32::NAN, &vector).is_err());
     }
 
     #[veritas::claims("storage/supported-schema-migrates")]
@@ -1106,7 +1218,14 @@ mod tests {
         assert_eq!(first.changed_message_ids, ["message-1"]);
         #[cfg(feature = "semantic")]
         storage
-            .replace_embeddings("generation-a", &[("message-1", &[1.0, 0.0])])
+            .replace_embeddings(
+                "generation-a",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127, 0],
+                    norm: 127.0,
+                }],
+            )
             .expect("seed embedding");
         let unchanged = storage
             .replace_conversation(&conversation("first"))
@@ -1136,6 +1255,27 @@ mod tests {
         );
     }
 
+    #[veritas::claims("indexing/only-changed-messages-refresh")]
+    #[test]
+    fn conversation_reconciliation_replaces_a_changed_message_id_at_the_same_ordinal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let mut storage = Storage::open_writer(&path).expect("writer");
+        storage
+            .replace_conversation(&conversation("first"))
+            .expect("initial insert");
+
+        let mut replacement = conversation("second");
+        replacement.messages[0].id = "message-2".to_owned();
+        let change = storage
+            .replace_conversation(&replacement)
+            .expect("replace message identity");
+
+        assert_eq!(change.changed_message_ids, ["message-2"]);
+        assert_eq!(change.removed_messages, 1);
+        assert_eq!(storage.counts().expect("counts").messages, 1);
+    }
+
     #[cfg(feature = "semantic")]
     #[veritas::claims("semantic/stale-embedding-generation-invalidated")]
     #[test]
@@ -1147,7 +1287,14 @@ mod tests {
             .replace_conversation(&conversation("generation proof"))
             .expect("insert conversation");
         writer
-            .replace_embeddings("old-generation", &[("message-1", &[1.0, 0.0])])
+            .replace_embeddings(
+                "old-generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[127, 0],
+                    norm: 127.0,
+                }],
+            )
             .expect("old embedding");
         writer.commit_writer().expect("commit old generation");
         drop(writer);
@@ -1156,8 +1303,9 @@ mod tests {
         assert_eq!(storage.embedding_count("new-generation").expect("count"), 0);
         assert_eq!(
             storage
-                .semantic_documents("new-generation", None, None)
+                .semantic_vectors("new-generation", None, None)
                 .expect("semantic documents")
+                .message_ids
                 .len(),
             0
         );
@@ -1180,10 +1328,31 @@ mod tests {
             ["message-1"]
         );
         writer
-            .replace_embeddings("new-generation", &[("message-1", &[0.0, 1.0])])
+            .replace_embeddings(
+                "new-generation",
+                &[EmbeddingWrite {
+                    message_id: "message-1",
+                    vector: &[0, 127],
+                    norm: 127.0,
+                }],
+            )
             .expect("new embedding");
         writer.commit_writer().expect("commit new generation");
         assert_eq!(writer.embedding_count("new-generation").expect("count"), 1);
+        let vectors = writer
+            .semantic_vectors("new-generation", None, None)
+            .expect("stored quantized vectors");
+        assert_eq!(vectors.message_ids, ["message-1"]);
+        assert_eq!(vectors.values, [0, 127]);
+        assert_eq!(vectors.norms, [127.0]);
+        assert_eq!(vectors.dimensions, 2);
+        assert_eq!(
+            writer
+                .search_hits(&["message-1"])
+                .expect("hydrate semantic hit")[0]
+                .content,
+            "generation proof"
+        );
     }
 
     #[veritas::claims("storage/forget-persists-through-indexing")]
