@@ -134,18 +134,19 @@ fn parse_codex(path: &Path) -> Result<ParsedFile, AppError> {
                     .to_owned(),
                 flatten_content(payload.get("content")?)?,
             ),
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
                 let name = payload
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 let arguments = payload
                     .get("arguments")
+                    .or_else(|| payload.get("input"))
                     .map(stringify_value)
                     .unwrap_or_default();
                 ("assistant".to_owned(), format!("Tool {name}: {arguments}"))
             }
-            "function_call_output" => {
+            "function_call_output" | "custom_tool_call_output" => {
                 let output = payload.get("output").map(stringify_value)?;
                 (
                     "tool".to_owned(),
@@ -351,5 +352,34 @@ mod tests {
         assert_eq!(conversation.id, "c1");
         assert_eq!(conversation.messages.len(), 2);
         assert!(conversation.messages[1].content.contains("Tool search"));
+    }
+
+    // Veritas claims: ingestion/provider-boundary,
+    // ingestion/supported-jsonl-indexes
+    #[test]
+    fn codex_parser_keeps_custom_tool_calls() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary JSONL");
+        writeln!(file, r#"{{"type":"session_meta","payload":{{"id":"c2"}}}}"#).expect("meta line");
+        writeln!(
+            file,
+            r#"{{"type":"response_item","payload":{{"type":"custom_tool_call","id":"tool1","call_id":"call1","name":"imagegen","input":"draw a fox"}}}}"#
+        )
+        .expect("custom tool line");
+        writeln!(
+            file,
+            r#"{{"type":"response_item","payload":{{"type":"custom_tool_call_output","id":"tool2","call_id":"call1","output":"created fox.png"}}}}"#
+        )
+        .expect("custom tool output line");
+
+        let parsed = parse_codex(file.path()).expect("parse Codex history");
+        let conversation = parsed.conversation.expect("conversation");
+        assert_eq!(conversation.id, "c2");
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(
+            conversation.messages[0].content,
+            "Tool imagegen: draw a fox"
+        );
+        assert_eq!(conversation.messages[1].role, "tool");
+        assert_eq!(conversation.messages[1].content, "created fox.png");
     }
 }

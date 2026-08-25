@@ -1,5 +1,6 @@
 mod cli;
 mod ingestion;
+mod semantic;
 mod storage;
 
 use std::ffi::OsString;
@@ -91,8 +92,8 @@ impl AppError {
         Self::new(10, "internal", message, false)
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
-        Self::new(4, "unavailable", message, true)
+    fn model(message: impl Into<String>) -> Self {
+        Self::new(4, "model", message, true)
     }
 
     fn new(code: i32, kind: &'static str, message: impl Into<String>, retryable: bool) -> Self {

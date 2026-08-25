@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::AppError;
 use crate::ingestion::{self, ProviderRoots};
+use crate::semantic::{self, Models};
 use crate::storage::Storage;
 
 #[derive(Debug, Parser)]
@@ -17,6 +18,10 @@ struct Cli {
     /// Canonical CASS SQLite database.
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
+
+    /// Semantic model asset directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    models_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -77,6 +82,7 @@ pub(super) enum Response {
     View(ViewResponse),
     Status(StatusResponse),
     Forget(ForgetResponse),
+    ModelsInstall(ModelsInstallResponse),
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +92,8 @@ pub(super) struct IndexResponse {
     scanned_files: u64,
     malformed_records: u64,
     full: bool,
+    embeddings: u64,
+    realized_mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +127,15 @@ pub(super) struct ForgetResponse {
     forgotten: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub(super) struct ModelsInstallResponse {
+    installed: bool,
+    model_directory: PathBuf,
+    #[serde(flatten)]
+    summary: semantic::InstallSummary,
+    recommended_action: &'static str,
+}
+
 pub(super) fn run<I, T>(args: I) -> Result<Response, AppError>
 where
     I: IntoIterator<Item = T>,
@@ -129,6 +146,7 @@ where
         AppError::usage(error.to_string())
     })?;
     let database_path = cli.db.unwrap_or_else(default_database_path);
+    let models_dir = cli.models_dir.unwrap_or_else(default_models_path);
 
     match cli.command {
         Command::Index {
@@ -137,6 +155,7 @@ where
             codex_root,
         } => index(
             &database_path,
+            &models_dir,
             full,
             &ProviderRoots::new(claude_root, codex_root),
         ),
@@ -145,24 +164,40 @@ where
             limit,
             provider,
             days,
-        } => search(&database_path, query, limit, provider.as_deref(), days),
+        } => search(
+            &database_path,
+            &models_dir,
+            query,
+            limit,
+            provider.as_deref(),
+            days,
+        ),
         Command::View { id, context } => view(&database_path, id, context),
-        Command::Status => status(&database_path),
+        Command::Status => status(&database_path, &models_dir),
         Command::Forget { id } => forget(&database_path, id),
         Command::Models {
             command: ModelsCommand::Install,
-        } => Err(AppError::unavailable(
-            "semantic model installation will be enabled after backend selection",
-        )),
+        } => install_models(&models_dir),
     }
 }
 
-fn index(database_path: &Path, full: bool, roots: &ProviderRoots) -> Result<Response, AppError> {
+fn index(
+    database_path: &Path,
+    models_dir: &Path,
+    full: bool,
+    roots: &ProviderRoots,
+) -> Result<Response, AppError> {
     let mut storage = Storage::open(database_path)?;
     let summary = ingestion::index(&mut storage, roots)?;
     if full {
         storage.rebuild_derived_search_state()?;
     }
+    let models = Models::new(models_dir.to_path_buf());
+    let embeddings = if let Some(mut backend) = models.load()? {
+        semantic::rebuild_embeddings(&mut storage, &mut backend)?
+    } else {
+        0
+    };
     let counts = storage.counts()?;
     Ok(Response::Index(IndexResponse {
         indexed_conversations: counts.conversations,
@@ -170,22 +205,44 @@ fn index(database_path: &Path, full: bool, roots: &ProviderRoots) -> Result<Resp
         scanned_files: summary.scanned_files,
         malformed_records: summary.malformed_records,
         full,
+        embeddings,
+        realized_mode: if embeddings > 0 { "hybrid" } else { "lexical" },
     }))
 }
 
 fn search(
     database_path: &Path,
+    models_dir: &Path,
     query: String,
     limit: usize,
     provider: Option<&str>,
     days: Option<u32>,
 ) -> Result<Response, AppError> {
     let storage = Storage::open_existing(database_path)?;
-    let results = storage.search(&query, limit, provider, days)?;
+    let counts = storage.counts()?;
+    let models = Models::new(models_dir.to_path_buf());
+    let backend = if counts.embeddings > 0 {
+        models.load().ok().flatten()
+    } else {
+        None
+    };
+    let (results, realized_mode, fallback_mode) = if let Some(mut backend) = backend {
+        (
+            semantic::hybrid_search(&storage, &mut backend, &query, limit, provider, days)?,
+            "hybrid",
+            None,
+        )
+    } else {
+        (
+            storage.search(&query, limit, provider, days)?,
+            "lexical",
+            Some("lexical"),
+        )
+    };
     Ok(Response::Search(SearchResponse {
         query,
-        realized_mode: "lexical",
-        fallback_mode: Some("lexical"),
+        realized_mode,
+        fallback_mode,
         results,
     }))
 }
@@ -196,14 +253,15 @@ fn view(database_path: &Path, id: String, context: u32) -> Result<Response, AppE
     Ok(Response::View(ViewResponse { id, messages }))
 }
 
-fn status(database_path: &Path) -> Result<Response, AppError> {
+fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError> {
+    let models_installed = Models::new(models_dir.to_path_buf()).is_installed();
     if !database_path.is_file() {
         return Ok(Response::Status(StatusResponse {
             ready: false,
             database_path: database_path.to_path_buf(),
             conversations: 0,
             messages: 0,
-            models_installed: false,
+            models_installed,
             realized_mode: "unavailable",
             recommended_action: Some("index"),
         }));
@@ -211,14 +269,27 @@ fn status(database_path: &Path) -> Result<Response, AppError> {
 
     let storage = Storage::open_existing(database_path)?;
     let counts = storage.counts()?;
+    let hybrid_ready =
+        models_installed && counts.messages > 0 && counts.embeddings == counts.messages;
     Ok(Response::Status(StatusResponse {
         ready: true,
         database_path: database_path.to_path_buf(),
         conversations: counts.conversations,
         messages: counts.messages,
-        models_installed: false,
-        realized_mode: "lexical",
-        recommended_action: None,
+        models_installed,
+        realized_mode: if hybrid_ready { "hybrid" } else { "lexical" },
+        recommended_action: (models_installed && counts.embeddings != counts.messages)
+            .then_some("index"),
+    }))
+}
+
+fn install_models(models_dir: &Path) -> Result<Response, AppError> {
+    let summary = Models::new(models_dir.to_path_buf()).install()?;
+    Ok(Response::ModelsInstall(ModelsInstallResponse {
+        installed: true,
+        model_directory: models_dir.to_path_buf(),
+        summary,
+        recommended_action: "index",
     }))
 }
 
@@ -232,6 +303,13 @@ fn default_database_path() -> PathBuf {
     ProjectDirs::from("dev", "jamesqo", "cass").map_or_else(
         || PathBuf::from("cass.sqlite3"),
         |directories| directories.data_local_dir().join("cass.sqlite3"),
+    )
+}
+
+fn default_models_path() -> PathBuf {
+    ProjectDirs::from("dev", "jamesqo", "cass").map_or_else(
+        || PathBuf::from("models"),
+        |directories| directories.data_local_dir().join("models"),
     )
 }
 

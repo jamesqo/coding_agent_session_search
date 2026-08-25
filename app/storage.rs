@@ -27,6 +27,11 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER,
     UNIQUE (conversation_id, ordinal)
 );
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    dimensions INTEGER NOT NULL,
+    vector BLOB NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
     content,
     message_id UNINDEXED,
@@ -42,16 +47,23 @@ pub(crate) struct Storage {
 pub(crate) struct Counts {
     pub(crate) conversations: u64,
     pub(crate) messages: u64,
+    pub(crate) embeddings: u64,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SearchHit {
-    id: String,
-    conversation_id: String,
-    provider: String,
-    role: String,
-    content: String,
-    lexical_score: f64,
+    pub(crate) id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) provider: String,
+    pub(crate) role: String,
+    pub(crate) content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_score: Option<f32>,
+    pub(crate) fusion_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rerank_score: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +73,16 @@ pub(crate) struct Message {
     role: String,
     content: String,
     created_at: Option<i64>,
+}
+
+pub(crate) struct SearchableMessage {
+    pub(crate) id: String,
+    pub(crate) content: String,
+}
+
+pub(crate) struct SemanticDocument {
+    pub(crate) hit: SearchHit,
+    pub(crate) vector: Vec<f32>,
 }
 
 impl Storage {
@@ -91,11 +113,19 @@ impl Storage {
             .connection
             .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
             .map_err(AppError::database)?;
+        let embeddings: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM message_embeddings", [], |row| {
+                row.get(0)
+            })
+            .map_err(AppError::database)?;
         Ok(Counts {
             conversations: u64::try_from(conversations)
                 .map_err(|_| AppError::internal("negative conversation count"))?,
             messages: u64::try_from(messages)
                 .map_err(|_| AppError::internal("negative message count"))?,
+            embeddings: u64::try_from(embeddings)
+                .map_err(|_| AppError::internal("negative embedding count"))?,
         })
     }
 
@@ -167,6 +197,7 @@ impl Storage {
         self.connection
             .execute_batch(
                 "DELETE FROM message_fts;
+                 DELETE FROM message_embeddings;
                  INSERT INTO message_fts(content, message_id, conversation_id)
                  SELECT content, id, conversation_id FROM messages;",
             )
@@ -178,12 +209,13 @@ impl Storage {
         query: &str,
         limit: usize,
         provider: Option<&str>,
-        _days: Option<u32>,
+        days: Option<u32>,
     ) -> Result<Vec<SearchHit>, AppError> {
         if query.trim().is_empty() {
             return Err(AppError::usage("search query must not be empty"));
         }
         let limit = i64::try_from(limit.min(1_000)).unwrap_or(1_000);
+        let cutoff = cutoff_timestamp(days)?;
         let mut statement = self
             .connection
             .prepare(
@@ -194,19 +226,115 @@ impl Storage {
                    JOIN conversations c ON c.id = m.conversation_id
                   WHERE message_fts MATCH ?1
                     AND (?2 IS NULL OR c.provider = ?2)
+                    AND (?3 IS NULL OR m.created_at >= ?3)
                   ORDER BY lexical_score, m.id
-                  LIMIT ?3",
+                  LIMIT ?4",
             )
             .map_err(AppError::database)?;
         let rows = statement
-            .query_map(params![query, provider, limit], |row| {
+            .query_map(params![query, provider, cutoff, limit], |row| {
                 Ok(SearchHit {
                     id: row.get(0)?,
                     conversation_id: row.get(1)?,
                     provider: row.get(2)?,
                     role: row.get(3)?,
                     content: row.get(4)?,
-                    lexical_score: row.get(5)?,
+                    lexical_score: Some(row.get(5)?),
+                    semantic_score: None,
+                    fusion_score: 0.0,
+                    rerank_score: None,
+                })
+            })
+            .map_err(AppError::database)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)
+    }
+
+    pub(crate) fn searchable_messages(&self) -> Result<Vec<SearchableMessage>, AppError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, content FROM messages ORDER BY id")
+            .map_err(AppError::database)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SearchableMessage {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(AppError::database)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::database)
+    }
+
+    pub(crate) fn replace_embeddings(
+        &mut self,
+        embeddings: &[(&str, &[f32])],
+    ) -> Result<(), AppError> {
+        let transaction = self.connection.transaction().map_err(AppError::database)?;
+        transaction
+            .execute("DELETE FROM message_embeddings", [])
+            .map_err(AppError::database)?;
+        for (message_id, vector) in embeddings {
+            let dimensions = i64::try_from(vector.len())
+                .map_err(|_| AppError::internal("embedding has too many dimensions"))?;
+            transaction
+                .execute(
+                    "INSERT INTO message_embeddings(message_id, dimensions, vector)
+                     VALUES (?1, ?2, ?3)",
+                    params![message_id, dimensions, encode_vector(vector)],
+                )
+                .map_err(AppError::database)?;
+        }
+        transaction.commit().map_err(AppError::database)
+    }
+
+    pub(crate) fn semantic_documents(
+        &self,
+        provider: Option<&str>,
+        days: Option<u32>,
+    ) -> Result<Vec<SemanticDocument>, AppError> {
+        let cutoff = cutoff_timestamp(days)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT m.id, m.conversation_id, c.provider, m.role, m.content,
+                        e.dimensions, e.vector
+                   FROM message_embeddings e
+                   JOIN messages m ON m.id = e.message_id
+                   JOIN conversations c ON c.id = m.conversation_id
+                  WHERE (?1 IS NULL OR c.provider = ?1)
+                    AND (?2 IS NULL OR m.created_at >= ?2)
+                  ORDER BY m.id",
+            )
+            .map_err(AppError::database)?;
+        let rows = statement
+            .query_map(params![provider, cutoff], |row| {
+                let dimensions: i64 = row.get(5)?;
+                let bytes: Vec<u8> = row.get(6)?;
+                let vector = decode_vector(dimensions, &bytes).map_err(|message| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        bytes.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            message,
+                        )),
+                    )
+                })?;
+                Ok(SemanticDocument {
+                    hit: SearchHit {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        role: row.get(3)?,
+                        content: row.get(4)?,
+                        lexical_score: None,
+                        semantic_score: None,
+                        fusion_score: 0.0,
+                        rerank_score: None,
+                    },
+                    vector,
                 })
             })
             .map_err(AppError::database)?;
@@ -273,6 +401,41 @@ impl Storage {
     }
 }
 
+fn encode_vector(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * size_of::<f32>());
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_vector(dimensions: i64, bytes: &[u8]) -> Result<Vec<f32>, &'static str> {
+    let dimensions = usize::try_from(dimensions).map_err(|_| "negative embedding dimensions")?;
+    if bytes.len() != dimensions.saturating_mul(size_of::<f32>()) {
+        return Err("embedding blob length does not match its dimensions");
+    }
+    Ok(bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn cutoff_timestamp(days: Option<u32>) -> Result<Option<i64>, AppError> {
+    let Some(days) = days else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            AppError::internal(format!("system clock precedes Unix epoch: {error}"))
+        })?;
+    let age = std::time::Duration::from_secs(u64::from(days).saturating_mul(86_400));
+    let cutoff = now.saturating_sub(age).as_millis();
+    i64::try_from(cutoff)
+        .map(Some)
+        .map_err(|_| AppError::internal("timestamp exceeds SQLite range"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +454,14 @@ mod tests {
         let counts = storage.counts().expect("counts");
         assert_eq!(counts.conversations, 0);
         assert_eq!(counts.messages, 0);
+        assert_eq!(counts.embeddings, 0);
+    }
+
+    #[test]
+    fn embedding_blobs_round_trip() {
+        let vector = [-1.5, 0.0, 2.25];
+        let bytes = encode_vector(&vector);
+        assert_eq!(decode_vector(3, &bytes), Ok(vector.to_vec()));
+        assert!(decode_vector(2, &bytes).is_err());
     }
 }
