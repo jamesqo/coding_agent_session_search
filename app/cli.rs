@@ -11,14 +11,23 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::AppError;
+use crate::config::{self, ConfigurationStatus, ResolvedConfig};
 use crate::federation::{self, SearchEnvelope, SearchRequest, ViewEnvelope, ViewRequest};
-use crate::ingestion::{self, ProviderRoots};
+use crate::ingestion;
 use crate::semantic::{self, Models};
 use crate::storage::Storage;
 
 #[derive(Debug, Parser)]
 #[command(name = "cass", version, about, arg_required_else_help = true)]
 struct Cli {
+    /// Versioned CASS node and provider configuration.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Exact configured node to treat as local.
+    #[arg(long, global = true, value_name = "NAME")]
+    local_node: Option<String>,
+
     /// Canonical CASS SQLite database.
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
@@ -38,6 +47,15 @@ enum Command {
         /// Recreate all derived search state.
         #[arg(long)]
         full: bool,
+        /// Restrict indexing to a supported provider.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Vec<String>,
+        /// Admit sources modified within this many days.
+        #[arg(long, value_name = "DAYS")]
+        since_days: Option<u32>,
+        /// Admit source history regardless of age.
+        #[arg(long)]
+        all_history: bool,
     },
     /// Search indexed messages.
     Search {
@@ -150,6 +168,7 @@ pub(super) struct StatusResponse {
     semantic_support: bool,
     realized_mode: &'static str,
     recommended_action: Option<&'static str>,
+    configuration: ConfigurationStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -172,15 +191,61 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = Cli::try_parse_from(args).map_err(|error| {
-        let _ = error.print();
-        AppError::usage(error.to_string())
-    })?;
+    let cli = Cli::try_parse_from(args).map_err(|error| AppError::usage(error.to_string()))?;
+    let hidden_worker = matches!(
+        &cli.command,
+        Command::Search {
+            federation_request: true,
+            ..
+        } | Command::View {
+            federation_request: true,
+            ..
+        }
+    );
+    if hidden_worker && (cli.config.is_some() || cli.local_node.is_some()) {
+        return Err(AppError::usage(
+            "--config and --local-node are invalid with --federation-request",
+        ));
+    }
+    let resolved_config = if hidden_worker {
+        None
+    } else {
+        Some(config::load(
+            cli.config.as_deref(),
+            cli.local_node.as_deref(),
+        )?)
+    };
     let database_path = cli.db.unwrap_or_else(default_database_path);
     let models_dir = cli.models_dir.unwrap_or_else(default_models_path);
+    dispatch(
+        cli.command,
+        resolved_config.as_ref(),
+        &database_path,
+        &models_dir,
+    )
+}
 
-    match cli.command {
-        Command::Index { full } => index(&database_path, &models_dir, full, &ProviderRoots::new()),
+fn dispatch(
+    command: Command,
+    resolved_config: Option<&ResolvedConfig>,
+    database_path: &Path,
+    models_dir: &Path,
+) -> Result<Response, AppError> {
+    match command {
+        Command::Index {
+            full,
+            provider,
+            since_days,
+            all_history,
+        } => {
+            let options = resolve_index_options(
+                resolved_config.expect("public command resolved configuration above"),
+                &provider,
+                since_days,
+                all_history,
+            )?;
+            index(database_path, models_dir, full, &options)
+        }
         Command::Search {
             query,
             limit,
@@ -198,8 +263,8 @@ where
                 let request: SearchRequest = read_federation_request()?;
                 federation::validate_protocol(request.protocol)?;
                 local_search(
-                    &database_path,
-                    &models_dir,
+                    database_path,
+                    models_dir,
                     request.query,
                     request.limit,
                     request.provider.as_deref(),
@@ -210,8 +275,8 @@ where
                 let query = query.ok_or_else(|| AppError::usage("search requires a query"))?;
                 let nodes = federation::select_nodes(&node)?;
                 search(
-                    &database_path,
-                    &models_dir,
+                    database_path,
+                    models_dir,
                     query,
                     limit,
                     provider.as_deref(),
@@ -234,18 +299,22 @@ where
                 }
                 let request: ViewRequest = read_federation_request()?;
                 federation::validate_protocol(request.protocol)?;
-                local_view(&database_path, request.id, request.context)
+                local_view(database_path, request.id, request.context)
                     .map(|response| Response::FederationView(ViewEnvelope::new(response)))
             } else {
                 let id = id.ok_or_else(|| AppError::usage("view requires an id"))?;
-                view(&database_path, id, context, node)
+                view(database_path, id, context, node)
             }
         }
-        Command::Status => status(&database_path, &models_dir),
-        Command::Forget { id } => forget(&database_path, id),
+        Command::Status => status(
+            database_path,
+            models_dir,
+            resolved_config.expect("public command resolved configuration above"),
+        ),
+        Command::Forget { id } => forget(database_path, id),
         Command::Models {
             command: ModelsCommand::Install,
-        } => install_models(&models_dir),
+        } => install_models(models_dir),
     }
 }
 
@@ -253,7 +322,7 @@ fn index(
     database_path: &Path,
     models_dir: &Path,
     full: bool,
-    roots: &ProviderRoots,
+    options: &ingestion::IndexOptions,
 ) -> Result<Response, AppError> {
     let total_started = Instant::now();
     let models = Models::new(models_dir.to_path_buf());
@@ -272,7 +341,7 @@ fn index(
     }
     let storage_setup_milliseconds = elapsed_milliseconds(storage_started);
     let ingestion_started = Instant::now();
-    let summary = ingestion::index(&mut storage, roots)?;
+    let summary = ingestion::index(&mut storage, options)?;
     let ingestion_milliseconds = elapsed_milliseconds(ingestion_started);
     let search_started = Instant::now();
     if storage.derived_search_is_dirty()? {
@@ -420,16 +489,77 @@ fn local_search(
 fn normalize_provider_filter(provider: Option<&str>) -> Result<Option<&'static str>, AppError> {
     match provider {
         None => Ok(None),
-        Some("claude" | "claude-code" | "claude_code") => Ok(Some("claude-code")),
+        Some("claude-code") => Ok(Some("claude-code")),
         Some("codex") => Ok(Some("codex")),
-        Some("opencode" | "open-code" | "open_code") => Ok(Some("opencode")),
-        Some("github-copilot" | "copilot" | "github_copilot") => Ok(Some("github-copilot")),
-        Some("hermes" | "hermes-agent" | "hermes_agent") => Ok(Some("hermes")),
-        Some("pi" | "pi-agent" | "pi_agent") => Ok(Some("pi")),
         Some(provider) => Err(AppError::usage(format!(
             "unsupported provider filter: {provider}"
         ))),
     }
+}
+
+fn resolve_index_options(
+    configuration: &ResolvedConfig,
+    requested_providers: &[String],
+    since_days: Option<u32>,
+    all_history: bool,
+) -> Result<ingestion::IndexOptions, AppError> {
+    if since_days.is_some() && all_history {
+        return Err(AppError::usage(
+            "--since-days and --all-history cannot be used together",
+        ));
+    }
+    if matches!(since_days, Some(days) if !(1..=36_500).contains(&days)) {
+        return Err(AppError::usage("--since-days must be between 1 and 36500"));
+    }
+
+    let explicit = !requested_providers.is_empty();
+    let mut select_claude = !explicit && configuration.providers.claude_code.is_some();
+    let mut select_codex = !explicit && configuration.providers.codex.is_some();
+    for provider in requested_providers {
+        match provider.as_str() {
+            "claude-code" => select_claude = true,
+            "codex" => select_codex = true,
+            _ => {
+                return Err(AppError::usage(format!(
+                    "unsupported index provider: {provider}"
+                )));
+            }
+        }
+    }
+
+    let claude_code = if select_claude {
+        Some(
+            configuration
+                .providers
+                .claude_code
+                .clone()
+                .ok_or_else(|| AppError::usage("provider is not enabled: claude-code"))?,
+        )
+    } else {
+        None
+    };
+    let codex = if select_codex {
+        Some(
+            configuration
+                .providers
+                .codex
+                .clone()
+                .ok_or_else(|| AppError::usage("provider is not enabled: codex"))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(ingestion::IndexOptions {
+        claude_code,
+        codex,
+        roots_are_authoritative: configuration.loaded,
+        since_days: if all_history {
+            None
+        } else {
+            since_days.or(configuration.since_days)
+        },
+    })
 }
 
 fn view(
@@ -474,7 +604,11 @@ fn read_federation_request<T: DeserializeOwned>() -> Result<T, AppError> {
         .map_err(|error| AppError::usage(format!("invalid federation request: {error}")))
 }
 
-fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError> {
+fn status(
+    database_path: &Path,
+    models_dir: &Path,
+    configuration: &ResolvedConfig,
+) -> Result<Response, AppError> {
     let models_installed = Models::new(models_dir.to_path_buf()).is_installed();
     if !database_path.is_file() {
         return Ok(Response::Status(StatusResponse {
@@ -493,6 +627,7 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
             } else {
                 "models install"
             }),
+            configuration: configuration.status(),
         }));
     }
 
@@ -525,6 +660,7 @@ fn status(database_path: &Path, models_dir: &Path) -> Result<Response, AppError>
         } else {
             Some("index")
         },
+        configuration: configuration.status(),
     }))
 }
 
@@ -563,6 +699,25 @@ mod tests {
     use super::*;
     use veritas_test_macros as veritas;
 
+    fn test_configuration(
+        claude_enabled: bool,
+        codex_enabled: bool,
+        since_days: Option<u32>,
+    ) -> ResolvedConfig {
+        let root = std::env::temp_dir().join("cass-cli-options");
+        ResolvedConfig {
+            path: root.join("config.json"),
+            loaded: true,
+            local: None,
+            nodes: Vec::new(),
+            providers: crate::config::ResolvedProviders {
+                claude_code: claude_enabled.then(|| vec![root.join("claude")]),
+                codex: codex_enabled.then(|| vec![root.join("codex")]),
+            },
+            since_days,
+        }
+    }
+
     #[veritas::claims("cli/operational-command-surface")]
     #[test]
     fn command_surface_contains_only_the_contract_commands() {
@@ -574,6 +729,48 @@ mod tests {
         assert_eq!(
             names,
             ["index", "search", "view", "status", "forget", "models"]
+        );
+    }
+
+    #[veritas::claims(
+        "configuration/cli-values-have-precedence",
+        "indexing/cli-provider-selection-is-bounded"
+    )]
+    #[test]
+    fn index_options_validate_deduplicate_and_apply_horizon_precedence() {
+        let configuration = test_configuration(true, true, Some(90));
+        let selected = resolve_index_options(
+            &configuration,
+            &["codex".to_owned(), "codex".to_owned()],
+            Some(30),
+            false,
+        )
+        .expect("selected options");
+        assert!(selected.claude_code.is_none());
+        assert_eq!(selected.codex.unwrap().len(), 1);
+        assert_eq!(selected.since_days, Some(30));
+
+        let all =
+            resolve_index_options(&configuration, &[], None, true).expect("all-history options");
+        assert_eq!(all.since_days, None);
+        assert!(all.claude_code.is_some());
+        assert!(all.codex.is_some());
+
+        for invalid in [Some(0), Some(36_501)] {
+            assert!(resolve_index_options(&configuration, &[], invalid, false).is_err());
+        }
+        assert!(resolve_index_options(&configuration, &[], Some(1), true).is_err());
+        assert!(
+            resolve_index_options(&configuration, &["opencode".to_owned()], None, false).is_err()
+        );
+        assert!(
+            resolve_index_options(
+                &test_configuration(false, true, Some(90)),
+                &["claude-code".to_owned()],
+                None,
+                false,
+            )
+            .is_err()
         );
     }
 }

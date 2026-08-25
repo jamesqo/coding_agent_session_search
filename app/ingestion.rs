@@ -4,10 +4,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
-use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -19,13 +18,11 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
 const CHECKPOINT_FILES: u64 = 32;
 const CHECKPOINT_BYTES: u64 = 128 * 1024 * 1024;
 
-pub(crate) struct ProviderRoots {
-    claude: Vec<PathBuf>,
-    codex: Vec<PathBuf>,
-    opencode: Vec<PathBuf>,
-    copilot: Vec<PathBuf>,
-    hermes: Vec<PathBuf>,
-    pi: Vec<PathBuf>,
+pub(crate) struct IndexOptions {
+    pub(crate) claude_code: Option<Vec<PathBuf>>,
+    pub(crate) codex: Option<Vec<PathBuf>>,
+    pub(crate) roots_are_authoritative: bool,
+    pub(crate) since_days: Option<u32>,
 }
 
 pub(crate) struct IndexSummary {
@@ -74,6 +71,15 @@ struct Discovery {
     complete: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ProviderScan<'a> {
+    provider: &'static str,
+    roots: &'a [PathBuf],
+    cutoff_modified_ns: Option<i64>,
+    parse: fn(&Path) -> Result<ParsedFile, AppError>,
+    authoritative: bool,
+}
+
 struct SourceFile {
     path: PathBuf,
     source_path: String,
@@ -115,38 +121,17 @@ struct ExtractedMessage {
     session_id: Option<String>,
 }
 
-impl ProviderRoots {
-    pub(crate) fn new() -> Self {
-        let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
-        Self {
-            claude: configured_roots(
-                "CASS_CLAUDE_ROOTS",
-                [
-                    home.join(".claude/projects"),
-                    home.join(".config/claude/projects"),
-                ],
-            ),
-            codex: configured_roots(
-                "CASS_CODEX_ROOTS",
-                [
-                    home.join(".codex/sessions"),
-                    home.join(".local/share/codex/sessions"),
-                ],
-            ),
-            opencode: configured_roots(
-                "CASS_OPENCODE_ROOTS",
-                [home.join(".local/share/opencode/opencode.db")],
-            ),
-            copilot: configured_roots("CASS_COPILOT_ROOTS", [home.join(".copilot/session-state")]),
-            hermes: configured_roots("CASS_HERMES_ROOTS", [home.join(".hermes/state.db")]),
-            pi: configured_roots("CASS_PI_ROOTS", [home.join(".pi/agent/sessions")]),
-        }
-    }
-}
-
 pub(crate) fn index(
     storage: &mut Storage,
-    roots: &ProviderRoots,
+    options: &IndexOptions,
+) -> Result<IndexSummary, AppError> {
+    index_at(storage, options, SystemTime::now())
+}
+
+fn index_at(
+    storage: &mut Storage,
+    options: &IndexOptions,
+    run_started: SystemTime,
 ) -> Result<IndexSummary, AppError> {
     let mut summary = IndexSummary {
         scanned_files: 0,
@@ -163,49 +148,51 @@ pub(crate) fn index(
         processed_files: 0,
     };
     let mut progress = IndexProgress::new();
+    let cutoff_modified_ns = cutoff_modified_ns(run_started, options.since_days)?;
 
-    index_provider(
-        storage,
-        "claude-code",
-        discover_jsonl_files(&roots.claude),
-        parse_claude,
-        &mut summary,
-        &mut progress,
-    )?;
-    index_database_provider(
-        storage,
-        "opencode",
-        &roots.opencode,
-        parse_opencode,
-        &mut summary,
-    )?;
-    index_provider(
-        storage,
-        "github-copilot",
-        discover_files(&roots.copilot, |path| {
-            path.file_name().and_then(|name| name.to_str()) == Some("events.jsonl")
-        }),
-        parse_copilot,
-        &mut summary,
-        &mut progress,
-    )?;
-    index_database_provider(storage, "hermes", &roots.hermes, parse_hermes, &mut summary)?;
-    index_provider(
-        storage,
-        "pi",
-        discover_jsonl_files(&roots.pi),
-        parse_pi,
-        &mut summary,
-        &mut progress,
-    )?;
-    index_provider(
-        storage,
-        "codex",
-        discover_jsonl_files(&roots.codex),
-        parse_codex,
-        &mut summary,
-        &mut progress,
-    )?;
+    // Inspect every configured root before opening the ingestion pipeline. A
+    // bad root must fail closed without committing another provider first.
+    let claude_discovery = options
+        .claude_code
+        .as_ref()
+        .map(|roots| discover_jsonl_files(roots, options.roots_are_authoritative))
+        .transpose()?;
+    let codex_discovery = options
+        .codex
+        .as_ref()
+        .map(|roots| discover_jsonl_files(roots, options.roots_are_authoritative))
+        .transpose()?;
+
+    if let (Some(roots), Some(discovery)) = (&options.claude_code, claude_discovery) {
+        index_provider(
+            storage,
+            ProviderScan {
+                provider: "claude-code",
+                roots,
+                cutoff_modified_ns,
+                parse: parse_claude,
+                authoritative: options.roots_are_authoritative,
+            },
+            discovery,
+            &mut summary,
+            &mut progress,
+        )?;
+    }
+    if let (Some(roots), Some(discovery)) = (&options.codex, codex_discovery) {
+        index_provider(
+            storage,
+            ProviderScan {
+                provider: "codex",
+                roots,
+                cutoff_modified_ns,
+                parse: parse_codex,
+                authoritative: options.roots_are_authoritative,
+            },
+            discovery,
+            &mut summary,
+            &mut progress,
+        )?;
+    }
 
     summary.processed_files = summary.scanned_files;
     progress.emit(&summary, "ingestion-complete", true);
@@ -215,14 +202,50 @@ pub(crate) fn index(
 
 fn index_provider(
     storage: &mut Storage,
-    provider: &'static str,
+    scan: ProviderScan<'_>,
     discovery: Discovery,
-    parse: fn(&Path) -> Result<ParsedFile, AppError>,
     summary: &mut IndexSummary,
     progress: &mut IndexProgress,
 ) -> Result<(), AppError> {
-    let (mut pending, observed_paths, mut complete) =
-        prepare_sources(storage, provider, discovery, summary)?;
+    if !scan.authoritative {
+        return index_provider_inner(storage, scan, discovery, summary, progress);
+    }
+    storage.begin_provider_scan()?;
+    match index_provider_inner(storage, scan, discovery, summary, progress) {
+        Ok(()) => storage.finish_provider_scan(),
+        Err(error) => match storage.rollback_provider_scan() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(rollback_error),
+        },
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the bounded parser producer/consumer transaction in one linear scope"
+)]
+fn index_provider_inner(
+    storage: &mut Storage,
+    scan: ProviderScan<'_>,
+    discovery: Discovery,
+    summary: &mut IndexSummary,
+    progress: &mut IndexProgress,
+) -> Result<(), AppError> {
+    let ProviderScan {
+        provider,
+        roots,
+        cutoff_modified_ns,
+        parse,
+        authoritative,
+    } = scan;
+    let (mut pending, observed_paths, mut complete) = prepare_sources(
+        storage,
+        provider,
+        cutoff_modified_ns,
+        authoritative,
+        discovery,
+        summary,
+    )?;
     pending.sort_unstable_by(|left, right| {
         right
             .size_bytes
@@ -248,7 +271,13 @@ fn index_provider(
                     let Some(source) = pending.get(index) else {
                         break;
                     };
-                    let parsed = parse(&source.path);
+                    let parsed = parse(&source.path).map_err(|error| {
+                        if authoritative {
+                            configured_source_error(&source.path, &error)
+                        } else {
+                            error
+                        }
+                    });
                     let source = SourceFile {
                         path: source.path.clone(),
                         source_path: source.source_path.clone(),
@@ -278,43 +307,99 @@ fn index_provider(
             match apply_parsed_source(storage, provider, result, summary) {
                 Ok(source_complete) => complete &= source_complete,
                 Err(error) => {
-                    complete = false;
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+                    record_first_error(&mut complete, &mut first_error, error);
                     continue;
                 }
             }
             batch_files = batch_files.saturating_add(1);
             batch_bytes = batch_bytes.saturating_add(source_bytes);
-            if batch_files >= CHECKPOINT_FILES || batch_bytes >= CHECKPOINT_BYTES {
-                match storage.checkpoint_writer() {
-                    Ok(()) => {
-                        summary.committed_batches += 1;
-                        batch_files = 0;
-                        batch_bytes = 0;
-                        progress.emit(summary, "checkpoint", true);
-                    }
-                    Err(error) => {
-                        complete = false;
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                }
+            if !authoritative
+                && (batch_files >= CHECKPOINT_FILES || batch_bytes >= CHECKPOINT_BYTES)
+                && let Err(error) = checkpoint_provider_batch(
+                    storage,
+                    summary,
+                    progress,
+                    &mut batch_files,
+                    &mut batch_bytes,
+                )
+            {
+                record_first_error(&mut complete, &mut first_error, error);
             }
             progress.emit(summary, "indexing", false);
         }
     });
-    if complete {
-        summary.purged_conversations += storage.purge_missing_sources(provider, &observed_paths)?;
+    if authoritative {
+        verify_authoritative_discovery(roots, &observed_paths)?;
     }
+    summary.purged_conversations += reconcile_complete_sources(
+        storage,
+        complete,
+        provider,
+        &observed_paths,
+        roots,
+        cutoff_modified_ns,
+    )?;
     first_error.map_or(Ok(()), Err)
+}
+
+fn reconcile_complete_sources(
+    storage: &mut Storage,
+    complete: bool,
+    provider: &str,
+    observed_paths: &BTreeSet<String>,
+    roots: &[PathBuf],
+    cutoff_modified_ns: Option<i64>,
+) -> Result<u64, AppError> {
+    if !complete {
+        return Ok(0);
+    }
+    storage.purge_missing_sources(provider, observed_paths, roots, cutoff_modified_ns)
+}
+
+fn verify_authoritative_discovery(
+    roots: &[PathBuf],
+    observed_paths: &BTreeSet<String>,
+) -> Result<(), AppError> {
+    let final_paths = discover_jsonl_files(roots, true)?
+        .files
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    if final_paths != *observed_paths {
+        return Err(AppError::configuration(
+            "configured provider roots changed while indexing",
+        ));
+    }
+    Ok(())
+}
+
+fn record_first_error(complete: &mut bool, first_error: &mut Option<AppError>, error: AppError) {
+    *complete = false;
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+}
+
+fn checkpoint_provider_batch(
+    storage: &mut Storage,
+    summary: &mut IndexSummary,
+    progress: &mut IndexProgress,
+    batch_files: &mut u64,
+    batch_bytes: &mut u64,
+) -> Result<(), AppError> {
+    storage.checkpoint_writer()?;
+    summary.committed_batches += 1;
+    *batch_files = 0;
+    *batch_bytes = 0;
+    progress.emit(summary, "checkpoint", true);
+    Ok(())
 }
 
 fn prepare_sources(
     storage: &Storage,
     provider: &str,
+    cutoff_modified_ns: Option<i64>,
+    authoritative: bool,
     discovery: Discovery,
     summary: &mut IndexSummary,
 ) -> Result<(Vec<SourceFile>, BTreeSet<String>, bool), AppError> {
@@ -322,10 +407,19 @@ fn prepare_sources(
     let mut pending = Vec::new();
     let mut observed_paths = BTreeSet::new();
     for path in discovery.files {
-        summary.scanned_files += 1;
         let source_path = path.to_string_lossy().into_owned();
         observed_paths.insert(source_path.clone());
-        let (size_bytes, modified_ns) = source_stamp(&path)?;
+        let (size_bytes, modified_ns) = source_stamp(&path).map_err(|error| {
+            if authoritative {
+                configured_source_error(&path, &error)
+            } else {
+                error
+            }
+        })?;
+        if cutoff_modified_ns.is_some_and(|cutoff| modified_ns < cutoff) {
+            continue;
+        }
+        summary.scanned_files += 1;
         let bytes = u64::try_from(size_bytes).unwrap_or_default();
         summary.discovered_bytes = summary.discovered_bytes.saturating_add(bytes);
         if storage.source_checkpoint_matches(provider, &source_path, size_bytes, modified_ns)? {
@@ -343,6 +437,14 @@ fn prepare_sources(
         }
     }
     Ok((pending, observed_paths, complete))
+}
+
+fn configured_source_error(path: &Path, error: &AppError) -> AppError {
+    AppError::configuration(format!(
+        "configured provider source became inaccessible: {}: {}",
+        path.display(),
+        error.error.message
+    ))
 }
 
 fn apply_parsed_source(
@@ -437,31 +539,6 @@ fn source_stamp(path: &Path) -> Result<(i64, i64), AppError> {
     Ok((size_bytes, modified_ns))
 }
 
-fn index_database_provider(
-    storage: &mut Storage,
-    provider: &'static str,
-    roots: &[PathBuf],
-    parse: fn(&Path) -> Result<ParsedDatabase, AppError>,
-    summary: &mut IndexSummary,
-) -> Result<(), AppError> {
-    let mut complete = true;
-    let mut observed_paths = BTreeSet::new();
-    for path in roots.iter().filter(|path| path.is_file()) {
-        summary.scanned_files += 1;
-        let parsed = parse(path)?;
-        summary.malformed_records += parsed.malformed_records;
-        complete &= parsed.malformed_records == 0;
-        for conversation in parsed.conversations {
-            observed_paths.insert(conversation.source_path.to_string_lossy().into_owned());
-            apply_conversation(storage, &conversation, summary)?;
-        }
-    }
-    if complete {
-        summary.purged_conversations += storage.purge_missing_sources(provider, &observed_paths)?;
-    }
-    Ok(())
-}
-
 fn apply_conversation(
     storage: &mut Storage,
     conversation: &Conversation,
@@ -476,34 +553,67 @@ fn apply_conversation(
     Ok(())
 }
 
-fn configured_roots<const N: usize>(env_name: &str, defaults: [PathBuf; N]) -> Vec<PathBuf> {
-    std::env::var_os(env_name).map_or_else(
-        || defaults.into_iter().collect(),
-        |value| std::env::split_paths(&value).collect(),
-    )
+fn discover_jsonl_files(roots: &[PathBuf], authoritative: bool) -> Result<Discovery, AppError> {
+    discover_files(roots, authoritative, is_jsonl)
 }
 
-fn discover_jsonl_files(roots: &[PathBuf]) -> Discovery {
-    discover_files(roots, is_jsonl)
-}
-
-fn discover_files(roots: &[PathBuf], accept: fn(&Path) -> bool) -> Discovery {
+fn discover_files(
+    roots: &[PathBuf],
+    authoritative: bool,
+    accept: fn(&Path) -> bool,
+) -> Result<Discovery, AppError> {
     let mut files = BTreeSet::new();
     let mut complete = true;
     for root in roots {
-        if root.is_file() {
+        let metadata = match root.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if authoritative => {
+                return Err(AppError::configuration(format!(
+                    "configured provider root is not accessible: {}: {error}",
+                    root.display()
+                )));
+            }
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        if metadata.is_file() {
             if accept(root) {
                 files.insert(root.clone());
+            } else if authoritative {
+                return Err(AppError::configuration(format!(
+                    "configured provider file is not a supported history: {}",
+                    root.display()
+                )));
+            } else {
+                complete = false;
             }
             continue;
         }
-        if !root.is_dir() {
+        if !metadata.is_dir() {
+            if authoritative {
+                return Err(AppError::configuration(format!(
+                    "configured provider root is not a file or directory: {}",
+                    root.display()
+                )));
+            }
+            complete = false;
             continue;
         }
         for entry in WalkDir::new(root).follow_links(false) {
-            let Ok(entry) = entry else {
-                complete = false;
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if authoritative => {
+                    return Err(AppError::configuration(format!(
+                        "failed to inspect configured provider root {}: {error}",
+                        root.display()
+                    )));
+                }
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             let path = entry.path();
             if entry.file_type().is_file() && accept(path) {
@@ -511,270 +621,38 @@ fn discover_files(roots: &[PathBuf], accept: fn(&Path) -> bool) -> Discovery {
             }
         }
     }
-    Discovery {
+    Ok(Discovery {
         files: files.into_iter().collect(),
         complete,
-    }
+    })
+}
+
+fn cutoff_modified_ns(
+    run_started: SystemTime,
+    since_days: Option<u32>,
+) -> Result<Option<i64>, AppError> {
+    let Some(days) = since_days else {
+        return Ok(None);
+    };
+    let seconds = u64::from(days)
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| AppError::usage("--since-days is out of range"))?;
+    let cutoff = run_started
+        .checked_sub(Duration::from_secs(seconds))
+        .unwrap_or(UNIX_EPOCH);
+    let nanoseconds = cutoff
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nanoseconds = i64::try_from(nanoseconds)
+        .map_err(|_| AppError::internal("index cutoff is out of range"))?;
+    Ok(Some(nanoseconds))
 }
 
 fn is_jsonl(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-}
-
-struct ParsedDatabase {
-    conversations: Vec<Conversation>,
-    malformed_records: u64,
-}
-
-fn parse_opencode(path: &Path) -> Result<ParsedDatabase, AppError> {
-    let connection = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(AppError::database)?;
-    let mut conversations = Vec::new();
-    let mut malformed_records = 0;
-    for (session_id, title, created_at, updated_at) in opencode_sessions(&connection)? {
-        let mut query = connection
-            .prepare(
-                "SELECT id, data, time_created FROM message
-                 WHERE session_id = ?1 ORDER BY time_created, id",
-            )
-            .map_err(AppError::database)?;
-        let rows = query
-            .query_map([&session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })
-            .map_err(AppError::database)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(AppError::database)?;
-        drop(query);
-        let mut messages = Vec::new();
-        for (source_id, data, message_created_at) in rows {
-            let role = if let Ok(data) = serde_json::from_str::<Value>(&data) {
-                data.get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_owned()
-            } else {
-                malformed_records += 1;
-                continue;
-            };
-            let Some(content) =
-                opencode_message_content(&connection, &source_id, &mut malformed_records)?
-            else {
-                continue;
-            };
-            let ordinal = i64::try_from(messages.len())
-                .map_err(|_| AppError::internal("conversation contains too many messages"))?;
-            messages.push(NormalizedMessage {
-                id: stable_id(
-                    "message",
-                    &["opencode", &path.to_string_lossy(), &source_id],
-                ),
-                ordinal,
-                role,
-                content,
-                search_projection: None,
-                created_at: message_created_at,
-            });
-        }
-        if !messages.is_empty() {
-            conversations.push(Conversation {
-                id: session_id.clone(),
-                provider: "opencode",
-                source_path: PathBuf::from(format!("{}#{session_id}", path.display())),
-                title,
-                created_at,
-                updated_at,
-                messages,
-            });
-        }
-    }
-    Ok(ParsedDatabase {
-        conversations,
-        malformed_records,
-    })
-}
-
-type OpenCodeSession = (String, Option<String>, Option<i64>, Option<i64>);
-
-fn opencode_sessions(connection: &SqliteConnection) -> Result<Vec<OpenCodeSession>, AppError> {
-    let mut query = connection
-        .prepare(
-            "SELECT id, title, time_created, time_updated
-             FROM session ORDER BY time_created, id",
-        )
-        .map_err(AppError::database)?;
-    query
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-        .map_err(AppError::database)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(AppError::database)
-}
-
-fn opencode_message_content(
-    connection: &SqliteConnection,
-    message_id: &str,
-    malformed_records: &mut u64,
-) -> Result<Option<String>, AppError> {
-    let mut query = connection
-        .prepare(
-            "SELECT data FROM part WHERE message_id = ?1
-             ORDER BY time_created, id",
-        )
-        .map_err(AppError::database)?;
-    let parts = query
-        .query_map([message_id], |row| row.get::<_, String>(0))
-        .map_err(AppError::database)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(AppError::database)?;
-    let mut content = Vec::new();
-    for part in parts {
-        if let Ok(data) = serde_json::from_str::<Value>(&part) {
-            if matches!(
-                data.get("type").and_then(Value::as_str),
-                Some("text" | "reasoning")
-            ) && let Some(text) = data.get("text").and_then(Value::as_str)
-                && !text.trim().is_empty()
-            {
-                content.push(text.to_owned());
-            }
-        } else {
-            *malformed_records += 1;
-        }
-    }
-    Ok((!content.is_empty()).then(|| content.join("\n")))
-}
-
-fn parse_copilot(path: &Path) -> Result<ParsedFile, AppError> {
-    let mut parsed = parse_jsonl(path, "github-copilot", |raw| {
-        let role = match raw.get("type").and_then(Value::as_str)? {
-            "user.message" => "user",
-            "assistant.message" => "assistant",
-            _ => return None,
-        };
-        let payload = raw.get("data").unwrap_or(raw);
-        let content = payload
-            .get("content")
-            .or_else(|| payload.get("message"))
-            .or_else(|| payload.get("text"))
-            .and_then(flatten_content)?;
-        Some(ExtractedMessage {
-            source_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
-            role: role.to_owned(),
-            content,
-            search_projection: None,
-            created_at: parse_timestamp(raw.get("timestamp")),
-            session_id: None,
-        })
-    })?;
-    if let Some(conversation) = &mut parsed.conversation
-        && let Some(session_id) = path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-    {
-        session_id.clone_into(&mut conversation.id);
-    }
-    Ok(parsed)
-}
-
-fn parse_hermes(path: &Path) -> Result<ParsedDatabase, AppError> {
-    let connection = SqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(AppError::database)?;
-    let mut query = connection
-        .prepare(
-            "SELECT id, title, CAST(started_at * 1000 AS INTEGER),
-                    CAST(ended_at * 1000 AS INTEGER)
-             FROM sessions ORDER BY started_at, id",
-        )
-        .map_err(AppError::database)?;
-    let sessions = query
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })
-        .map_err(AppError::database)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(AppError::database)?;
-    drop(query);
-    let mut conversations = Vec::new();
-    for (session_id, title, created_at, updated_at) in sessions {
-        let mut query = connection
-            .prepare(
-                "SELECT id, role, content, reasoning,
-                        CAST(timestamp * 1000 AS INTEGER)
-                 FROM messages WHERE session_id = ?1 ORDER BY timestamp, id",
-            )
-            .map_err(AppError::database)?;
-        let rows = query
-            .query_map([&session_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })
-            .map_err(AppError::database)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(AppError::database)?;
-        drop(query);
-        let mut messages = Vec::new();
-        for (source_id, role, content, reasoning, message_created_at) in rows {
-            if role == "session_meta" {
-                continue;
-            }
-            let content = [content, reasoning]
-                .into_iter()
-                .flatten()
-                .filter(|text| !text.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n[reasoning]\n");
-            if content.is_empty() {
-                continue;
-            }
-            let ordinal = i64::try_from(messages.len())
-                .map_err(|_| AppError::internal("conversation contains too many messages"))?;
-            messages.push(NormalizedMessage {
-                id: stable_id(
-                    "message",
-                    &["hermes", &path.to_string_lossy(), &source_id.to_string()],
-                ),
-                ordinal,
-                role,
-                content,
-                search_projection: None,
-                created_at: message_created_at,
-            });
-        }
-        if !messages.is_empty() {
-            conversations.push(Conversation {
-                id: session_id.clone(),
-                provider: "hermes",
-                source_path: PathBuf::from(format!("{}#{session_id}", path.display())),
-                title,
-                created_at,
-                updated_at,
-                messages,
-            });
-        }
-    }
-    Ok(ParsedDatabase {
-        conversations,
-        malformed_records: 0,
-    })
 }
 
 fn parse_claude(path: &Path) -> Result<ParsedFile, AppError> {
@@ -811,31 +689,6 @@ fn parse_codex(path: &Path) -> Result<ParsedFile, AppError> {
         } else {
             None
         }
-    })
-}
-
-fn parse_pi(path: &Path) -> Result<ParsedFile, AppError> {
-    parse_jsonl(path, "pi", |raw| {
-        if raw.get("type").and_then(Value::as_str) != Some("message") {
-            return None;
-        }
-        let message = raw.get("message")?;
-        let role = match message.get("role").and_then(Value::as_str)? {
-            "toolResult" => "tool",
-            role => role,
-        };
-        let mut content = flatten_content(message.get("content")?)?;
-        if role == "tool" {
-            content = truncate_chars(&content, MAX_TOOL_OUTPUT_CHARS);
-        }
-        Some(ExtractedMessage {
-            source_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
-            role: role.to_owned(),
-            content,
-            search_projection: None,
-            created_at: parse_timestamp(raw.get("timestamp")),
-            session_id: None,
-        })
     })
 }
 
@@ -923,8 +776,6 @@ fn parse_jsonl(
                 .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-        } else if provider == "pi" && raw.get("type").and_then(Value::as_str) == Some("session") {
-            session_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
         }
         let Some(extracted) = extract(&raw) else {
             continue;
@@ -1089,11 +940,82 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, FileTimes};
     use std::io::Write;
 
     use super::*;
     use veritas_test_macros as veritas;
+
+    fn write_claude_session(path: &Path, session: &str, message: &str) {
+        fs::write(
+            path,
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"uuid\":\"{session}-m1\",\"message\":{{\"role\":\"user\",\"content\":\"{message}\"}}}}\n"
+            ),
+        )
+        .expect("Claude fixture");
+    }
+
+    fn test_conversation(
+        id: &str,
+        provider: &'static str,
+        source_path: PathBuf,
+        content: &str,
+    ) -> Conversation {
+        Conversation {
+            id: id.to_owned(),
+            provider,
+            source_path,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            messages: vec![NormalizedMessage {
+                id: format!("{id}-message"),
+                ordinal: 0,
+                role: "user".to_owned(),
+                content: content.to_owned(),
+                search_projection: None,
+                created_at: None,
+            }],
+        }
+    }
+
+    fn empty_summary() -> IndexSummary {
+        IndexSummary {
+            scanned_files: 0,
+            malformed_records: 0,
+            changed_messages: 0,
+            removed_messages: 0,
+            unchanged_sources: 0,
+            checkpoint_skipped_sources: 0,
+            tombstoned_sources: 0,
+            purged_conversations: 0,
+            committed_batches: 0,
+            discovered_bytes: 0,
+            processed_bytes: 0,
+            processed_files: 0,
+        }
+    }
+
+    fn set_modified(path: &Path, modified: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open fixture")
+            .set_times(FileTimes::new().set_modified(modified))
+            .expect("set fixture modification time");
+    }
+
+    fn parse_with_late_failure(path: &Path) -> Result<ParsedFile, AppError> {
+        if path.file_name().and_then(|name| name.to_str()) == Some("failure.jsonl") {
+            std::thread::sleep(Duration::from_millis(50));
+            return Err(AppError::io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "source disappeared",
+            )));
+        }
+        parse_claude(path)
+    }
 
     #[veritas::claims(
         "ingestion/provider-boundary",
@@ -1274,16 +1196,14 @@ mod tests {
         drop(writer);
 
         fs::write(claude_root.join("malformed.jsonl"), "not-json\n").expect("malformed source");
-        let roots = ProviderRoots {
-            claude: vec![claude_root.clone()],
-            codex: Vec::new(),
-            opencode: Vec::new(),
-            copilot: Vec::new(),
-            hermes: Vec::new(),
-            pi: Vec::new(),
+        let options = IndexOptions {
+            claude_code: Some(vec![claude_root.clone()]),
+            codex: None,
+            roots_are_authoritative: true,
+            since_days: None,
         };
         let mut writer = Storage::open_writer(&database).expect("incomplete writer");
-        let incomplete = index(&mut writer, &roots).expect("bounded malformed scan");
+        let incomplete = index(&mut writer, &options).expect("bounded malformed scan");
         assert_eq!(incomplete.malformed_records, 1);
         writer.commit_writer().expect("commit incomplete scan");
         assert_eq!(writer.counts().expect("counts").conversations, 1);
@@ -1291,9 +1211,474 @@ mod tests {
 
         fs::remove_file(claude_root.join("malformed.jsonl")).expect("remove malformed source");
         let mut writer = Storage::open_writer(&database).expect("complete writer");
-        let complete = index(&mut writer, &roots).expect("complete scan");
+        let complete = index(&mut writer, &options).expect("complete scan");
         assert_eq!(complete.purged_conversations, 1);
         writer.commit_writer().expect("commit complete scan");
         assert_eq!(writer.counts().expect("counts").conversations, 0);
+    }
+
+    #[veritas::claims(
+        "ingestion/configured-provider-roots-index",
+        "ingestion/unsupported-providers-ignored"
+    )]
+    #[test]
+    fn authoritative_roots_index_only_the_two_concrete_formats() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let claude = directory.path().join("claude");
+        let codex = directory.path().join("codex");
+        fs::create_dir(&claude).expect("Claude root");
+        fs::create_dir(&codex).expect("Codex root");
+        write_claude_session(
+            &claude.join("claude.jsonl"),
+            "claude-session",
+            "claude sentinel",
+        );
+        fs::write(
+            claude.join("unsupported.jsonl"),
+            "{\"info\":{\"id\":\"opencode-session\"},\"messages\":[{\"role\":\"user\",\"content\":\"unsupported sentinel\"}]}\n",
+        )
+        .expect("unsupported fixture");
+        fs::write(
+            codex.join("codex.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-session\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"codex-message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex sentinel\"}]}}\n"
+            ),
+        )
+        .expect("Codex fixture");
+        let mut writer =
+            Storage::open_writer(&directory.path().join("cass.sqlite3")).expect("writer");
+        let summary = index(
+            &mut writer,
+            &IndexOptions {
+                claude_code: Some(vec![claude]),
+                codex: Some(vec![codex]),
+                roots_are_authoritative: true,
+                since_days: None,
+            },
+        )
+        .expect("configured index");
+
+        assert_eq!(summary.scanned_files, 3);
+        assert_eq!(writer.counts().expect("counts").conversations, 2);
+        writer.commit_writer().expect("commit configured index");
+        assert_eq!(
+            writer
+                .search("claude", 10, Some("claude-code"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            writer
+                .search("codex", 10, Some("codex"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            writer
+                .search("unsupported", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[veritas::claims("indexing/inaccessible-roots-never-authorize-purge")]
+    #[test]
+    fn every_authoritative_root_is_preflighted_before_ingestion_writes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let claude_root = directory.path().join("claude");
+        fs::create_dir(&claude_root).expect("Claude root");
+        write_claude_session(&claude_root.join("session.jsonl"), "session", "sentinel");
+        let options = IndexOptions {
+            claude_code: Some(vec![claude_root]),
+            codex: Some(vec![directory.path().join("missing-codex")]),
+            roots_are_authoritative: true,
+            since_days: None,
+        };
+        let mut writer =
+            Storage::open_writer(&directory.path().join("cass.sqlite3")).expect("writer");
+
+        let error = index(&mut writer, &options).err().expect("missing root");
+
+        assert_eq!(error.error.kind, "configuration");
+        assert_eq!(writer.counts().expect("counts").conversations, 0);
+        assert_eq!(writer.counts().expect("counts").messages, 0);
+    }
+
+    #[veritas::claims("indexing/incomplete-scan-preserves-state")]
+    #[test]
+    fn missing_builtin_root_is_nonfatal_but_never_authorizes_purge() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("claude");
+        fs::create_dir(&root).expect("Claude root");
+        write_claude_session(&root.join("session.jsonl"), "session", "durable sentinel");
+        let database = directory.path().join("cass.sqlite3");
+        let options = IndexOptions {
+            claude_code: Some(vec![root.clone()]),
+            codex: None,
+            roots_are_authoritative: false,
+            since_days: None,
+        };
+        let mut writer = Storage::open_writer(&database).expect("initial writer");
+        index(&mut writer, &options).expect("initial index");
+        writer.commit_writer().expect("commit initial index");
+        drop(writer);
+        fs::rename(&root, directory.path().join("offline")).expect("take root offline");
+
+        let mut writer = Storage::open_writer(&database).expect("offline writer");
+        let refresh = index(&mut writer, &options).expect("nonfatal refresh");
+
+        assert_eq!(refresh.purged_conversations, 0);
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+        assert_eq!(
+            writer
+                .search("durable", 10, None, None)
+                .expect("preserved search row")
+                .len(),
+            1
+        );
+        drop(writer);
+
+        fs::write(&root, "not a JSONL history").expect("replace root with unusable file");
+        let mut writer = Storage::open_writer(&database).expect("wrong-type writer");
+        let refresh = index(&mut writer, &options).expect("nonfatal wrong-type refresh");
+        assert_eq!(refresh.purged_conversations, 0);
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+    }
+
+    #[veritas::claims("indexing/inaccessible-roots-never-authorize-purge")]
+    #[test]
+    fn configured_root_disappearing_after_discovery_rolls_back_without_purge() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("configured");
+        fs::create_dir(&root).expect("configured root");
+        let discovery = discover_jsonl_files(std::slice::from_ref(&root), true)
+            .expect("initial empty discovery");
+        let database = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&database).expect("seed writer");
+        writer
+            .replace_conversation(&test_conversation(
+                "existing",
+                "claude-code",
+                root.join("missing.jsonl"),
+                "durable sentinel",
+            ))
+            .expect("seed conversation");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+        fs::remove_dir(&root).expect("remove configured root");
+
+        let mut writer = Storage::open_writer(&database).expect("configured writer");
+        let error = index_provider(
+            &mut writer,
+            ProviderScan {
+                provider: "claude-code",
+                roots: std::slice::from_ref(&root),
+                cutoff_modified_ns: None,
+                parse: parse_claude,
+                authoritative: true,
+            },
+            discovery,
+            &mut empty_summary(),
+            &mut IndexProgress::new(),
+        )
+        .expect_err("disappearing configured root");
+
+        assert_eq!(error.error.kind, "configuration");
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+        writer.commit_writer().expect("commit unchanged state");
+        assert_eq!(writer.search("durable", 10, None, None).unwrap().len(), 1);
+    }
+
+    #[veritas::claims("indexing/inaccessible-roots-never-authorize-purge")]
+    #[test]
+    fn late_configured_source_failure_rolls_back_provider_changes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("cass.sqlite3");
+        let old_source = directory.path().join("old.jsonl");
+        let mut writer = Storage::open_writer(&database).expect("seed writer");
+        for (id, content) in [("existing", "durable sentinel"), ("forgotten", "forgotten")] {
+            writer
+                .replace_conversation(&test_conversation(
+                    id,
+                    "claude-code",
+                    if id == "existing" {
+                        old_source.clone()
+                    } else {
+                        directory.path().join("forgotten.jsonl")
+                    },
+                    content,
+                ))
+                .expect("seed conversation");
+        }
+        writer
+            .record_source_checkpoint("claude-code", old_source.to_str().unwrap(), 10, 20)
+            .expect("seed checkpoint");
+        writer
+            .replace_embeddings(
+                "test-generation",
+                &[crate::storage::EmbeddingWrite {
+                    message_id: "existing-message",
+                    vector: &[127],
+                    norm: 127.0,
+                }],
+            )
+            .expect("seed embedding");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+        let mut storage = Storage::open(&database).expect("forget storage");
+        assert!(storage.forget("forgotten").expect("seed tombstone"));
+        drop(storage);
+
+        let root = directory.path().join("configured");
+        fs::create_dir(&root).expect("configured root");
+        let valid = root.join("valid.jsonl");
+        let failure = root.join("failure.jsonl");
+        write_claude_session(&valid, "new-session", "uncommitted sentinel");
+        fs::write(&failure, "placeholder\n").expect("failure fixture");
+        let discovery = discover_jsonl_files(std::slice::from_ref(&root), true)
+            .expect("initial configured discovery");
+        let mut writer = Storage::open_writer(&database).expect("configured writer");
+        let mut summary = empty_summary();
+        let error = index_provider(
+            &mut writer,
+            ProviderScan {
+                provider: "claude-code",
+                roots: std::slice::from_ref(&root),
+                cutoff_modified_ns: None,
+                parse: parse_with_late_failure,
+                authoritative: true,
+            },
+            discovery,
+            &mut summary,
+            &mut IndexProgress::new(),
+        )
+        .expect_err("late source failure");
+
+        assert_eq!(error.error.kind, "configuration");
+        assert_eq!(summary.committed_batches, 0);
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+        assert_eq!(writer.embedding_count("test-generation").unwrap(), 1);
+        assert!(
+            writer
+                .source_checkpoint_matches("claude-code", old_source.to_str().unwrap(), 10, 20)
+                .unwrap()
+        );
+        assert_eq!(writer.search("durable", 10, None, None).unwrap().len(), 1);
+        assert!(
+            writer
+                .search("uncommitted", 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        let tombstone = writer
+            .replace_conversation(&test_conversation(
+                "forgotten",
+                "claude-code",
+                directory.path().join("forgotten.jsonl"),
+                "forgotten",
+            ))
+            .expect("tombstone remains");
+        assert!(tombstone.tombstoned);
+    }
+
+    #[veritas::claims(
+        "indexing/recency-horizon-bounds-admission-not-retention",
+        "indexing/recency-exclusion-preserves-stored-state"
+    )]
+    #[test]
+    fn horizon_admits_the_boundary_and_preserves_deleted_old_sources() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("claude");
+        fs::create_dir(&root).expect("Claude root");
+        let old_path = root.join("old.jsonl");
+        let recent_path = root.join("recent.jsonl");
+        write_claude_session(&old_path, "old-session", "old sentinel");
+        fs::write(
+            &recent_path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"recent-session\",\"uuid\":\"recent-1\",\"timestamp\":\"2020-01-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"recent sentinel\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"recent-session\",\"uuid\":\"recent-2\",\"timestamp\":\"2020-01-02T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":\"complete conversation sentinel\"}}\n"
+            ),
+        )
+        .expect("boundary fixture");
+        let run_started = UNIX_EPOCH + Duration::from_hours(200 * 24);
+        let boundary = run_started - Duration::from_hours(90 * 24);
+        set_modified(&old_path, boundary - Duration::from_nanos(1));
+        set_modified(&recent_path, boundary);
+        let database = directory.path().join("cass.sqlite3");
+        let bounded = IndexOptions {
+            claude_code: Some(vec![root.clone()]),
+            codex: None,
+            roots_are_authoritative: true,
+            since_days: Some(90),
+        };
+        let mut writer = Storage::open_writer(&database).expect("bounded writer");
+        let admitted = index_at(&mut writer, &bounded, run_started).expect("bounded index");
+        assert_eq!(admitted.scanned_files, 1);
+        assert_eq!(writer.counts().expect("bounded counts").conversations, 1);
+        assert_eq!(writer.counts().expect("bounded counts").messages, 2);
+        writer.commit_writer().expect("commit bounded index");
+        assert_eq!(writer.search("complete", 10, None, None).unwrap().len(), 1);
+        assert!(writer.search("old", 10, None, None).unwrap().is_empty());
+        drop(writer);
+
+        let all_history = IndexOptions {
+            since_days: None,
+            ..bounded
+        };
+        let mut writer = Storage::open_writer(&database).expect("all-history writer");
+        let archival = index_at(&mut writer, &all_history, run_started).expect("all-history index");
+        assert_eq!(archival.scanned_files, 2);
+        assert_eq!(
+            writer.counts().expect("all-history counts").conversations,
+            2
+        );
+        let old_message_id = stable_id(
+            "message",
+            &["claude-code", &old_path.to_string_lossy(), "old-session-m1"],
+        );
+        writer
+            .replace_embeddings(
+                "old-generation",
+                &[crate::storage::EmbeddingWrite {
+                    message_id: &old_message_id,
+                    vector: &[127],
+                    norm: 127.0,
+                }],
+            )
+            .expect("old embedding");
+        let (old_size_bytes, old_modified_ns) = source_stamp(&old_path).expect("old source stamp");
+        writer.commit_writer().expect("commit all-history index");
+        drop(writer);
+
+        fs::remove_file(&old_path).expect("remove old source");
+        fs::remove_file(&recent_path).expect("remove recent source");
+        let bounded = IndexOptions {
+            since_days: Some(90),
+            ..all_history
+        };
+        let mut writer = Storage::open_writer(&database).expect("bounded writer");
+        let refresh = index_at(&mut writer, &bounded, run_started).expect("bounded refresh");
+
+        assert_eq!(refresh.purged_conversations, 1);
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+        assert_eq!(writer.embedding_count("old-generation").unwrap(), 1);
+        assert!(
+            writer
+                .source_checkpoint_matches(
+                    "claude-code",
+                    old_path.to_str().unwrap(),
+                    old_size_bytes,
+                    old_modified_ns,
+                )
+                .expect("old checkpoint")
+        );
+        writer.commit_writer().expect("commit bounded refresh");
+        assert_eq!(writer.search("old", 10, None, None).unwrap().len(), 1);
+        assert!(writer.search("recent", 10, None, None).unwrap().is_empty());
+    }
+
+    #[veritas::claims("indexing/partial-provider-scan-preserves-others")]
+    #[test]
+    fn selecting_one_provider_never_reconciles_an_unselected_provider() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("codex");
+        fs::create_dir(&root).expect("Codex root");
+        let database = directory.path().join("cass.sqlite3");
+        let mut writer = Storage::open_writer(&database).expect("writer");
+        for (id, provider, source_path) in [
+            (
+                "claude-session",
+                "claude-code",
+                directory.path().join("claude.jsonl"),
+            ),
+            ("codex-session", "codex", root.join("missing.jsonl")),
+            (
+                "claude-forgotten",
+                "claude-code",
+                directory.path().join("claude-forgotten.jsonl"),
+            ),
+        ] {
+            writer
+                .replace_conversation(&test_conversation(
+                    id,
+                    provider,
+                    source_path,
+                    &format!("{provider} sentinel"),
+                ))
+                .expect("seed conversation");
+        }
+        writer
+            .record_source_checkpoint(
+                "claude-code",
+                directory.path().join("claude.jsonl").to_str().unwrap(),
+                10,
+                20,
+            )
+            .expect("Claude checkpoint");
+        writer
+            .replace_embeddings(
+                "claude-generation",
+                &[crate::storage::EmbeddingWrite {
+                    message_id: "claude-session-message",
+                    vector: &[127],
+                    norm: 127.0,
+                }],
+            )
+            .expect("Claude embedding");
+        writer.commit_writer().expect("commit seed");
+        drop(writer);
+        let mut storage = Storage::open(&database).expect("tombstone storage");
+        assert!(
+            storage
+                .forget("claude-forgotten")
+                .expect("Claude tombstone")
+        );
+        drop(storage);
+
+        let mut writer = Storage::open_writer(&database).expect("refresh writer");
+        let summary = index(
+            &mut writer,
+            &IndexOptions {
+                claude_code: None,
+                codex: Some(vec![root]),
+                roots_are_authoritative: true,
+                since_days: None,
+            },
+        )
+        .expect("Codex-only refresh");
+
+        assert_eq!(summary.purged_conversations, 1);
+        assert_eq!(writer.counts().expect("counts").conversations, 1);
+        assert_eq!(writer.embedding_count("claude-generation").unwrap(), 1);
+        assert!(
+            writer
+                .source_checkpoint_matches(
+                    "claude-code",
+                    directory.path().join("claude.jsonl").to_str().unwrap(),
+                    10,
+                    20,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            writer
+                .search("claude", 10, None, None)
+                .expect("Claude remains")
+                .len(),
+            1
+        );
+        let tombstone = writer
+            .replace_conversation(&test_conversation(
+                "claude-forgotten",
+                "claude-code",
+                directory.path().join("claude-forgotten.jsonl"),
+                "forgotten",
+            ))
+            .expect("Claude tombstone remains");
+        assert!(tombstone.tombstoned);
     }
 }

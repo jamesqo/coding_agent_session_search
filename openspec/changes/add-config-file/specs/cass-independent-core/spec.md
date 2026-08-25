@@ -12,6 +12,12 @@ providers SHALL retain their built-in local roots. OpenCode, GitHub Copilot
 CLI, Hermes Agent, Pi, and every other provider SHALL have no discovery or
 configuration surface.
 
+<!-- claim: storage/unsupported-provider-data-is-removed -->
+Opening a supported earlier database schema SHALL remove unsupported-provider
+canonical rows, FTS rows, embeddings, checkpoints, and tombstones while
+preserving Claude Code and Codex state, then constrain future canonical rows to
+the two supported providers.
+
 #### Scenario: Configured providers
 
 <!-- claim: ingestion/configured-provider-roots-index -->

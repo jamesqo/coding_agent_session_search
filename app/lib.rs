@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod federation;
 mod ingestion;
 mod semantic;
@@ -66,6 +67,10 @@ struct ErrorBody {
 }
 
 impl AppError {
+    fn configuration(message: impl Into<String>) -> Self {
+        Self::new(9, "configuration", message, false)
+    }
+
     fn usage(message: impl Into<String>) -> Self {
         Self::new(2, "usage", message, false)
     }

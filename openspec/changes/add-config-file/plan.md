@@ -127,7 +127,7 @@ reads legacy environment inputs independently.
 
 ## Delivery Plan
 
-- [ ] **PH-1 — Add the internal strict configuration core.** Depends on: none.
+- [x] **PH-1 — Add the internal strict configuration core.** Depends on: none.
   Create `config.rs`, the configuration error constructor, bounded default and
   explicit path handling, split version/field/provider/root/node/horizon
   validation, and exact local-node resolution. Do not expose flags or status
@@ -145,8 +145,9 @@ reads legacy environment inputs independently.
   its removal owner. PH-1 and PH-2 form one non-landable activation unit; PH-2
   exit requires removal of that allowance before strict Clippy.
 
-  **PH-1 execution contract — approved.** Plan revision: current worktree at
-  base `4bca8d38`. Status: in progress. Depends on: none. Consumes the existing
+  **PH-1 execution contract — approved.** Code baseline: `4bca8d38`; execution
+  starts from planning commit `1e2f059b`. Status: complete. Depends on: none.
+  Consumes the existing
   `AppError`, `ProjectDirs`, and Serde. Produces a validated immutable
   configuration value for PH-2 and PH-3. Owns `app/config.rs`, its
   `app/lib.rs` module declaration and configuration error constructor, and
@@ -200,15 +201,23 @@ reads legacy environment inputs independently.
 
   Exit:
 
-  - [ ] All internal PH-1 behavior and focused tests pass.
-  - [ ] Canonical phase gate passes and runnable evidence is freshly discovered.
-  - [ ] New/changed links are semantically reviewed and explicitly approved.
-  - [ ] The immutable resolved config is available to PH-2/PH-3; later work
+  - [x] All internal PH-1 behavior and focused tests pass.
+  - [x] Canonical phase gate passes and runnable evidence is freshly discovered.
+  - [x] Links created or changed by PH-1 are semantically reviewed and
+        explicitly approved; pre-existing review debt remains outside this
+        phase.
+  - [x] The immutable resolved config is available to PH-2/PH-3; later work
         remains owned there.
 
-  Completion record: pending.
+  Completion record: implementation and native proof complete on 2026-08-25;
+  focused configuration tests passed 14/14, full Nextest passed 66/66 with two
+  skipped, strict Clippy/rustfmt/doctests/OpenSpec passed, and fresh Veritas
+  discovery reports 68 evidence declarations, 64 links, and no artifact or
+  provider drift. Independent correctness and contract rechecks found no
+  remaining material issue. All ten PH-1-owned links were approved under the
+  user's explicitly delegated authority. PH-2 is ready.
 
-- [ ] **PH-2 — Activate local configuration and safe indexing atomically.**
+- [x] **PH-2 — Activate local configuration and safe indexing atomically.**
   Depends on: PH-1. Expose `--config` and `--local-node`; validate configuration
   before all six public commands while hidden federation workers remain
   config-blind; add the exact nested status projection and stable error wire
@@ -227,6 +236,67 @@ reads legacy environment inputs independently.
   Veritas gates. Owns global/provider/horizon flags, status, CLI loading,
   `ProviderRoots`, index orchestration, reconciliation authority, provider
   cleanup, root-environment removal, and tests.
+
+  **PH-2 execution contract — approved under the plan's existing authority.**
+  Status: complete. Depends on: completed PH-1. Consumes the immutable
+  `ResolvedConfig`, code-9 configuration error, current two JSONL parsers,
+  checkpoints, provider-scoped purge, and CLI process harness. Produces one
+  public configuration boundary and one concrete two-provider index request
+  for PH-3. Owns `app/cli.rs`, `app/ingestion.rs`, provider-contraction changes
+  in `app/storage.rs`, CLI/ingestion/storage tests, and the PH-2 portion of
+  `app/config.rs`; concurrent siblings: none. Verification cadence: phase;
+  role: phase-final.
+
+  Contract: public commands load and validate configuration before model,
+  database, scan, process, or download effects. Hidden federation workers
+  reject explicit configuration flags and never discover a default file.
+  Status exposes only the exact resolved local projection. Index selection is
+  exhaustive over Claude Code and Codex, deduplicated, and resolved before
+  effects. One run timestamp yields an inclusive source-mtime cutoff. Every
+  selected configured root is inspected before provider writes; old discovered
+  paths and old stored checkpoints remain outside purge authority. Missing
+  sources can be purged only inside the selected provider/root/age authority.
+  Existing unsupported-provider rows are removed through one schema migration
+  so broad search cannot surface providers outside the product boundary.
+  Federation node selection, SSH destinations, and `CASS_SEARCH_NODES` remain
+  strictly PH-3-owned.
+
+  Execution increments:
+
+  1. Add failing CLI process tests for global flags, exact status projection,
+     stable configuration errors, six-command pre-effect ordering, and hidden
+     worker config blindness. Wire one public `config::load` boundary without
+     consuming configured federation nodes.
+  2. Replace `ProviderRoots` and six root environment inputs with a concrete
+     Claude/Codex selection and resolved roots. Add index provider/horizon
+     flags and precedence, delete the four unsupported parsers and search
+     filters, and migrate the ignored real-model test to explicit config.
+  3. Make selected-root discovery fail closed before writes; apply one
+     controlled inclusive cutoff; extend reconciliation with root and stored
+     checkpoint age authority. Prove 16/17 boundaries, cutoff equality and one
+     nanosecond before it, all-history, complete-conversation admission,
+     inaccessible/disappearing roots, old present/deleted preservation, and
+     selected-provider isolation.
+  4. Migrate schema version 8 to the two-provider constraint and remove
+     unsupported canonical, FTS, embedding, checkpoint, and tombstone state.
+     Remove PH-1's module allowance or narrow only PH-3-owned inventory fields,
+     then run the phase-final native, OpenSpec, review, and Veritas gates.
+
+  Exit:
+
+  - [x] Public configuration/status and pre-effect behavior pass focused proof.
+  - [x] Two-provider selection, root authority, and horizon safety pass focused proof.
+  - [x] Schema/provider contraction preserves Claude Code and Codex state.
+  - [x] Canonical phase gate and delegated semantic approvals are current.
+
+  Completion record: complete on 2026-08-25. The final native gate passed
+  80/80 Nextest tests with two intentionally skipped, strict Clippy, rustfmt,
+  and doctests; strict OpenSpec validation passed. Independent correctness and
+  contract/proof rechecks found no remaining issue after configured-root race,
+  built-in-root purge authority, and ignored real-model fixture fixes. Fresh
+  Veritas discovery has no claim/evidence drift, and all 19 exact PH-2-owned
+  links were semantically reviewed and approved under the user's delegated
+  authority. Pre-existing semantic-search review debt remains outside PH-2.
 
 - [ ] **PH-3 — Resolve configured federation and integrate commands.** Depends
   on: PH-1 and PH-2. Replace raw/environment nodes with configured logical names

@@ -9,14 +9,14 @@ use serde::{Deserialize, Serialize};
 use crate::AppError;
 use crate::ingestion::Conversation;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const FTS_BULK_REBUILD_PERCENT: u64 = 90;
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL CHECK (
         provider IN (
-            'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+            'claude-code', 'codex'
         )
     ),
     source_path TEXT NOT NULL UNIQUE,
@@ -219,6 +219,28 @@ impl Storage {
         self.writer_active = true;
         self.transaction_base_messages = self.message_count()?;
         Ok(())
+    }
+
+    pub(crate) fn begin_provider_scan(&self) -> Result<(), AppError> {
+        self.require_writer()?;
+        self.connection
+            .execute_batch("SAVEPOINT cass_provider_scan")
+            .map_err(AppError::database)
+    }
+
+    pub(crate) fn finish_provider_scan(&self) -> Result<(), AppError> {
+        self.connection
+            .execute_batch("RELEASE cass_provider_scan")
+            .map_err(AppError::database)
+    }
+
+    pub(crate) fn rollback_provider_scan(&self) -> Result<(), AppError> {
+        self.connection
+            .execute_batch(
+                "ROLLBACK TO cass_provider_scan;
+                 RELEASE cass_provider_scan;",
+            )
+            .map_err(AppError::database)
     }
 
     fn measured_fts_bulk_threshold(&self) -> Result<u64, AppError> {
@@ -664,15 +686,29 @@ impl Storage {
         &mut self,
         provider: &str,
         observed_paths: &BTreeSet<String>,
+        authoritative_roots: &[std::path::PathBuf],
+        cutoff_modified_ns: Option<i64>,
     ) -> Result<u64, AppError> {
         self.require_writer()?;
         let mut statement = self
             .connection
-            .prepare("SELECT id, source_path FROM conversations WHERE provider = ?1")
+            .prepare(
+                "SELECT conversations.id, conversations.source_path,
+                        source_checkpoints.modified_ns
+                   FROM conversations
+                   LEFT JOIN source_checkpoints
+                     ON source_checkpoints.provider = conversations.provider
+                    AND source_checkpoints.source_path = conversations.source_path
+                  WHERE conversations.provider = ?1",
+            )
             .map_err(AppError::database)?;
         let rows = statement
             .query_map([provider], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
             })
             .map_err(AppError::database)?;
         let existing = rows
@@ -680,8 +716,15 @@ impl Storage {
             .map_err(AppError::database)?;
         drop(statement);
         let mut removed = 0_u64;
-        for (id, source_path) in existing {
-            if observed_paths.contains(&source_path) {
+        for (id, source_path, modified_ns) in existing {
+            if observed_paths.contains(&source_path)
+                || !source_is_in_reconciliation_scope(
+                    &source_path,
+                    modified_ns,
+                    authoritative_roots,
+                    cutoff_modified_ns,
+                )
+            {
                 continue;
             }
             if !self.defer_search_updates {
@@ -697,16 +740,28 @@ impl Storage {
         }
         let mut statement = self
             .connection
-            .prepare("SELECT source_path FROM source_checkpoints WHERE provider = ?1")
+            .prepare(
+                "SELECT source_path, modified_ns
+                   FROM source_checkpoints WHERE provider = ?1",
+            )
             .map_err(AppError::database)?;
         let checkpoint_paths = statement
-            .query_map([provider], |row| row.get::<_, String>(0))
+            .query_map([provider], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(AppError::database)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(AppError::database)?;
         drop(statement);
-        for source_path in checkpoint_paths {
-            if !observed_paths.contains(&source_path) {
+        for (source_path, modified_ns) in checkpoint_paths {
+            if !observed_paths.contains(&source_path)
+                && source_is_in_reconciliation_scope(
+                    &source_path,
+                    Some(modified_ns),
+                    authoritative_roots,
+                    cutoff_modified_ns,
+                )
+            {
                 self.connection
                     .execute(
                         "DELETE FROM source_checkpoints
@@ -1124,6 +1179,22 @@ fn readonly_table_count(connection: &Connection, table: &str) -> Result<u64, App
     u64::try_from(count).map_err(|_| AppError::internal("negative table count"))
 }
 
+fn source_is_in_reconciliation_scope(
+    source_path: &str,
+    modified_ns: Option<i64>,
+    authoritative_roots: &[std::path::PathBuf],
+    cutoff_modified_ns: Option<i64>,
+) -> bool {
+    let source_path = Path::new(source_path);
+    if !authoritative_roots
+        .iter()
+        .any(|root| source_path.starts_with(root))
+    {
+        return false;
+    }
+    cutoff_modified_ns.is_none_or(|cutoff| modified_ns.is_some_and(|value| value >= cutoff))
+}
+
 impl Drop for Storage {
     fn drop(&mut self) {
         if self.writer_active {
@@ -1214,7 +1285,12 @@ fn provider_schema_is_current(connection: &Connection) -> Result<bool, AppError>
             |row| row.get(0),
         )
         .map_err(AppError::database)?;
-    Ok(sql.contains("'opencode'") && sql.contains("'github-copilot'") && sql.contains("'pi'"))
+    Ok(sql.contains("'claude-code'")
+        && sql.contains("'codex'")
+        && !sql.contains("'opencode'")
+        && !sql.contains("'github-copilot'")
+        && !sql.contains("'hermes'")
+        && !sql.contains("'pi'"))
 }
 
 fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
@@ -1223,7 +1299,7 @@ fn rebuild_provider_schema(connection: &Connection) -> Result<(), AppError> {
             "CREATE TABLE conversations_next (
                 id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL CHECK (provider IN (
-                    'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
+                    'claude-code', 'codex'
                 )),
                 source_path TEXT NOT NULL UNIQUE,
                 title TEXT, created_at INTEGER, updated_at INTEGER,
@@ -1348,30 +1424,26 @@ fn purge_unsupported_providers(connection: &Connection) -> Result<(), AppError> 
             "DELETE FROM message_fts
               WHERE conversation_id IN (
                     SELECT id FROM conversations
-                     WHERE provider NOT IN (
-                        'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
-                     )
+                     WHERE provider NOT IN ('claude-code', 'codex')
               );
              DELETE FROM message_embeddings
               WHERE message_id IN (
                     SELECT messages.id
                       FROM messages
                       JOIN conversations ON conversations.id = messages.conversation_id
-                     WHERE conversations.provider NOT IN (
-                        'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
-                     )
+                     WHERE conversations.provider NOT IN ('claude-code', 'codex')
               );
              DELETE FROM messages
               WHERE conversation_id IN (
                     SELECT id FROM conversations
-                     WHERE provider NOT IN (
-                        'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
-                     )
+                     WHERE provider NOT IN ('claude-code', 'codex')
               );
              DELETE FROM conversations
-              WHERE provider NOT IN (
-                'claude-code', 'codex', 'opencode', 'github-copilot', 'hermes', 'pi'
-              );",
+              WHERE provider NOT IN ('claude-code', 'codex');
+             DELETE FROM source_checkpoints
+              WHERE provider NOT IN ('claude-code', 'codex');
+             DELETE FROM tombstones
+              WHERE provider NOT IN ('claude-code', 'codex');",
         )
         .map_err(AppError::database)
 }
@@ -2134,6 +2206,36 @@ mod tests {
         VALUES ('codex', '/tmp/session-1.jsonl', 10, 20);
      PRAGMA user_version = 7;";
 
+    fn version_eight_provider_fixture() -> String {
+        VERSION_SEVEN_SCHEMA_FIXTURE
+            .replace(
+                "created_at INTEGER, fingerprint TEXT NOT NULL DEFAULT ''",
+                "search_projection TEXT, created_at INTEGER, fingerprint TEXT NOT NULL DEFAULT ''",
+            )
+            .replace(
+                "PRAGMA user_version = 7;",
+                "INSERT INTO tombstones(provider, conversation_id, forgotten_at)
+                    VALUES ('codex', 'forgotten-codex', 25);
+                 INSERT INTO conversations(id, provider, source_path, source_fingerprint)
+                    VALUES ('unsupported-session', 'opencode', '/tmp/opencode.jsonl', 'source');
+                 INSERT INTO messages(
+                    id, conversation_id, ordinal, role, content, search_projection, fingerprint
+                 ) VALUES (
+                    'unsupported-message', 'unsupported-session', 0, 'user',
+                    'unsupported sentinel', NULL, 'message'
+                 );
+                 INSERT INTO message_fts(content, message_id, conversation_id)
+                    VALUES ('unsupported sentinel', 'unsupported-message', 'unsupported-session');
+                 INSERT INTO message_embeddings(message_id, generation, dimensions, norm, vector)
+                    VALUES ('unsupported-message', 'generation', 1, 1.0, X'7F');
+                 INSERT INTO source_checkpoints(provider, source_path, size_bytes, modified_ns)
+                    VALUES ('opencode', '/tmp/opencode.jsonl', 10, 20);
+                 INSERT INTO tombstones(provider, conversation_id, forgotten_at)
+                    VALUES ('opencode', 'forgotten-opencode', 30);
+                 PRAGMA user_version = 8;",
+            )
+    }
+
     #[veritas::claims(
         "storage/supported-schema-migrates",
         "storage/tool-search-projection-migrates"
@@ -2201,6 +2303,101 @@ mod tests {
         let reopened = Storage::open(&path).expect("idempotent second open");
         assert_eq!(reopened.counts().expect("reopened counts").messages, 1);
         assert!(reopened.derived_search_is_dirty().expect("still dirty"));
+    }
+
+    #[veritas::claims("storage/unsupported-provider-data-is-removed")]
+    #[test]
+    fn version_eight_migration_removes_every_unsupported_provider_surface() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cass.sqlite3");
+        let connection = Connection::open(&path).expect("seed database");
+        let fixture = version_eight_provider_fixture();
+        connection
+            .execute_batch(&fixture)
+            .expect("seed version eight");
+        drop(connection);
+
+        let storage = Storage::open(&path).expect("migrate database");
+        for table in ["conversations", "source_checkpoints", "tombstones"] {
+            let query = format!("SELECT count(*) FROM {table} WHERE provider = 'opencode'");
+            assert_eq!(
+                storage
+                    .connection
+                    .query_row(&query, [], |row| row.get::<_, i64>(0))
+                    .expect("unsupported provider count"),
+                0,
+                "unsupported rows remain in {table}"
+            );
+        }
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM source_checkpoints WHERE provider = 'codex'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("supported checkpoint count"),
+            1
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM tombstones WHERE provider = 'codex'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("supported tombstone count"),
+            1
+        );
+        assert_eq!(storage.counts().expect("counts").conversations, 1);
+        assert_eq!(storage.counts().expect("counts").messages, 1);
+        assert_eq!(storage.counts().expect("counts").embeddings, 1);
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM message_fts WHERE content = 'unsupported sentinel'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("unsupported FTS count"),
+            0
+        );
+        let schema: String = storage
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'conversations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("provider schema");
+        assert!(schema.contains("'claude-code'"));
+        assert!(schema.contains("'codex'"));
+        assert!(!schema.contains("'opencode'"));
+        for provider in ["opencode", "github-copilot", "hermes", "pi"] {
+            let error = storage
+                .connection
+                .execute(
+                    "INSERT INTO conversations(id, provider, source_path)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        format!("rejected-{provider}"),
+                        provider,
+                        format!("/tmp/rejected-{provider}.jsonl")
+                    ],
+                )
+                .expect_err("unsupported provider rejected");
+            assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+        }
+        assert_eq!(
+            storage
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            SCHEMA_VERSION
+        );
     }
 
     #[veritas::claims("storage/newer-schema-is-rejected")]
@@ -2329,7 +2526,12 @@ mod tests {
         let mut writer = Storage::open_writer(&path).expect("purge writer");
         assert_eq!(
             writer
-                .purge_missing_sources("codex", &BTreeSet::new())
+                .purge_missing_sources(
+                    "codex",
+                    &BTreeSet::new(),
+                    &[std::path::PathBuf::from("/tmp")],
+                    None,
+                )
                 .expect("purge missing source"),
             1
         );

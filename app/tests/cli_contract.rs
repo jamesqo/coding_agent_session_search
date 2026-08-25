@@ -65,7 +65,7 @@ fn seed_readiness_database(path: &Path, search_projection: Option<&str>) {
              INSERT INTO derived_state VALUES (1, 0);
              INSERT INTO conversations(id, provider, source_path)
                 VALUES ('session', 'codex', '/tmp/session.jsonl');
-             PRAGMA user_version = 8;",
+             PRAGMA user_version = 9;",
         )
         .expect("readiness schema");
     connection
@@ -89,6 +89,311 @@ fn current_embedding_generation() -> String {
     )
     .to_hex()
     .to_string()
+}
+
+fn write_config(path: &Path, local_node: &str, claude_root: &Path, codex_root: &Path) {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "local_node": local_node,
+            "nodes": [{
+                "name": local_node,
+                "ssh": local_node,
+                "search": true,
+                "providers": {
+                    "claude-code": {"roots": [claude_root]},
+                    "codex": {"roots": [codex_root]}
+                },
+                "index": {"since_days": 30}
+            }]
+        }))
+        .expect("configuration JSON"),
+    )
+    .expect("configuration file");
+}
+
+#[veritas::claims("configuration/status-reports-resolved-settings")]
+#[test]
+fn status_reports_the_exact_resolved_local_configuration() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config = directory.path().join("config.json");
+    let claude = directory.path().join("remote-claude");
+    let codex = directory.path().join("remote-codex");
+    write_config(&config, "xenia", &claude, &codex);
+
+    let body = run_json(&[
+        "--config",
+        config.to_str().unwrap(),
+        "--db",
+        directory.path().join("missing.sqlite3").to_str().unwrap(),
+        "--models-dir",
+        directory.path().join("missing-models").to_str().unwrap(),
+        "status",
+    ]);
+
+    assert_eq!(
+        body["configuration"],
+        serde_json::json!({
+            "path": std::fs::canonicalize(&config).expect("canonical config"),
+            "loaded": true,
+            "local_node": "xenia",
+            "providers": {
+                "claude-code": {"roots": [claude]},
+                "codex": {"roots": [codex]}
+            },
+            "index": {"since_days": 30}
+        })
+    );
+}
+
+#[veritas::claims("configuration/status-reports-resolved-settings")]
+#[test]
+fn legacy_provider_root_environment_variables_are_ignored() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let home = directory.path().join("home");
+    let config_home = directory.path().join("config-home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&config_home).expect("config home");
+    let injected = directory.path().join("injected");
+    let output = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("CASS_CLAUDE_ROOTS", &injected)
+        .env("CASS_CODEX_ROOTS", &injected)
+        .env("CASS_OPENCODE_ROOTS", &injected)
+        .env("CASS_COPILOT_ROOTS", &injected)
+        .env("CASS_HERMES_ROOTS", &injected)
+        .env("CASS_PI_ROOTS", &injected)
+        .args([
+            "--db",
+            directory.path().join("missing.sqlite3").to_str().unwrap(),
+            "status",
+        ])
+        .output()
+        .expect("status");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(
+        body["configuration"],
+        serde_json::json!({
+            "path": config_home.join("cass/config.json"),
+            "loaded": false,
+            "local_node": null,
+            "providers": {
+                "claude-code": {"roots": [
+                    home.join(".claude/projects"),
+                    home.join(".config/claude/projects")
+                ]},
+                "codex": {"roots": [
+                    home.join(".codex/sessions"),
+                    home.join(".local/share/codex/sessions")
+                ]}
+            },
+            "index": {"since_days": 90}
+        })
+    );
+}
+
+#[veritas::claims(
+    "configuration/invalid-loaded-file-fails-before-effects",
+    "configuration/errors-are-stable-and-nonretryable"
+)]
+#[test]
+fn every_public_command_rejects_malformed_configuration_before_effects() {
+    let command_arguments: &[&[&str]] = &[
+        &["index"],
+        &["search", "needle", "--node", "remote"],
+        &["view", "message", "--node", "remote"],
+        &["status"],
+        &["forget", "conversation"],
+        &["models", "install"],
+    ];
+
+    for (arguments, explicit) in command_arguments
+        .iter()
+        .flat_map(|arguments| [(arguments, true), (arguments, false)])
+    {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let xdg = directory.path().join("xdg");
+        let config = if explicit {
+            directory.path().join("config.json")
+        } else {
+            xdg.join("cass/config.json")
+        };
+        let database = directory.path().join("cass.sqlite3");
+        let models = directory.path().join("models");
+        std::fs::create_dir_all(config.parent().expect("config parent")).expect("config parent");
+        std::fs::write(&config, "{").expect("malformed configuration");
+        let mut command = Command::cargo_bin("cass").expect("cass binary");
+        if explicit {
+            command.args(["--config", config.to_str().unwrap()]);
+        } else {
+            command.env("XDG_CONFIG_HOME", &xdg);
+        }
+        let output = command
+            .args(["--db", database.to_str().unwrap()])
+            .args(["--models-dir", models.to_str().unwrap()])
+            .args(*arguments)
+            .output()
+            .expect("run public command");
+
+        assert!(
+            !output.status.success(),
+            "command unexpectedly passed: {arguments:?}"
+        );
+        assert_eq!(output.stdout, Vec::<u8>::new());
+        let error: Value = serde_json::from_slice(&output.stderr).expect("one JSON error");
+        assert_eq!(error["error"]["kind"], "configuration");
+        assert_eq!(error["error"]["retryable"], false);
+        assert!(error["error"].get("recommended_action").is_none());
+        assert_eq!(output.status.code(), Some(9));
+        assert!(!database.exists());
+        assert!(!models.exists());
+    }
+}
+
+#[veritas::claims("configuration/invalid-loaded-file-fails-before-effects")]
+#[test]
+fn hidden_workers_are_config_blind_and_reject_explicit_config_flags() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let explicit = directory.path().join("config.json");
+    std::fs::write(&explicit, "{").expect("malformed explicit config");
+    for (worker, request) in [
+        (
+            ["search", "--federation-request"],
+            r#"{"protocol":2,"query":"needle","limit":1}"#,
+        ),
+        (
+            ["view", "--federation-request"],
+            r#"{"protocol":2,"id":"message","context":0}"#,
+        ),
+    ] {
+        for explicit_flag in ["config", "local-node"] {
+            let mut command = Command::cargo_bin("cass").expect("cass binary");
+            if explicit_flag == "config" {
+                command.args(["--config", explicit.to_str().unwrap()]);
+            } else {
+                command.args(["--local-node", "xenia"]);
+            }
+            let output = command
+                .args(worker)
+                .write_stdin(request)
+                .output()
+                .expect("explicit worker invocation");
+            let error: Value = serde_json::from_slice(&output.stderr).expect("worker usage error");
+            assert_eq!(error["error"]["kind"], "usage");
+        }
+    }
+
+    let xdg = directory.path().join("xdg");
+    let default_config = xdg.join("cass/config.json");
+    std::fs::create_dir_all(default_config.parent().expect("config parent"))
+        .expect("default config parent");
+    std::fs::write(default_config, "{").expect("malformed default config");
+    for (worker, request, expected_kind) in [
+        (
+            ["search", "--federation-request"],
+            r#"{"protocol":2,"query":"needle","limit":1}"#,
+            "model",
+        ),
+        (
+            ["view", "--federation-request"],
+            r#"{"protocol":2,"id":"message","context":0}"#,
+            "database-missing",
+        ),
+    ] {
+        let worker_output = Command::cargo_bin("cass")
+            .expect("cass binary")
+            .env("XDG_CONFIG_HOME", &xdg)
+            .args([
+                "--db",
+                directory.path().join("missing.sqlite3").to_str().unwrap(),
+                "--models-dir",
+                directory.path().join("missing-models").to_str().unwrap(),
+            ])
+            .args(worker)
+            .write_stdin(request)
+            .output()
+            .expect("config-blind worker invocation");
+        let worker_error: Value =
+            serde_json::from_slice(&worker_output.stderr).expect("worker runtime error");
+        assert_eq!(worker_error["error"]["kind"], expected_kind);
+    }
+}
+
+#[veritas::claims(
+    "configuration/cli-values-have-precedence",
+    "indexing/cli-provider-selection-is-bounded"
+)]
+#[test]
+fn public_index_flags_validate_before_models_database_or_scanning() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config = directory.path().join("config.json");
+    let codex_root = directory.path().join("codex");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "local_node": "test-node",
+            "nodes": [{
+                "name": "test-node",
+                "ssh": "test-node",
+                "search": true,
+                "providers": {"codex": {"roots": [codex_root]}},
+                "index": {"since_days": 90}
+            }]
+        }))
+        .expect("config JSON"),
+    )
+    .expect("config");
+    let database = directory.path().join("cass.sqlite3");
+    let models = directory.path().join("models");
+    for arguments in [
+        vec!["--provider", "opencode"],
+        vec!["--provider", "claude-code"],
+        vec!["--since-days", "0"],
+        vec!["--since-days", "30", "--all-history"],
+    ] {
+        let output = Command::cargo_bin("cass")
+            .expect("cass binary")
+            .args(["--config", config.to_str().unwrap()])
+            .args(["--db", database.to_str().unwrap()])
+            .args(["--models-dir", models.to_str().unwrap()])
+            .arg("index")
+            .args(arguments)
+            .output()
+            .expect("invalid index invocation");
+        let error: Value = serde_json::from_slice(&output.stderr).expect("usage JSON");
+        assert_eq!(error["error"]["kind"], "usage");
+        assert!(!database.exists());
+        assert!(!models.exists());
+    }
+
+    let accepted = Command::cargo_bin("cass")
+        .expect("cass binary")
+        .args(["--config", config.to_str().unwrap()])
+        .args(["--db", database.to_str().unwrap()])
+        .args(["--models-dir", models.to_str().unwrap()])
+        .args([
+            "index",
+            "--provider",
+            "codex",
+            "--provider",
+            "codex",
+            "--since-days",
+            "30",
+        ])
+        .output()
+        .expect("accepted index invocation");
+    let error: Value = serde_json::from_slice(&accepted.stderr).expect("model JSON");
+    assert_eq!(error["error"]["kind"], "model");
+    assert!(!database.exists());
 }
 
 #[veritas::claims("cli/bare-invocation-prints-help")]
@@ -513,12 +818,14 @@ fn real_models_index_and_run_hybrid_search() {
     )
     .expect("Claude fixture");
     let database = directory.path().join("cass.sqlite3");
+    let config = directory.path().join("config.json");
+    write_config(&config, "test-node", &claude, &codex);
     let model_arg = models.to_str().unwrap();
     let output = Command::cargo_bin("cass")
         .expect("cass binary")
-        .env("CASS_CLAUDE_ROOTS", &claude)
-        .env("CASS_CODEX_ROOTS", &codex)
         .args([
+            "--config",
+            config.to_str().unwrap(),
             "--db",
             database.to_str().unwrap(),
             "--models-dir",
