@@ -14,17 +14,12 @@ concurrency:
 
 jobs:
   deploy:
-    uses: jamesqo/gha-workflows/.github/workflows/rust-cli-deploy.yml@v1
+    uses: jamesqo/gha-workflows/.github/workflows/rust-cli-deploy.yml@v2
     with:
       binary: cass
       rust-toolchain: nightly
       cache-prefix: cass
       rustflags: -Zunstable-options --jobs-frontend=4
-      test-command: >-
-        cargo fmt --check &&
-        cargo clippy --locked --all-targets -- -D warnings &&
-        cargo nextest run --locked &&
-        cargo test --locked --doc
       deploy-targets: >-
         [{"ssh":"james@100.97.52.20","platform":"linux-amd64"},{"ssh":"jko@100.102.58.41","platform":"darwin-arm64"},{"ssh":"james@100.90.2.48","platform":"darwin-arm64"}]
     secrets:
