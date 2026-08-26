@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+binary=${1:?usage: deploy-smoke BINARY REVISION}
+revision=${2:?usage: deploy-smoke BINARY REVISION}
+scratch=${TMPDIR:-/tmp}/cass-deploy-$revision-$$
+trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
+mkdir -p "$scratch/models"
+
+"$binary" \
+  --db "$scratch/cass.sqlite3" \
+  --models-dir "$scratch/models" \
+  status | grep -q '"ready":false'
